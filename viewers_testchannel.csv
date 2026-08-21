@@ -1,0 +1,117 @@
+timestamp_utc,is_live,viewer_count,title,game,started_at,stream_id
+2026-08-18T09:05:00Z,true,16,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:10:00Z,true,64,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:15:00Z,true,105,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:20:00Z,true,142,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:25:00Z,true,174,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:30:00Z,true,180,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:35:00Z,true,164,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:40:00Z,true,138,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:45:00Z,true,63,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:50:00Z,true,40,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-18T09:05:00Z,319000000001
+2026-08-18T09:55:00Z,false,,,,,
+2026-08-18T10:00:00Z,false,,,,,
+2026-08-18T10:05:00Z,false,,,,,
+2026-08-18T10:10:00Z,false,,,,,
+2026-08-18T10:15:00Z,false,,,,,
+2026-08-18T10:20:00Z,false,,,,,
+2026-08-19T04:50:00Z,true,38,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T04:55:00Z,true,148,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:00:00Z,true,240,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:05:00Z,true,318,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:10:00Z,true,386,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:15:00Z,true,454,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:20:00Z,true,485,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:25:00Z,true,514,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:30:00Z,true,531,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:35:00Z,true,534,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:40:00Z,true,538,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:45:00Z,true,564,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:50:00Z,true,583,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T05:55:00Z,true,628,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:00:00Z,true,633,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:05:00Z,true,621,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:10:00Z,true,595,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:15:00Z,true,630,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:20:00Z,true,675,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:25:00Z,true,686,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:30:00Z,true,703,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:35:00Z,true,686,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:40:00Z,true,664,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:45:00Z,true,657,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:50:00Z,true,627,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T06:55:00Z,true,647,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:00:00Z,true,608,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:05:00Z,true,560,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:10:00Z,true,611,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:15:00Z,true,611,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:20:00Z,true,636,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:25:00Z,true,656,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:30:00Z,true,667,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:35:00Z,true,702,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:40:00Z,true,670,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:45:00Z,true,688,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:50:00Z,true,705,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T07:55:00Z,true,688,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:00:00Z,true,740,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:05:00Z,true,686,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:10:00Z,true,689,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:15:00Z,true,706,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:20:00Z,true,700,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:25:00Z,true,697,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:30:00Z,true,632,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:35:00Z,true,611,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:40:00Z,true,590,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:45:00Z,true,573,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:50:00Z,true,595,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T08:55:00Z,true,551,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:00:00Z,true,554,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:05:00Z,true,572,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:10:00Z,true,593,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:15:00Z,true,601,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:20:00Z,true,599,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:25:00Z,true,596,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:30:00Z,true,590,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:35:00Z,true,590,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:40:00Z,true,595,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:45:00Z,true,602,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:50:00Z,true,623,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T09:55:00Z,true,638,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:00:00Z,true,610,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:05:00Z,true,597,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:10:00Z,true,581,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:15:00Z,true,692,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:20:00Z,true,581,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:25:00Z,true,625,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:30:00Z,true,596,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:35:00Z,true,574,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:40:00Z,true,553,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:45:00Z,true,552,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:50:00Z,true,545,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T10:55:00Z,true,518,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:00:00Z,true,550,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:05:00Z,true,534,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:10:00Z,true,523,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:15:00Z,true,502,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:20:00Z,true,501,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:25:00Z,true,496,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:30:00Z,true,475,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:35:00Z,true,430,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:40:00Z,true,481,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:45:00Z,true,473,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:50:00Z,true,472,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T11:55:00Z,true,479,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:00:00Z,true,500,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:05:00Z,true,471,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:10:00Z,true,467,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:15:00Z,true,455,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:20:00Z,true,456,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:25:00Z,true,424,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:30:00Z,true,428,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:35:00Z,true,413,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:40:00Z,true,334,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:45:00Z,true,172,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:50:00Z,true,125,"Sample Stream: Park Day, Rides, Music, and More!",IRL,2026-08-19T04:50:00Z,319997409116
+2026-08-19T12:55:00Z,false,,,,,
+2026-08-19T13:00:00Z,false,,,,,
+2026-08-19T13:05:00Z,false,,,,,

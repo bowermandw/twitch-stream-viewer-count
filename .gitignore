@@ -1,0 +1,15 @@
+# Credentials and tokens — never commit these
+.env
+.token_cache.json
+
+# Collected data and generated charts
+viewers_*.csv
+poll_*.log
+chart_*.svg
+
+# ...except the committed test fixtures, which are synthetic
+!viewers_testchannel.csv
+!chart_testchannel.svg
+
+__pycache__/
+*.pyc
