@@ -1,23 +1,16 @@
-#!/usr/bin/env python3
-"""Chart the viewer counts collected by twitch_viewers.py.
+"""Rendering the sample data as SVG.
 
-Renders an SVG in the style of the YouTube Studio "Concurrent viewers" chart:
-peak and average in the header, a filled area curve, and — added here — the
-time the peak happened plus a light per-block average line.
-
-Pure standard library, so it runs on any Python 3 with nothing installed.
+Styled after the YouTube Studio "Concurrent viewers" chart, extended with the
+time each peak happened and per-block average lines. Hand-built SVG rather than
+a plotting library, which is why this package needs nothing installed.
 """
 
-import argparse
-import csv
 import html
 import math
 import os
-import subprocess
-import sys
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
-import twitch_viewers as tv
+from . import config
 
 # --- palette (YouTube Studio dark) ----------------------------------------
 BG = "#0f0f0f"
@@ -55,52 +48,6 @@ GAP_TOLERANCE = 2.5
 # --------------------------------------------------------------------------
 # data
 # --------------------------------------------------------------------------
-
-
-def read_samples(path):
-    """Parse a viewers_*.csv into dicts, skipping rows that can't be read."""
-    if not os.path.exists(path):
-        sys.exit(
-            "No data file at {}\n"
-            "Collect some first:  python3 twitch_viewers.py <channel>\n"
-            "Or make fake data:   python3 make_test_data.py testchannel".format(path)
-        )
-
-    samples = []
-    with open(path, newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            try:
-                when = datetime.strptime(
-                    row["timestamp_utc"], "%Y-%m-%dT%H:%M:%SZ"
-                ).replace(tzinfo=timezone.utc)
-            except (ValueError, KeyError, TypeError):
-                continue
-            live = (row.get("is_live") or "").strip().lower() == "true"
-            try:
-                viewers = int(row["viewer_count"]) if live else None
-            except (ValueError, KeyError, TypeError):
-                continue
-
-            def optional(name):
-                """metrics_*.csv has these columns; viewers_*.csv does not."""
-                raw = (row.get(name) or "").strip()
-                try:
-                    return int(raw) if raw else None
-                except ValueError:
-                    return None
-
-            samples.append({
-                "when": when,
-                "live": live,
-                "viewers": viewers,
-                "followers": optional("follower_count"),
-                "chatters": optional("chatter_count"),
-                "title": row.get("title") or "",
-                "game": row.get("game") or "",
-                "stream_id": row.get("stream_id") or "",
-            })
-    samples.sort(key=lambda s: s["when"])
-    return samples
 
 
 def split_sessions(samples):
@@ -778,183 +725,3 @@ def print_summary(session, bucket_minutes, metrics=None):
 # --------------------------------------------------------------------------
 
 
-def main():
-    parser = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="examples:\n"
-               "  python3 graph.py IGN\n"
-               "  python3 graph.py themeparkgiant --date 2026-08-22\n"
-               "  python3 graph.py themeparkgiant --date today --composite\n"
-               "  python3 graph.py IGN --list-days\n")
-    parser.add_argument("channel", nargs="?", default=None,
-                        help="channel name, or a path to a viewers_*.csv")
-    parser.add_argument("--bucket", type=int, default=30, metavar="MIN",
-                        help="block size for the light average lines (default 30)")
-    parser.add_argument("--no-buckets", action="store_true", help="hide the average lines")
-    parser.add_argument("--date", default=None, metavar="YYYY-MM-DD",
-                        help="chart one calendar day (local time), first live sample to "
-                             "last, keeping any offline stretch in between. "
-                             "Accepts 'today' and 'yesterday'.")
-    parser.add_argument("--list-days", action="store_true",
-                        help="list the days with live data and exit")
-    parser.add_argument("--session", type=int, default=None, metavar="N",
-                        help="which broadcast to chart (default: the most recent)")
-    parser.add_argument("--list-sessions", action="store_true",
-                        help="list the broadcasts in the file and exit")
-    parser.add_argument("--composite", action="store_true",
-                        help="all metrics on one plot instead of separate panels")
-    parser.add_argument("--only", default=None, metavar="METRIC",
-                        help="chart just one metric: {}".format(
-                            ", ".join(m["key"] for m in METRICS)))
-    parser.add_argument("--viewers-only", action="store_true",
-                        help="read viewers_<channel>.csv even if metrics data exists")
-    parser.add_argument("--output", default=None, help="output .svg path")
-    parser.add_argument("--width", type=int, default=1300)
-    parser.add_argument("--height", type=int, default=470)
-    parser.add_argument("--open", dest="open_it", action="store_true",
-                        help="open the chart when done")
-    args = parser.parse_args()
-
-    channel = args.channel or tv.resolve_channel(None)
-    if channel.lower().endswith(".csv"):
-        path, label = channel, os.path.basename(channel)
-    else:
-        label = channel
-        import metrics as metrics_mod
-        metrics_path, _ = metrics_mod.paths_for(channel)
-        viewers_path, _ = tv.paths_for(channel)
-        # metrics_*.csv is a superset, so prefer it unless asked otherwise.
-        if args.viewers_only or not os.path.exists(metrics_path):
-            path = viewers_path
-        else:
-            path = metrics_path
-
-    samples = read_samples(path)
-
-    if args.list_days:
-        days = days_present(samples)
-        if not days:
-            sys.exit("No live samples in {}.".format(os.path.basename(path)))
-        print("{} day(s) with live data in {}:\n".format(len(days), os.path.basename(path)))
-        for day in days:
-            window = select_day(samples, day)
-            counts = [s["viewers"] for s in window if s["viewers"] is not None]
-            down = offline_spans(window)
-            print("  {}  {:>9}  peak {:>6}  {} sample{}{}".format(
-                day.isoformat(),
-                fmt_elapsed((window[-1]["when"] - window[0]["when"]).total_seconds()),
-                fmt_count(max(counts)) if counts else "—", len(window),
-                "s" * (len(window) != 1),
-                "   ({} offline mid-day)".format(fmt_elapsed(sum(b - a for a, b in down)))
-                if down else ""))
-        print("\nChart one with --date YYYY-MM-DD.")
-        return
-
-    day = None
-    if args.date:
-        keyword = args.date.strip().lower()
-        today = datetime.now().astimezone().date()
-        if keyword == "today":
-            day = today
-        elif keyword == "yesterday":
-            day = today - timedelta(days=1)
-        else:
-            try:
-                day = datetime.strptime(args.date.strip(), "%Y-%m-%d").date()
-            except ValueError:
-                sys.exit("Bad --date '{}'. Use YYYY-MM-DD, 'today' or 'yesterday'.".format(
-                    args.date))
-        session = select_day(samples, day)
-        if not session:
-            available = days_present(samples)
-            sys.exit("No live samples on {} in {}.{}".format(
-                day.isoformat(), os.path.basename(path),
-                "\nDays with data: " + ", ".join(d.isoformat() for d in available)
-                if available else ""))
-        sessions = [session]
-    else:
-        sessions = split_sessions(samples)
-    if not sessions:
-        sys.exit(
-            "{} has no complete broadcast yet (need 2+ consecutive live samples).\n"
-            "Rows found: {}".format(os.path.basename(path), len(samples))
-        )
-
-    if args.list_sessions:
-        print("{} broadcast(s) in {}:\n".format(len(sessions), os.path.basename(path)))
-        for i, s in enumerate(sessions):
-            counts = [x["viewers"] for x in s]
-            print("  [{}] {}  {:>9}  peak {:>6}  avg {:>6}  ({} samples)".format(
-                i, s[0]["when"].astimezone().strftime("%a %-d %b %-I:%M %p"),
-                fmt_elapsed((s[-1]["when"] - s[0]["when"]).total_seconds()),
-                fmt_count(max(counts)), fmt_count(sum(counts) / len(counts)), len(counts)))
-        print("\nChart one with --session N (default is the most recent).")
-        return
-
-    if day and args.session is not None:
-        sys.exit("--date and --session select different things; use one or the other.")
-    index = args.session if args.session is not None else len(sessions) - 1
-    if not 0 <= index < len(sessions):
-        sys.exit("No session {} — the file has {} (0-{}). Try --list-sessions.".format(
-            index, len(sessions), len(sessions) - 1))
-    session = sessions[index]
-
-    metrics = available_metrics(session)
-    if args.only:
-        if args.only not in METRIC_BY_KEY:
-            sys.exit("Unknown metric '{}'. Choose from: {}".format(
-                args.only, ", ".join(m["key"] for m in METRICS)))
-        metrics = [m for m in metrics if m["key"] == args.only]
-        if not metrics:
-            sys.exit("No {} data in {}.".format(args.only, os.path.basename(path)))
-
-    multi = len(metrics) > 1
-    suffix = ""
-    if args.composite and multi:
-        svg = render_composite(session, label, args.width, max(args.height, 470),
-                               metrics=metrics, day=day)
-        suffix = "_composite"
-    elif multi:
-        svg = render_stacked(session, label, args.bucket, args.width,
-                             show_buckets=not args.no_buckets, metrics=metrics, day=day)
-        suffix = "_metrics"
-    elif metrics and (day or metrics[0]["key"] != "viewers"):
-        # A single non-viewer metric reads best as one panel, and a day window
-        # can contain offline rows that only the panel renderer handles.
-        svg = render_stacked(session, label, args.bucket, args.width,
-                             show_buckets=not args.no_buckets, metrics=metrics, day=day)
-        suffix = "" if (day and metrics[0]["key"] == "viewers") else "_" + metrics[0]["key"]
-    else:
-        svg = render(session, label, args.bucket, args.width, args.height,
-                     show_buckets=not args.no_buckets)
-
-    if day:
-        suffix += "_" + day.isoformat()
-    out_path = args.output or os.path.join(
-        tv.BASE_DIR, "chart_{}{}.svg".format(
-            tv.channel_slug(label.replace(".csv", "")), suffix))
-    with open(out_path, "w", encoding="utf-8") as handle:
-        handle.write(svg)
-
-    if day:
-        down = offline_spans(session)
-        print("{}  — {}  ({})".format(label, day.strftime("%a %-d %b %Y"),
-                                      os.path.basename(path)))
-        if down:
-            print("  {} offline in {} stretch{} mid-day, kept in the chart\n".format(
-                fmt_elapsed(sum(b - a for a, b in down)), len(down),
-                "es" if len(down) != 1 else ""))
-        else:
-            print()
-    else:
-        print("{}  — broadcast {} of {}  ({})\n".format(
-            label, index + 1, len(sessions), os.path.basename(path)))
-    print_summary(session, args.bucket, metrics)
-    print("\n  chart     {}".format(out_path))
-
-    if args.open_it:
-        subprocess.run(["open", out_path], check=False)
-
-
-if __name__ == "__main__":
-    main()

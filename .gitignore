@@ -1,26 +1,21 @@
-# Credentials and tokens — never commit these
+# Credentials — never commit these
 .env
-.token_cache.json
-.user_token.json
 
-# Collected data and generated charts
-viewers_*.csv
-metrics_*.csv
-poll_*.log
-metrics_*.log
-chart_*.svg
+# Collected data, logs and cached tokens
+data/*
+!data/.gitkeep
 
-# ...except the committed test fixtures, which are synthetic
-!viewers_testchannel.csv
-!metrics_testchannel.csv
-!viewers_breaktest.csv
-!metrics_breaktest.csv
-!chart_testchannel.svg
-!chart_testchannel_metrics.svg
-!chart_testchannel_composite.svg
-!chart_breaktest_metrics_2026-08-19.svg
+# Generated charts
+charts/*
+!charts/.gitkeep
 
+# Python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
 
 bruno/

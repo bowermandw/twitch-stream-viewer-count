@@ -1,20 +1,11 @@
-#!/usr/bin/env python3
-"""Interactive setup: collect Twitch API credentials, verify them, write .env.
+"""Collect Twitch API credentials, verify them, write .env."""
 
-Twitch has no API for creating an app or reading back a client secret — that
-requires a browser login to the dev console — so this script walks you through
-that part, then handles everything after it.
-"""
-
-import argparse
 import getpass
-import os
-import stat
-import sys
 import urllib.error
 import webbrowser
 
-import twitch_viewers as tv
+from .. import api, auth, config
+from ..logging import note
 
 CONSOLE_URL = "https://dev.twitch.tv/console/apps/create"
 
@@ -31,35 +22,40 @@ API for this — it has to be done in a browser, once. It takes about 2 minutes.
   2. Fill in the form:
        Name                 anything unique, e.g. themeparkgiant-viewer-log
        OAuth Redirect URLs  http://localhost:3000
-                            (required field, unused by this app)
+                            (required field; used only by `auth`)
        Category             Analytics Tool
        Client Type          Confidential
 
   3. Click Create, then Manage on the new app.
 
   4. Copy the Client ID, then click New Secret and copy that too.
-     The secret is shown ONLY ONCE — copy it before leaving the page.
+     The secret is shown ONLY ONCE.
 
 Then paste both below.
 """.format(url=CONSOLE_URL)
 
 
+def add_arguments(parser):
+    parser.add_argument("--client-id", help="skip the prompt and use this value")
+    parser.add_argument("--client-secret", help="skip the prompt and use this value")
+    parser.add_argument("--channel", default=None, help="channel to test against")
+    parser.add_argument("--no-browser", action="store_true",
+                        help="don't try to open the dev console")
+
+
 def confirm(prompt, default_yes=True):
-    suffix = "[Y/n]" if default_yes else "[y/N]"
     try:
-        answer = input("{} {} ".format(prompt, suffix)).strip().lower()
+        answer = input("{} {} ".format(prompt, "[Y/n]" if default_yes else "[y/N]")).strip().lower()
     except EOFError:
         return default_yes
-    if not answer:
-        return default_yes
-    return answer in ("y", "yes")
+    return default_yes if not answer else answer in ("y", "yes")
 
 
 def verify(client_id, client_secret, channel):
-    """Prove the credentials work by getting a token and making a real call."""
+    """Prove the credentials work with a token request and a real API call."""
     print("\nVerifying against the Twitch API...")
     try:
-        token = tv.request_new_token(client_id, client_secret)
+        token = auth.request_new_token(client_id, client_secret)
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -70,73 +66,43 @@ def verify(client_id, client_secret, channel):
             print("\n  FAILED: Twitch rejected these credentials (HTTP {}).".format(exc.code))
             print("  {}".format(detail))
             print("\n  Check for a typo, or generate a New Secret in the console")
-            print("  (a secret is invalidated if you generate another one).")
+            print("  (generating one invalidates the previous secret).")
         else:
             print("\n  FAILED: HTTP {} from Twitch. {}".format(exc.code, detail))
         return False
     except (urllib.error.URLError, OSError) as exc:
         print("\n  FAILED: could not reach Twitch: {}".format(exc))
-        print("  Check your internet connection and try again.")
         return False
 
     print("  Access token obtained.")
-
     try:
-        stream = tv.fetch_stream(channel, token, client_id)
+        stream = api.get_stream(channel, token, client_id)
     except Exception as exc:  # noqa: BLE001
         print("  FAILED: token works but the streams call failed: {}".format(exc))
         return False
 
     if stream is None:
         print("  Streams API reachable — {} is currently OFFLINE.".format(channel))
-        print("  (That's a valid result, and confirms everything works.)")
+        print("  (A valid result, and it confirms everything works.)")
     else:
         print("  Streams API reachable — {} is LIVE with {} viewers.".format(
-            channel, stream.get("viewer_count")
-        ))
-        print('  Title: "{}"'.format(stream.get("title", "")))
+            channel, stream.get("viewer_count")))
     return True
 
 
-def write_env(client_id, client_secret):
-    with open(tv.ENV_PATH, "w", encoding="utf-8") as handle:
-        handle.write("# Twitch API credentials — created by setup.py\n")
-        handle.write("# Keep this file private; it is gitignored.\n")
-        handle.write("TWITCH_CLIENT_ID={}\n".format(client_id))
-        handle.write("TWITCH_CLIENT_SECRET={}\n".format(client_secret))
-    os.chmod(tv.ENV_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
-    print("\nWrote {} (permissions 0600).".format(tv.ENV_PATH))
-
-
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--client-id", help="skip the prompt and use this value")
-    parser.add_argument("--client-secret", help="skip the prompt and use this value")
-    parser.add_argument(
-        "--channel", default=None, help="channel to test the credentials against"
-    )
-    parser.add_argument(
-        "--no-browser", action="store_true", help="don't try to open the dev console"
-    )
-    args = parser.parse_args()
-
-    args.channel = tv.resolve_channel(args.channel)
-    tv.configure_paths(args.channel)
-
+def run(args):
+    config.ensure_dirs()
+    channel = config.resolve_channel(args.channel)
     non_interactive = bool(args.client_id and args.client_secret)
 
-    # Reuse anything already configured so re-running is safe.
-    existing = tv.load_env_file(tv.ENV_PATH)
+    existing = config.load_env_file()
     if existing.get("TWITCH_CLIENT_ID") and not non_interactive:
-        print("An existing .env was found with client ID: {}...{}".format(
-            existing["TWITCH_CLIENT_ID"][:6], existing["TWITCH_CLIENT_ID"][-4:]
-        ))
+        shown = existing["TWITCH_CLIENT_ID"]
+        print("An existing .env was found with client ID: {}...{}".format(shown[:6], shown[-4:]))
         if not confirm("Replace it?", default_yes=False):
-            client_id = existing["TWITCH_CLIENT_ID"]
-            client_secret = existing.get("TWITCH_CLIENT_SECRET", "")
-            if verify(client_id, client_secret, args.channel):
+            if verify(shown, existing.get("TWITCH_CLIENT_SECRET", ""), channel):
                 print("\nExisting credentials are valid. Nothing to do.")
-                print("Run:  python3 twitch_viewers.py {}".format(args.channel))
+                print("Run:  twitch-metrics poll {}".format(channel))
                 return 0
             print("\nExisting credentials do NOT work — let's replace them.")
         print()
@@ -145,7 +111,7 @@ def main():
         client_id, client_secret = args.client_id.strip(), args.client_secret.strip()
     else:
         print(INSTRUCTIONS)
-        if not args.no_browser and confirm("Open the Twitch dev console in your browser now?"):
+        if not args.no_browser and confirm("Open the Twitch dev console now?"):
             try:
                 webbrowser.open(CONSOLE_URL)
             except Exception:  # noqa: BLE001
@@ -153,7 +119,6 @@ def main():
         print()
         try:
             client_id = input("Client ID:     ").strip()
-            # getpass keeps the secret out of the terminal scrollback.
             client_secret = getpass.getpass("Client Secret: (hidden) ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nCancelled. Nothing was written.")
@@ -163,24 +128,20 @@ def main():
         print("\nBoth values are required. Nothing was written.")
         return 1
 
-    # Cheap sanity check before spending a network round trip.
     for label, value in (("Client ID", client_id), ("Client Secret", client_secret)):
         if len(value) < 20 or not value.isalnum():
-            print("\nWarning: that {} doesn't look like a Twitch credential".format(label))
-            print("(expected ~30 alphanumeric characters, got {}).".format(len(value)))
+            print("\nWarning: that {} doesn't look like a Twitch credential "
+                  "(expected ~30 alphanumeric characters, got {}).".format(label, len(value)))
             if not non_interactive and not confirm("Continue anyway?", default_yes=False):
                 print("Cancelled. Nothing was written.")
                 return 1
 
-    if not verify(client_id, client_secret, args.channel):
-        print("\nNothing was written to .env. Fix the above and re-run:  python3 setup.py")
+    if not verify(client_id, client_secret, channel):
+        print("\nNothing was written to .env. Fix the above and re-run:  twitch-metrics setup")
         return 1
 
-    write_env(client_id, client_secret)
+    config.write_env(client_id, client_secret)
+    print("\nWrote {} (permissions 0600).".format(config.ENV_PATH))
     print("\nSetup complete. Start collecting data with:\n")
-    print("    python3 twitch_viewers.py {}\n".format(args.channel))
+    print("    twitch-metrics poll {}\n".format(channel))
     return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())

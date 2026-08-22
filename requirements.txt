@@ -1,0 +1,23 @@
+# No third-party dependencies.
+#
+# This project deliberately uses only the Python standard library — urllib for
+# HTTP, csv for storage, and hand-built SVG for the charts. There is nothing to
+# pip install.
+#
+# All you need on a server is Python 3.9 or newer:
+#
+#     python3 --version
+#
+# To install the `twitch-metrics` command itself:
+#
+#     pip install -e .
+#
+# Or skip installing entirely and run it in place:
+#
+#     python3 -m twitchmetrics --help
+#
+# Optional, and only for turning the SVG charts into PNGs:
+#
+#     macOS         brew install librsvg
+#     Debian/Ubuntu apt install librsvg2-bin
+#     then          rsvg-convert -w 1600 charts/chart_x.svg -o chart.png

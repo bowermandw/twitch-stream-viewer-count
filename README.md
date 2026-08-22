@@ -1,197 +1,133 @@
-# Twitch Viewer Count Poller
+# Twitch Metrics
 
-Records the live viewer count for a Twitch channel into a CSV file on a fixed
-interval, then charts it in the style of the YouTube Studio "Concurrent
-viewers" graph.
+Poll a Twitch channel's **viewers, followers and chat size** on an interval into
+a CSV, then chart it in the style of the YouTube Studio "Concurrent viewers"
+graph.
 
-**Python 3, standard library only — nothing to install.** No matplotlib, no
-numpy, no `pip install`.
+**Python 3.9+ and nothing else.** No dependencies, no `pip install`, no
+virtualenv needed — only the standard library. `urllib` for HTTP, `csv` for
+storage, hand-built SVG for the charts.
 
-![Example chart](docs_chart_testchannel.png)
-
-*Generated from the sample data committed to this repo. The header carries the
-peak, **when** the peak happened, and the average; the amber segments are
-per-30-minute averages.*
+![Example chart](docs/chart_testchannel.png)
 
 Polling all three metrics gives a panel each:
 
-![All three metrics](docs_chart_metrics.png)
+![All three metrics](docs/chart_metrics.png)
+
+*Both generated from the synthetic fixtures in `tests/fixtures/`, so they
+reproduce without credentials.*
 
 ### What it does
 
-- Polls the Twitch Helix API on an interval and appends one CSV row per sample
-- Records viewers, followers and chat size together, or viewers alone
+- Samples viewers, followers and chat size on one tick into `data/metrics_<channel>.csv`
 - Records offline polls too, so a gap in the data means "not running" rather than "not streaming"
-- Handles token refresh, rate limits, outages and network loss without dying
-- Keeps each channel in its own files, so several can be polled at once
-- Charts any broadcast as a self-contained SVG — one metric or all three
-- Ships synthetic sample data so you can try the chart before collecting anything
+- Handles token refresh, rate limits, API outages and network loss without dying
+- Charts a single broadcast or a whole calendar day, one metric or all three
+- Degrades cleanly when a metric needs permissions you don't have
+- Ships synthetic sample data so the charts work before you collect anything
 
-## Setup
+---
 
-Run this and follow the prompts:
+## Install
 
 ```
-python3 setup.py
+git clone https://github.com/bowermandw/twitch-stream-viewer-count.git
+cd twitch-stream-viewer-count
+python3 -m twitchmetrics --help
 ```
 
-It prints the instructions below, offers to open the Twitch dev console in your
-browser, asks for the two values, **verifies them against the real API**, and
-writes `.env` for you. If Twitch rejects them, nothing is written and it tells
-you why — so you can't end up with a silently broken config.
+That's it — there is nothing to install, and no virtualenv is needed to run it.
 
-### What you'll do in the browser
+Optionally put a `twitch-metrics` command on your PATH. Note that modern Pythons
+(Homebrew, Debian, Ubuntu) are *externally managed* and will refuse a bare
+`pip install`, so use a venv or pipx:
+
+```
+python3 -m venv .venv && .venv/bin/pip install -e .
+.venv/bin/twitch-metrics --help
+```
+
+```
+pipx install .          # if you have pipx
+```
+
+Either way **no dependencies are downloaded** — the install only creates the
+entry point. If you'd rather not bother, `python3 -m twitchmetrics` is
+equivalent everywhere and needs nothing. This README writes the short form for
+readability; substitute whichever you use.
+
+For servers, see [`deploy/README.md`](deploy/README.md) — requirements, systemd
+unit, and how to handle the one step that needs a browser.
+
+## Credentials
+
+```
+twitch-metrics setup
+```
+
+Walks you through registering a Twitch app, then **verifies the credentials
+against the live API** before writing `.env` at mode 0600. If Twitch rejects
+them, nothing is written and it tells you why.
+
+<details>
+<summary>What you'll do in the browser (about 2 minutes, once)</summary>
 
 Twitch has no API for creating an app or reading back a secret, so this part is
-manual — once, about two minutes.
+manual.
 
 1. Go to <https://dev.twitch.tv/console/apps/create> and log in.
-   Twitch requires 2FA on the account to use the dev console; if you don't have
-   it enabled it will make you set it up first (Settings -> Security).
+   The dev console requires 2FA on the account; if you don't have it enabled it
+   will make you set it up first.
 
 2. Fill in the form:
 
    | Field | Value |
    |---|---|
-   | **Name** | Anything unique across all of Twitch, e.g. `ign-viewer-log`. If it says the name is taken, add a number. |
-   | **OAuth Redirect URLs** | `http://localhost:3000` — a required field, but this app never uses it. There's no browser redirect in the flow we use. |
+   | **Name** | Anything unique across Twitch, e.g. `themeparkgiant-viewer-log` |
+   | **OAuth Redirect URLs** | `http://localhost:3000` — required, and used only by `twitch-metrics auth` |
    | **Category** | `Analytics Tool` |
    | **Client Type** | `Confidential` |
 
-3. Click **Create**. You're back at the app list.
+3. Click **Create**, then **Manage** on the new app.
 
-4. Click **Manage** next to your new app.
+4. Copy the **Client ID**. Click **New Secret** and copy that too — it is shown
+   only once, and generating another invalidates the previous one.
 
-5. **Client ID** is on that page — copy it.
-
-6. Click **New Secret**, confirm, and copy the **Client Secret** immediately.
-   It is shown only once. If you lose it, click New Secret again — note that
-   this invalidates the previous secret.
-
-Then paste both into the `setup.py` prompt. The secret is typed hidden and is
-never echoed to your terminal scrollback.
-
-### Doing it by hand instead
-
-If you'd rather skip the script, copy the template and fill it in:
+Non-interactive, for servers:
 
 ```
-cp .env.example .env
+twitch-metrics setup --client-id XXXX --client-secret YYYY
 ```
+</details>
 
-Or pass the values directly:
+---
 
-```
-python3 setup.py --client-id XXXX --client-secret YYYY
-```
-
-No user login or OAuth scopes are needed — live stream data is public, so this
-uses the server-to-server client credentials grant.
-
-## Usage
-
-The channel is the first argument. Each channel keeps its own data files, so
-you can poll several at once from separate terminals.
+## Polling
 
 ```
-python3 twitch_viewers.py ign   # poll ign
-python3 twitch_viewers.py       # poll the default channel
-```
-
-`Ctrl-C` to stop. The terminal must stay open for polling to continue.
-
-A single poll, useful for checking things work:
-
-```
-python3 twitch_viewers.py ign --once
-```
-
-`--channel ign` also works if you prefer the flag form.
-
-### Setting a default channel
-
-Without an argument it polls `DEFAULT_CHANNEL` from the top of
-`twitch_viewers.py`. To change that without editing code, add to `.env`:
-
-```
-TWITCH_CHANNEL=ign
-```
-
-Precedence: **command line > `TWITCH_CHANNEL` > `DEFAULT_CHANNEL`**.
-
-### Polling interval
-
-`INTERVAL_SECONDS` at the top of `twitch_viewers.py` (currently 300 = 5
-minutes). Polls land on wall-clock boundaries, so 300 gives you :00, :05, :10.
-Twitch's rate limit is 800 points/minute — an enormous amount of headroom, so
-polling more often is fine.
-
-## Files
-
-| File | Purpose |
-|---|---|
-| `setup.py` | One-time credential setup and verification |
-| `twitch_viewers.py` | The poller |
-| `metrics.py` | Polls viewers, followers and chat size together |
-| `graph.py` | Charts the collected data as an SVG |
-| `user_info.py` | Account details for one or more logins |
-| `followers.py` | Follower count, list, and follow checks |
-| `chatters.py` | How many people are connected to chat |
-| `user_auth.py` | Browser login for endpoints needing a user token |
-| `make_test_data.py` | Generates realistic fake data for testing the chart |
-| `.env` | Your credentials (gitignored, mode 0600) |
-| `.user_token.json` | User access token, if authorized (gitignored, mode 0600) |
-| `viewers_<channel>.csv` | Viewer data from `twitch_viewers.py` |
-| `metrics_<channel>.csv` | All three metrics from `metrics.py` |
-| `poll_<channel>.log` | Status line history, one file per channel |
-| `chart_<channel>.svg` | Generated chart |
-| `.token_cache.json` | Cached app token, shared across channels |
-
-Channel names are lowercased for filenames, so `ign` write to the
-same `viewers_ign.csv` rather than splitting your data across two files.
-
-## Output
-
-**`viewers_<channel>.csv`** — one row per poll:
-
-```
-timestamp_utc,is_live,viewer_count,title,game,started_at,stream_id
-2026-08-21T17:09:52Z,true,176,CODNext Showcase 2026,Special Events,2026-08-21T15:28:54Z,318926150999
-2026-08-21T17:14:52Z,true,181,CODNext Showcase 2026,Special Events,2026-08-21T15:28:54Z,318926150999
-2026-08-21T17:19:52Z,false,,,,,
-```
-
-Offline polls are recorded as rows with `is_live=false`, so a *gap* in the data
-means the script wasn't running, not that the channel was off.
-
-`stream_id` changes between broadcasts — use it to group samples into distinct
-stream sessions.
-
-**`poll_<channel>.log`** — the same status lines printed to the console, for
-checking on a long run after the fact.
-
-## Polling all three metrics
-
-`twitch_viewers.py` records viewers only. `metrics.py` records viewers,
-followers and chat size on the same tick, into one CSV:
-
-```
-python3 metrics.py themeparkgiant
-python3 metrics.py themeparkgiant --once
-python3 metrics.py ign --no-chatters
+twitch-metrics poll themeparkgiant
 ```
 
 ```
 themeparkgiant  LIVE     viewers      51  followers      751  chat     4
 ```
 
-Columns are `timestamp_utc, is_live, viewer_count, follower_count,
-chatter_count, title, game, started_at, stream_id`, written to
-`metrics_<channel>.csv`.
+One row per tick in `data/metrics_<channel>.csv`:
+
+```
+timestamp_utc,is_live,viewer_count,follower_count,chatter_count,title,game,started_at,stream_id
+```
 
 Followers and chat size are recorded **even when the channel is offline** —
 people follow and bots sit in chat between streams — while `viewer_count` is
 blank. Only `is_live` marks a broadcast.
+
+```
+twitch-metrics poll themeparkgiant --once           # one sample
+twitch-metrics poll themeparkgiant --no-chatters    # skip chat size
+twitch-metrics poll themeparkgiant --viewers-only   # viewers alone
+twitch-metrics poll themeparkgiant --interval 60    # every minute
+```
 
 ### What each metric needs
 
@@ -201,98 +137,88 @@ blank. Only `is_live` marks a broadcast.
 | Followers | app | any channel |
 | Chat size | user + `moderator:read:chatters` | channels you moderate |
 
-Chat size is the only one that needs a browser login, so it degrades rather
-than blocking: without a usable token, or on a channel you don't moderate, the
-column is left blank and the other two carry on. `--no-chatters` skips it
-outright. If chat requests fail three times running it stops asking, so a
-permission change mid-run doesn't fill the log with errors.
+Chat size is the only one needing a browser login, so it degrades rather than
+blocking: without a usable token, or on a channel you don't moderate, the column
+is left blank and the other two carry on. After three consecutive failures it
+stops asking, so a permission change mid-run doesn't fill the log with errors.
 
 ### The CSV always appends
 
-Both pollers open the file in append mode and write the header only when it's
+Both formats open in append mode and write the header only when the file is
 empty, so stopping and restarting — minutes or days later — continues the same
 file. Nothing is overwritten, and no marker is written at the join.
 
-That means a gap in the timestamps is the *only* record that polling stopped.
-`graph.py` infers one when the interval between samples exceeds 2.5× the median,
-and treats the samples either side as separate broadcasts. `--date` ignores that
-and takes the whole day.
+A gap in the timestamps is therefore the only record that polling stopped.
+`graph` infers one when the interval exceeds 2.5× the median and treats the
+samples either side as separate broadcasts. `--date` ignores that and takes the
+whole day.
+
+---
 
 ## Graphing
 
 ```
-python3 graph.py IGN --open
+twitch-metrics graph themeparkgiant --open
 ```
 
-Reads `viewers_<channel>.csv` and writes `chart_<channel>.svg`, styled after the
-YouTube Studio "Concurrent viewers" chart: peak and average in the header, a
-filled area curve, gridlines, and elapsed time along the bottom.
-
-It also prints a text summary with a per-block breakdown, so you get the numbers
-without opening the chart.
-
-Pure standard library — no matplotlib, no numpy. SVG opens in any browser and
-stays sharp at any size.
+Reads `data/metrics_<channel>.csv` (falling back to `viewers_<channel>.csv`) and
+writes `charts/chart_<channel>_metrics.svg`. It also prints a text summary, so
+you get the numbers without opening anything.
 
 ### Peak timing
 
-The header shows **when** the peak happened, both as elapsed stream time and as
-a wall-clock time (`at 3:10:00 · 4:00 AM`). The moment is also marked on the
-curve itself with a dot and a dashed drop-line.
+Every peak reports **when** it happened — wall-clock first, elapsed second
+(`peak 740 at 4:45 AM (3:55:00 into the stream)`) — in the header, the panel
+captions and the text summary. The moment is marked on the curve with a dot and
+a dashed drop-line.
+
+Follower tiles show no time, because that number is the change across the window
+rather than a moment.
 
 ### Block averages
 
-Instead of one average line across the whole chart, a short amber line sits over
-each block at that block's average, with a faint vertical divider at each
-boundary — so you can see how the audience moved through the stream rather than
-just its overall level.
+Instead of one average line across the whole chart, a short line sits over each
+block at that block's average, with a faint divider at each boundary.
 
 ```
-python3 graph.py IGN                 # 30-minute blocks (default)
-python3 graph.py IGN --bucket 60     # hourly
-python3 graph.py IGN --bucket 15     # finer
-python3 graph.py IGN --no-buckets    # just the curve
+twitch-metrics graph testchannel               # 30-minute blocks (default)
+twitch-metrics graph testchannel --bucket 60   # hourly
+twitch-metrics graph testchannel --no-buckets  # just the curve
 ```
 
-Hourly blocks on the same data:
+![Hourly averages](docs/chart_hourly.png)
 
-![Hourly averages](docs_chart_hourly.png)
+### One metric, or all three at once
 
-### Multiple metrics
+Each panel gets its own axis, because the three live on completely different
+scales. Followers deliberately **do not** use a zero-based axis: on a 0–800
+scale, a 40-follower gain is an invisible flat line. The panel spans the actual
+range instead.
 
-When `metrics_<channel>.csv` exists, `graph.py` uses it automatically and draws
-a panel per metric — the second image at the top of this README. Each panel
-gets its own axis, because the three live on completely different scales.
+`--composite` overlays all three, each normalised to its own range with the real
+range in the legend:
 
-Followers deliberately **do not** use a zero-based axis: on a 0–800 scale, a
-40-follower gain over a stream is an invisible flat line. The panel spans the
-actual range instead, and the header reports the change rather than the total.
-
-`--composite` overlays all three on one plot instead, each normalised to its
-own range with the real range in the legend:
-
-![Composite](docs_chart_composite.png)
+![Composite](docs/chart_composite.png)
 
 ```
-python3 graph.py testchannel                  # a panel per metric
-python3 graph.py testchannel --composite      # all three overlaid
-python3 graph.py testchannel --only chatters  # just one
-python3 graph.py testchannel --viewers-only   # ignore metrics data
+twitch-metrics graph testchannel --composite
+twitch-metrics graph testchannel --only chatters
+twitch-metrics graph testchannel --viewers-only
 ```
 
 ### Charting one day
 
 ```
-python3 graph.py themeparkgiant --date 2026-08-22
-python3 graph.py themeparkgiant --date today
-python3 graph.py themeparkgiant --list-days
+twitch-metrics graph themeparkgiant --date 2026-08-22
+twitch-metrics graph themeparkgiant --date today
+twitch-metrics graph themeparkgiant --list-days
 ```
 
 This charts a **calendar day** rather than a single broadcast: from the first
 live sample of that day to the last, keeping any offline stretch in between so
 the day reads continuously.
 
-![One day with breaks](docs_chart_day.png)
+![One day with breaks](docs/chart_day.png)
 
 That day was three sittings with two breaks. Three things to notice:
 
@@ -300,23 +226,22 @@ That day was three sittings with two breaks. Three things to notice:
   segment across it, because there is genuinely no viewer count while offline.
 - **Followers** run unbroken straight through — people follow between streams,
   and that is real data.
-- Offline stretches are **shaded**, and the x-axis switches to clock times,
-  since a day view is easier to read against the wall clock than elapsed time.
+- Offline stretches are **shaded**, and the x-axis switches to clock times.
 
-Dates are matched in **local time**, which is the day you mean when you type
-one, even though the CSV stores UTC.
+Dates match in **local time**, which is the day you mean when you type one, even
+though the CSV stores UTC.
 
-Without `--date`, the same file splits into separate broadcasts at each break:
+Without `--date`, the same file splits at each break:
 
 ```
-$ python3 graph.py breaktest --list-sessions
+$ twitch-metrics graph breaktest --list-sessions
 4 broadcast(s) in metrics_breaktest.csv:
   [0] Tue 18 Aug 5:05 AM    0:45:00  peak    180  avg    109  (10 samples)
   [1] Wed 19 Aug 12:50 AM    2:30:00  peak    740  avg    528  (31 samples)
   [2] Wed 19 Aug 4:00 AM    2:30:00  peak    740  avg    464  (31 samples)
   [3] Wed 19 Aug 6:55 AM    3:00:00  peak    740  avg    538  (37 samples)
 
-$ python3 graph.py breaktest --list-days
+$ twitch-metrics graph breaktest --list-days
 2 day(s) with live data in metrics_breaktest.csv:
   2026-08-18    0:45:00  peak    180  10 samples
   2026-08-19    9:05:00  peak    740  112 samples   (0:55:00 offline mid-day)
@@ -325,82 +250,54 @@ $ python3 graph.py breaktest --list-days
 Use `--session` for one sitting, `--date` for a whole day. They can't be
 combined, since they select different things.
 
-### Picking a broadcast
-
-A CSV accumulates every broadcast. `graph.py` splits them on offline rows,
-`stream_id` changes, and gaps where the poller wasn't running, then charts the
-most recent one.
-
-```
-python3 graph.py IGN --list-sessions   # see them all
-python3 graph.py IGN --session 0       # chart an earlier one
-```
-
-Other options: `--output PATH`, `--width`, `--height`, and a direct path
-(`python3 graph.py some_file.csv`).
+---
 
 ## Other lookups
 
-Alongside the poller, four scripts query the API directly. Each takes the
-channel as its first argument, falling back to `TWITCH_CHANNEL` then
-`DEFAULT_CHANNEL` — and each accepts a login, an `@handle`, or a numeric user
-ID.
+Each takes the channel as its first argument, falling back to `TWITCH_CHANNEL`
+then the built-in default, and accepts a login, an `@handle`, or a numeric ID.
 
-### Account details
+### Accounts
 
 ```
-python3 user_info.py prgskidmark
-python3 user_info.py ign prgskidmark themeparkgiant   # batched, up to 100
-python3 user_info.py 35616747 --by-id
-python3 user_info.py prgskidmark --json
+twitch-metrics users prgskidmark
+twitch-metrics users ign prgskidmark themeparkgiant   # batched, up to 100
+twitch-metrics users 35616747 --by-id
 ```
 
-```
-PrgSkidmark
-------------------------------------------------------------
-  Display name   PrgSkidmark
-  Login          prgskidmark
-  User ID        35616747
-  Broadcaster    Affiliate
-  Created        21 Aug 2012  (14 years, 3 days ago)
-```
+Twitch omits unknown logins rather than erroring, so the command reports which
+of the names you asked for came back empty.
 
-Twitch omits unknown logins from the response rather than erroring, so the
-script reports which of the names you asked for came back empty.
-
-Note that `view_count` is still returned by this endpoint but always contains
-`0` — Twitch retired lifetime view counts in 2022 and dropped the field from
-their docs without removing it from the API. It is labelled as deprecated
-rather than displayed as if it meant something.
+`view_count` is still returned by this endpoint but always contains `0` — Twitch
+retired lifetime view counts in 2022 and dropped the field from their docs
+without removing it from the API. It's labelled deprecated rather than shown as
+if it meant something.
 
 ### Followers
 
 ```
-python3 followers.py themeparkgiant                 # just the count
-python3 followers.py themeparkgiant --recent 10     # newest, with how long ago
-python3 followers.py themeparkgiant --list          # everyone, paged
-python3 followers.py themeparkgiant --check someone # do they follow, and since when
-python3 followers.py themeparkgiant --count-only    # bare number, for scripting
+twitch-metrics followers themeparkgiant                 # just the count
+twitch-metrics followers themeparkgiant --recent 10     # newest, with how long ago
+twitch-metrics followers themeparkgiant --list          # everyone, paged
+twitch-metrics followers themeparkgiant --check someone # do they follow, and since when
 ```
 
-The **count works with the ordinary app token**, so it works for any channel:
+The count uses the app token and works for **any** channel:
 
 ```
-$ python3 followers.py ign
+$ twitch-metrics followers ign
 IGN — 308,332 followers
 ```
 
 Seeing *who* follows is different — Twitch returns `total` to anyone but
-withholds the `data` array unless the token belongs to the broadcaster or one
-of their moderators and carries `moderator:read:followers`. Those modes ask for
-a user token; the plain count never does.
+withholds the `data` array unless the token belongs to the broadcaster or a
+moderator and carries `moderator:read:followers`.
 
 ### Chatters
 
 ```
-python3 chatters.py themeparkgiant
-python3 chatters.py themeparkgiant --list
-python3 chatters.py themeparkgiant --count-only
+twitch-metrics chatters themeparkgiant
+twitch-metrics chatters themeparkgiant --list
 ```
 
 ```
@@ -408,82 +305,111 @@ themeparkgiant — 3 people in chat
   (as moderator prgskidmark)
 ```
 
-This one has no app-token path at all — it needs a user token with
-`moderator:read:chatters`. You don't pass a moderator ID: Twitch requires it to
-match the token's own user, so it is read from the token rather than left as
-something to get wrong.
+You don't pass a moderator ID: Twitch requires it to match the token's own user,
+so it's read from the token rather than left as something to get wrong.
 
-Bear in mind the count includes bots and includes whoever is making the
-request, so it has a floor rather than reaching zero.
+The count includes bots and includes whoever is making the request, so it has a
+floor rather than reaching zero.
+
+---
 
 ## User authorization
 
-Most of this project uses an **app access token** (client credentials), which
-represents the application and needs no login. Two endpoints above instead need
-a **user access token** representing a person:
+Most commands use an **app access token** (client credentials), which represents
+the application and needs no login. Chat size and follower *names* need a **user
+access token** representing a person:
 
 ```
-python3 user_auth.py --scope moderator:read:chatters --scope moderator:read:followers
+twitch-metrics auth
 ```
 
-This opens Twitch, you approve, and it catches the redirect on
-`http://localhost:3000` — the redirect URL registered on the app during setup.
-Sign in as the account that moderates the channel, not the broadcaster.
+Opens Twitch, you approve, and it catches the redirect on `http://localhost:3000`
+— the redirect URL registered during setup. Sign in as the account that
+moderates the channel.
 
 ```
-python3 user_auth.py --status    # who the token is for, scopes, time left
-python3 user_auth.py --force     # log in again, e.g. as someone else
-python3 user_auth.py --revoke    # revoke and delete it
+twitch-metrics auth --status    # who it's for, scopes, time left
+twitch-metrics auth --force     # log in again, e.g. as someone else
+twitch-metrics auth --revoke    # revoke and delete it
 ```
 
 The token lasts about four hours and refreshes itself from the stored refresh
 token, so the browser step happens once. Requesting a new scope carries the
-already-granted ones along, so adding one doesn't quietly break the other
-script.
+already-granted ones along, so adding one doesn't break another command.
+
+---
 
 ## Test data
 
-To design or check the chart without waiting for a real 8-hour stream:
+To work on the charts without waiting for a real 8-hour stream:
 
 ```
-python3 make_test_data.py testchannel
-python3 graph.py testchannel --open
+twitch-metrics testdata testchannel
+twitch-metrics graph testchannel --open
 ```
 
-`viewers_testchannel.csv`, `metrics_testchannel.csv` and the generated charts
-are committed, so every chart above can be reproduced without running a poller
-or holding credentials. The generator
-writes the same columns the poller produces, so `graph.py` can't tell the
-difference. The curve is shaped like a real broadcast
-— a ramp at the start, a mid-stream bump, correlated jitter rather than random
-static, occasional spikes, a slow decline and a sharp drop at the end.
-
-The three metrics are generated as one correlated system rather than
-independently: chat size tracks viewers with a bot floor beneath it, and
-followers accrue faster while more people are watching, with the occasional
-unfollow so the line isn't suspiciously monotonic. It also
-writes a short earlier broadcast plus offline rows, so session-splitting gets
-exercised.
+The three metrics are generated as one **correlated** system rather than
+independently: chat size tracks viewers above a bot floor, and followers accrue
+faster while more people are watching, with occasional unfollows so the line
+isn't suspiciously monotonic. The viewer curve ramps, bumps mid-stream, jitters
+with correlated rather than random noise, declines slowly and drops sharply at
+the end.
 
 ```
-python3 make_test_data.py testchannel --hours 4 --peak 2000 --interval 60
-python3 make_test_data.py testchannel --single --seed 42
-python3 make_test_data.py breaktest --break 2.5:40 --break 5:25
+twitch-metrics testdata testchannel --hours 4 --peak 2000 --interval 60
+twitch-metrics testdata breaktest --break 2.5:40 --break 5:25
 ```
 
 `--break H:M` inserts an offline gap M minutes long, H hours in — repeatable,
-and each restart gets a new `stream_id` the way Twitch issues one. That's what
-the day chart above is generated from.
+each restart taking a new `stream_id` the way Twitch issues one. That's what the
+day chart above is generated from. The seed is fixed by default, so regenerating
+gives identical data.
 
-The seed is fixed by default, so regenerating gives identical data.
+## Tests
+
+```
+python3 tests/smoke.py
+```
+
+38 checks over the committed fixtures — parsing, session detection, day
+selection, gap handling, axis choice, path safety, rendering and CLI wiring. No
+network, no credentials, no tokens. It won't catch Twitch changing an API
+contract; only regressions in this code.
+
+---
+
+## Layout
+
+```
+twitchmetrics/          the package
+  config.py             paths, .env, channel resolution
+  auth.py               app access token
+  useroauth.py          user access token (browser flow)
+  api.py                Helix endpoint wrappers
+  storage.py            CSV read and append
+  chart.py              SVG rendering
+  testdata.py           synthetic data model
+  cli.py                subcommand dispatch
+  commands/             one module per subcommand
+data/                   samples, logs, cached tokens   (gitignored)
+charts/                 generated SVGs                 (gitignored)
+tests/fixtures/         synthetic sample data           (committed)
+docs/                   README images
+deploy/                 systemd unit and server notes
+```
+
+`data/` and `charts/` can be redirected with `TWITCH_DATA_DIR` and
+`TWITCH_CHARTS_DIR`, which is useful when the data belongs on a mounted volume.
+
+`data/` holds the only irreplaceable thing here — charts regenerate from the
+CSVs, and tokens can be re-fetched.
 
 ## Notes
 
 - `viewer_count` is Twitch's live concurrent-viewer number and lags reality by
-  about a minute. Don't confuse it with `view_count` on the Get Users endpoint,
-  which is a deprecated lifetime-views field that now always returns 0.
-- The 10-minute interval is the `INTERVAL_SECONDS` constant at the top of
-  `twitch_viewers.py`. Twitch's rate limit (800 points/min) leaves enormous
-  headroom if you want to poll more often.
-- Network errors, Twitch outages and rate limits are logged and skipped; the
-  loop keeps running. An expired or revoked token is refreshed automatically.
+  about a minute. Treat it as approximate.
+- Twitch's rate limit is 800 points/minute. Polling every 5 minutes uses a
+  vanishing fraction of that, so a shorter interval is fine.
+- Charts are SVG. To convert to PNG: `brew install librsvg` or
+  `apt install librsvg2-bin`, then `rsvg-convert -w 1600 in.svg -o out.png`.
+  Not needed for anything the project itself does.
