@@ -142,31 +142,46 @@ python3 -m twitchmetrics poll themeparkgiant --no-chatters
 
 ### systemd — the right answer for a Linux server
 
-Survives reboots, restarts on crash, and gives you `systemctl status` and
-journal logs.
+The unit is a **template**, so one file serves any number of channels. The name
+after the `@` becomes the channel.
 
 ```
-sudo cp deploy/twitch-metrics.service /etc/systemd/system/
-sudoedit /etc/systemd/system/twitch-metrics.service   # set User, WorkingDirectory, channel
+sudo cp deploy/twitch-metrics@.service /etc/systemd/system/
+sudoedit /etc/systemd/system/twitch-metrics@.service   # set User, Group, WorkingDirectory
 sudo systemctl daemon-reload
-sudo systemctl enable --now twitch-metrics
+
+sudo systemctl enable --now twitch-metrics@themeparkgiant
+sudo systemctl enable --now twitch-metrics@prgskidmark
 ```
 
-Then:
+Both run simultaneously and independently:
 
 ```
-systemctl status twitch-metrics      # is it running
-journalctl -u twitch-metrics -f      # follow the output
-sudo systemctl restart twitch-metrics
-sudo systemctl stop twitch-metrics
+systemctl status twitch-metrics@themeparkgiant
+journalctl -u twitch-metrics@prgskidmark -f
+systemctl restart twitch-metrics@themeparkgiant
+systemctl stop 'twitch-metrics@*'          # all of them
+systemctl list-units 'twitch-metrics@*'    # what's running
 ```
+
+Each instance writes its own `data/metrics_<channel>.csv` and
+`data/metrics_<channel>.log`. One crashing, restarting or being stopped has no
+effect on the others.
+
+The only state they share is the cached tokens in `data/`. Those are written
+atomically (temp file plus rename, so a reader never sees a half-written file),
+and the user-token refresh is serialised with a file lock — Twitch rotates the
+refresh token on use, so two pollers refreshing at the same instant would
+otherwise leave one holding an invalidated credential. Whichever poller waits
+picks up the other's fresh token instead of rotating again.
 
 `systemctl stop` sends SIGTERM, which the poller handles: it finishes the
 current sample, writes a summary line and exits 0 — it does not die mid-write,
 and it does not sit out the rest of the polling interval first.
 
-If it won't start, `journalctl -u twitch-metrics -n 50` almost always says why —
-usually a wrong `WorkingDirectory`, or a `User` that can't read `.env`.
+If it won't start, `journalctl -u twitch-metrics@themeparkgiant -n 50` almost
+always says why — usually a wrong `WorkingDirectory`, or a `User` that can't
+read `.env`.
 
 ### tmux — quickest thing that survives disconnecting
 

@@ -32,11 +32,14 @@ def _read_cache():
 
 
 def _write_cache(token, expires_in):
+    """Atomic, because several pollers share this file."""
     config.ensure_dirs()
+    temporary = config.TOKEN_CACHE_PATH + ".tmp{}".format(os.getpid())
     try:
-        with open(config.TOKEN_CACHE_PATH, "w", encoding="utf-8") as handle:
+        with open(temporary, "w", encoding="utf-8") as handle:
             json.dump({"access_token": token, "expires_at": time.time() + expires_in}, handle)
-        os.chmod(config.TOKEN_CACHE_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+        os.replace(temporary, config.TOKEN_CACHE_PATH)
     except OSError as exc:
         log("WARN     could not cache token: {}".format(exc))
 

@@ -140,6 +140,21 @@ with tempfile.TemporaryDirectory() as tmp:
                                 cwd=root, capture_output=True, text=True)
         check(label, result.returncode != 0, "expected non-zero exit")
 
+# --- concurrency safety ---------------------------------------------------
+section("concurrency")
+from twitchmetrics import useroauth as _uo  # noqa: E402
+check("token writes are atomic (temp + rename)",
+      "os.replace" in open(os.path.join(root, "twitchmetrics/useroauth.py")).read())
+check("app token writes are atomic",
+      "os.replace" in open(os.path.join(root, "twitchmetrics/auth.py")).read())
+check("refresh is lock-protected", hasattr(_uo, "_refresh_lock"))
+check("poller re-reads the token each tick, not once at startup",
+      "_current_user_token" in open(os.path.join(root, "twitchmetrics/commands/poll.py")).read())
+check("channels get separate data files",
+      config.metrics_csv("a") != config.metrics_csv("b"))
+check("systemd unit is a per-channel template",
+      "%i" in open(os.path.join(root, "deploy/twitch-metrics@.service")).read())
+
 # --- signals --------------------------------------------------------------
 section("shutdown signals")
 import signal as _signal  # noqa: E402

@@ -74,6 +74,48 @@ def _sample_total(what, call):
     return None
 
 
+def _current_user_token(state, force_refresh=False):
+    """A live user token, refreshed as needed.
+
+    Re-read every tick rather than cached for the life of the process: user
+    tokens last about four hours, so a long-running service that held the
+    startup token would quietly stop collecting chat size after the first
+    afternoon. Re-reading also picks up a refresh performed by a sibling
+    poller for another channel.
+    """
+    try:
+        payload = useroauth.user_token([api.SCOPE_CHATTERS], interactive=False,
+                                       force_refresh=force_refresh)
+    except SystemExit as exc:
+        log("WARN     user token unavailable — {}".format(str(exc).splitlines()[0]))
+        return None
+    state["moderator_id"] = str(payload.get("user_id"))
+    return payload["access_token"]
+
+
+def _sample_chatters(state):
+    """Chat size, refreshing the user token once if Twitch rejects it."""
+    token = _current_user_token(state)
+    if not token:
+        return None
+    try:
+        return api.get_chatters(state["broadcaster_id"], state["moderator_id"],
+                                token, state["client_id"]).get("total")
+    except urllib.error.HTTPError as exc:
+        if exc.code != 401:
+            log("WARN     chatters HTTP {}".format(exc.code))
+            return None
+        log("auth     user token rejected, refreshing and retrying once")
+        token = _current_user_token(state, force_refresh=True)
+        if not token:
+            return None
+        return _sample_total("chatters", lambda: api.get_chatters(
+            state["broadcaster_id"], state["moderator_id"], token, state["client_id"]))
+    except (api.RateLimited, urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        log("WARN     chatters failed: {}".format(exc))
+    return None
+
+
 def poll_once(state):
     """Sample everything enabled and append one row. True if a row was written."""
     try:
@@ -117,9 +159,7 @@ def poll_once(state):
 
     chatters = None
     if state["chatters_enabled"]:
-        chatters = _sample_total("chatters", lambda: api.get_chatters(
-            state["broadcaster_id"], state["moderator_id"],
-            state["user_token"], state["client_id"]))
+        chatters = _sample_chatters(state)
         if chatters is None:
             state["chatter_failures"] += 1
             if state["chatter_failures"] >= CHATTER_FAILURE_LIMIT:
@@ -182,15 +222,13 @@ def run(args):
         "broadcaster_id": broadcaster_id, "csv_path": csv_path,
         "viewers_only": args.viewers_only,
         "chatters_enabled": False, "chatter_failures": 0,
-        "user_token": None, "moderator_id": None,
+        "moderator_id": None,
     }
 
     if not args.viewers_only and not args.no_chatters:
         try:
             payload = useroauth.user_token([api.SCOPE_CHATTERS], interactive=False)
-            state.update(user_token=payload["access_token"],
-                         moderator_id=str(payload.get("user_id")),
-                         chatters_enabled=True)
+            state.update(moderator_id=str(payload.get("user_id")), chatters_enabled=True)
             log("start    chat size enabled as moderator {}".format(payload.get("login")))
         except SystemExit as exc:
             log("start    chat size disabled — {}".format(str(exc).splitlines()[0]))

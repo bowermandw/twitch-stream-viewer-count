@@ -6,6 +6,7 @@ the refresh token keeps it alive unattended, which is what makes this workable
 on a server.
 """
 
+import contextlib
 import http.server
 import json
 import os
@@ -52,10 +53,42 @@ def load_token():
 
 
 def save_token(payload):
+    """Write atomically, so a concurrent reader never sees a half-written file.
+
+    Several pollers (one per channel) share this file, and a plain open("w")
+    truncates before the new content lands.
+    """
     config.ensure_dirs()
-    with open(config.USER_TOKEN_PATH, "w", encoding="utf-8") as handle:
+    temporary = config.USER_TOKEN_PATH + ".tmp{}".format(os.getpid())
+    with open(temporary, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, indent=2)
-    os.chmod(config.USER_TOKEN_PATH, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    os.replace(temporary, config.USER_TOKEN_PATH)
+
+
+@contextlib.contextmanager
+def _refresh_lock():
+    """Serialise refreshes across processes.
+
+    Twitch rotates the refresh token on use, so two pollers refreshing at the
+    same moment would leave one holding an invalidated token. The loser of the
+    lock re-reads the file afterwards and picks up the winner's new token.
+    """
+    config.ensure_dirs()
+    path = config.USER_TOKEN_PATH + ".lock"
+    try:
+        import fcntl
+    except ImportError:
+        yield  # not POSIX; single-process use only
+        return
+    handle = open(path, "w")
+    try:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def _store(raw, scopes):
@@ -99,8 +132,22 @@ def validate(access_token):
 
 
 def refresh(payload, client_id, client_secret, scopes):
+    """Exchange the refresh token for a new access token.
+
+    Holds a lock and re-reads first: if another poller refreshed while we were
+    waiting, its result is already good and rotating again would invalidate it.
+    """
     if not payload.get("refresh_token"):
         return None
+    with _refresh_lock():
+        current = load_token()
+        if (current and current.get("access_token") != payload.get("access_token")
+                and current.get("expires_at", 0) - time.time() > REFRESH_MARGIN):
+            return current  # someone else refreshed; use theirs
+        return _refresh_locked(current or payload, client_id, client_secret, scopes)
+
+
+def _refresh_locked(payload, client_id, client_secret, scopes):
     try:
         raw = _post_form(config.TOKEN_URL, {
             "grant_type": "refresh_token",
@@ -276,17 +323,23 @@ def authorize(client_id, client_secret, scopes, open_browser=True, manual=False)
     return payload
 
 
-def user_token(scopes, interactive=True):
+def user_token(scopes, interactive=True, force_refresh=False):
     """A valid user token carrying every scope in `scopes`.
 
     Reuses the stored token, refreshes when stale, and only falls back to a
     browser login when there is no other way. interactive=False raises instead,
     which is what the pollers use so they never block on a prompt.
+
+    Safe to call on every tick: the happy path is one file read, and because the
+    file is re-read each time, a token refreshed by another poller is picked up
+    automatically.
     """
     client_id, client_secret = config.load_credentials()
     payload = load_token()
 
-    if payload:
+    if payload and force_refresh:
+        payload = refresh(payload, client_id, client_secret, scopes)
+    elif payload:
         missing = [s for s in scopes if s not in (payload.get("scopes") or [])]
         if missing:
             combined = sorted(set(scopes) | set(payload.get("scopes") or []))
@@ -303,9 +356,6 @@ def user_token(scopes, interactive=True):
             payload = None
         elif payload["expires_at"] - time.time() < REFRESH_MARGIN:
             payload = refresh(payload, client_id, client_secret, scopes)
-
-    if payload and not validate(payload["access_token"]):
-        payload = refresh(payload, client_id, client_secret, scopes)
 
     if not payload:
         if not interactive:

@@ -1,0 +1,54 @@
+# systemd TEMPLATE unit — one instance per channel.
+#
+# The name after the @ is passed to the poller as the channel, so a single file
+# serves any number of channels:
+#
+#   sudo cp deploy/twitch-metrics@.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now twitch-metrics@themeparkgiant
+#   sudo systemctl enable --now twitch-metrics@prgskidmark
+#
+#   systemctl status twitch-metrics@themeparkgiant
+#   journalctl -u twitch-metrics@prgskidmark -f
+#   systemctl stop 'twitch-metrics@*'
+#
+# Instances are independent: each writes data/metrics_<channel>.csv and its own
+# log, and one crashing or being stopped does not affect the others. They share
+# the cached tokens, which are written atomically and refreshed under a lock.
+#
+# Edit User, Group and WorkingDirectory to match your install.
+
+[Unit]
+Description=Twitch metrics poller for %i
+Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=twitch
+Group=twitch
+WorkingDirectory=/opt/twitch-metrics
+ExecStart=/usr/bin/python3 -m twitchmetrics poll %i
+
+# Restart on crash, backing off so a persistent failure doesn't spin.
+Restart=on-failure
+RestartSec=30
+
+# SIGTERM is handled: the poller finishes its current sample and exits 0.
+# It never needs the full grace period, so a short one surfaces real hangs.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
+StandardOutput=journal
+StandardError=journal
+
+# Only the data and charts directories need to be writable.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/twitch-metrics/data /opt/twitch-metrics/charts
+
+[Install]
+WantedBy=multi-user.target

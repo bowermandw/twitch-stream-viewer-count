@@ -136,12 +136,27 @@ current sample, writes a summary and exits 0, without waiting out the rest of
 the interval. That makes it safe under a service manager.
 
 ```
-tmux new -s twitch                      # quick: Ctrl-B D to detach
-sudo systemctl enable --now twitch-metrics   # permanent, survives reboots
+tmux new -s twitch                                    # quick: Ctrl-B D to detach
+sudo systemctl enable --now twitch-metrics@themeparkgiant   # permanent
 ```
 
-The systemd unit is in [`deploy/`](deploy/), along with tmux, nohup, cron and
-launchd recipes and a logrotate config.
+### Several channels at once
+
+Each channel keeps its own CSV and log, so pollers run side by side without
+interfering. The systemd unit is a template — the name after the `@` is the
+channel:
+
+```
+sudo systemctl enable --now twitch-metrics@themeparkgiant
+sudo systemctl enable --now twitch-metrics@prgskidmark
+```
+
+The only shared state is the cached tokens. Those are written atomically, and
+refreshes are serialised with a file lock, because Twitch rotates the refresh
+token on use.
+
+The unit and recipes for tmux, nohup, cron, launchd and logrotate are in
+[`deploy/`](deploy/).
 
 ### What each metric needs
 
