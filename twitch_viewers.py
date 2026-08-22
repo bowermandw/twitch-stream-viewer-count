@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-DEFAULT_CHANNEL = "ign"
+DEFAULT_CHANNEL = "themeparkgiant"
 INTERVAL_SECONDS = 300  # 5 minutes
 
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"

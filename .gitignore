@@ -1,6 +1,7 @@
 # Credentials and tokens — never commit these
 .env
 .token_cache.json
+.user_token.json
 
 # Collected data and generated charts
 viewers_*.csv
@@ -13,3 +14,5 @@ chart_*.svg
 
 __pycache__/
 *.pyc
+
+bruno/

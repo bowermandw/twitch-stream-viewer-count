@@ -128,8 +128,13 @@ polling more often is fine.
 | `setup.py` | One-time credential setup and verification |
 | `twitch_viewers.py` | The poller |
 | `graph.py` | Charts the collected data as an SVG |
+| `user_info.py` | Account details for one or more logins |
+| `followers.py` | Follower count, list, and follow checks |
+| `chatters.py` | How many people are connected to chat |
+| `user_auth.py` | Browser login for endpoints needing a user token |
 | `make_test_data.py` | Generates realistic fake data for testing the chart |
 | `.env` | Your credentials (gitignored, mode 0600) |
+| `.user_token.json` | User access token, if authorized (gitignored, mode 0600) |
 | `viewers_<channel>.csv` | Collected data, one file per channel |
 | `poll_<channel>.log` | Status line history, one file per channel |
 | `chart_<channel>.svg` | Generated chart |
@@ -211,6 +216,108 @@ python3 graph.py IGN --session 0       # chart an earlier one
 
 Other options: `--output PATH`, `--width`, `--height`, and a direct path
 (`python3 graph.py some_file.csv`).
+
+## Other lookups
+
+Alongside the poller, four scripts query the API directly. Each takes the
+channel as its first argument, falling back to `TWITCH_CHANNEL` then
+`DEFAULT_CHANNEL` — and each accepts a login, an `@handle`, or a numeric user
+ID.
+
+### Account details
+
+```
+python3 user_info.py prgskidmark
+python3 user_info.py ign prgskidmark themeparkgiant   # batched, up to 100
+python3 user_info.py 35616747 --by-id
+python3 user_info.py prgskidmark --json
+```
+
+```
+PrgSkidmark
+------------------------------------------------------------
+  Display name   PrgSkidmark
+  Login          prgskidmark
+  User ID        35616747
+  Broadcaster    Affiliate
+  Created        21 Aug 2012  (14 years, 3 days ago)
+```
+
+Twitch omits unknown logins from the response rather than erroring, so the
+script reports which of the names you asked for came back empty.
+
+Note that `view_count` is still returned by this endpoint but always contains
+`0` — Twitch retired lifetime view counts in 2022 and dropped the field from
+their docs without removing it from the API. It is labelled as deprecated
+rather than displayed as if it meant something.
+
+### Followers
+
+```
+python3 followers.py themeparkgiant                 # just the count
+python3 followers.py themeparkgiant --recent 10     # newest, with how long ago
+python3 followers.py themeparkgiant --list          # everyone, paged
+python3 followers.py themeparkgiant --check someone # do they follow, and since when
+python3 followers.py themeparkgiant --count-only    # bare number, for scripting
+```
+
+The **count works with the ordinary app token**, so it works for any channel:
+
+```
+$ python3 followers.py ign
+IGN — 308,332 followers
+```
+
+Seeing *who* follows is different — Twitch returns `total` to anyone but
+withholds the `data` array unless the token belongs to the broadcaster or one
+of their moderators and carries `moderator:read:followers`. Those modes ask for
+a user token; the plain count never does.
+
+### Chatters
+
+```
+python3 chatters.py themeparkgiant
+python3 chatters.py themeparkgiant --list
+python3 chatters.py themeparkgiant --count-only
+```
+
+```
+themeparkgiant — 3 people in chat
+  (as moderator prgskidmark)
+```
+
+This one has no app-token path at all — it needs a user token with
+`moderator:read:chatters`. You don't pass a moderator ID: Twitch requires it to
+match the token's own user, so it is read from the token rather than left as
+something to get wrong.
+
+Bear in mind the count includes bots and includes whoever is making the
+request, so it has a floor rather than reaching zero.
+
+## User authorization
+
+Most of this project uses an **app access token** (client credentials), which
+represents the application and needs no login. Two endpoints above instead need
+a **user access token** representing a person:
+
+```
+python3 user_auth.py --scope moderator:read:chatters --scope moderator:read:followers
+```
+
+This opens Twitch, you approve, and it catches the redirect on
+`http://localhost:3000` — the redirect URL registered on the app during setup.
+Sign in as the account that moderates the channel, not the broadcaster.
+
+```
+python3 user_auth.py --status    # who the token is for, scopes, time left
+python3 user_auth.py --force     # log in again, e.g. as someone else
+python3 user_auth.py --revoke    # revoke and delete it
+```
+
+The token lasts about four hours and refreshes itself from the stored refresh
+token, so the browser step happens once. Requesting a new scope carries the
+already-granted ones along, so adding one doesn't quietly break the other
+script.
 
 ## Test data
 
