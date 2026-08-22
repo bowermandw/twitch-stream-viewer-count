@@ -140,6 +140,31 @@ with tempfile.TemporaryDirectory() as tmp:
                                 cwd=root, capture_output=True, text=True)
         check(label, result.returncode != 0, "expected non-zero exit")
 
+# --- signals --------------------------------------------------------------
+section("shutdown signals")
+import signal as _signal  # noqa: E402
+import time as _time      # noqa: E402
+for _name, _sig in (("SIGTERM", _signal.SIGTERM), ("SIGINT", _signal.SIGINT)):
+    with tempfile.TemporaryDirectory() as _tmp:
+        _env = dict(os.environ, TWITCH_DATA_DIR=_tmp, TWITCH_CHARTS_DIR=_tmp,
+                    TWITCH_CLIENT_ID="x", TWITCH_CLIENT_SECRET="y")
+        _p = subprocess.Popen([sys.executable, "-u", "-m", "twitchmetrics", "poll",
+                               "nochannel", "--interval", "60", "--viewers-only"],
+                              cwd=root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              text=True, env=_env)
+        _time.sleep(3)
+        _started = _time.time()
+        _p.send_signal(_sig)
+        try:
+            _out, _ = _p.communicate(timeout=12)
+            _took = _time.time() - _started
+        except subprocess.TimeoutExpired:
+            _p.kill(); _out, _took = _p.communicate()[0], 99
+        check("{} exits 0".format(_name), _p.returncode == 0, "got %s" % _p.returncode)
+        check("{} logs a summary".format(_name), "stop " in _out)
+        check("{} doesn't wait out the interval".format(_name), _took < 10,
+              "took %.1fs" % _took)
+
 # --- invocation name ------------------------------------------------------
 section("invocation name")
 result = subprocess.run([sys.executable, "-m", "twitchmetrics", "--help"],

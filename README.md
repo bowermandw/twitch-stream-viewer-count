@@ -56,8 +56,8 @@ entry point. If you'd rather not bother, `python3 -m twitchmetrics` is
 equivalent everywhere and needs nothing. This README writes the short form for
 readability; substitute whichever you use.
 
-For servers, see [`deploy/README.md`](deploy/README.md) — requirements, systemd
-unit, and how to handle the one step that needs a browser.
+For servers, see [`deploy/README.md`](deploy/README.md) — requirements, running
+it in the background, and how to handle the one step that needs a browser.
 
 ## Credentials
 
@@ -128,6 +128,20 @@ twitch-metrics poll themeparkgiant --no-chatters    # skip chat size
 twitch-metrics poll themeparkgiant --viewers-only   # viewers alone
 twitch-metrics poll themeparkgiant --interval 60    # every minute
 ```
+
+### Running it in the background
+
+`Ctrl-C`, `SIGTERM` and `SIGHUP` all shut down cleanly — the poller finishes the
+current sample, writes a summary and exits 0, without waiting out the rest of
+the interval. That makes it safe under a service manager.
+
+```
+tmux new -s twitch                      # quick: Ctrl-B D to detach
+sudo systemctl enable --now twitch-metrics   # permanent, survives reboots
+```
+
+The systemd unit is in [`deploy/`](deploy/), along with tmux, nohup, cron and
+launchd recipes and a logrotate config.
 
 ### What each metric needs
 

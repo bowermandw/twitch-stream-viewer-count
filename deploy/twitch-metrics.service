@@ -24,6 +24,11 @@ ExecStart=/usr/bin/python3 -m twitchmetrics poll themeparkgiant
 Restart=on-failure
 RestartSec=30
 
+# SIGTERM is handled: the poller finishes its current sample and exits 0.
+# It never needs the full grace period, so a short one surfaces real hangs.
+KillSignal=SIGTERM
+TimeoutStopSec=20
+
 # The poller survives API errors itself; this is for the unexpected.
 StandardOutput=journal
 StandardError=journal

@@ -138,20 +138,136 @@ all:
 python3 -m twitchmetrics poll themeparkgiant --no-chatters
 ```
 
-## Run it continuously
+## Run it in the background
 
-Copy `twitch-metrics.service` into systemd — see the comments at the top of that
-file. Adjust `User`, `WorkingDirectory` and the channel.
+### systemd — the right answer for a Linux server
+
+Survives reboots, restarts on crash, and gives you `systemctl status` and
+journal logs.
 
 ```
 sudo cp deploy/twitch-metrics.service /etc/systemd/system/
+sudoedit /etc/systemd/system/twitch-metrics.service   # set User, WorkingDirectory, channel
 sudo systemctl daemon-reload
 sudo systemctl enable --now twitch-metrics
-journalctl -u twitch-metrics -f
 ```
 
-The poller handles token refresh, rate limits, API outages and network loss
-itself, so `Restart=on-failure` is a backstop rather than the main mechanism.
+Then:
+
+```
+systemctl status twitch-metrics      # is it running
+journalctl -u twitch-metrics -f      # follow the output
+sudo systemctl restart twitch-metrics
+sudo systemctl stop twitch-metrics
+```
+
+`systemctl stop` sends SIGTERM, which the poller handles: it finishes the
+current sample, writes a summary line and exits 0 — it does not die mid-write,
+and it does not sit out the rest of the polling interval first.
+
+If it won't start, `journalctl -u twitch-metrics -n 50` almost always says why —
+usually a wrong `WorkingDirectory`, or a `User` that can't read `.env`.
+
+### tmux — quickest thing that survives disconnecting
+
+No root, no unit file. Good for trying it out before committing to a service.
+
+```
+tmux new -s twitch
+python3 -m twitchmetrics poll themeparkgiant
+# Ctrl-B then D to detach; the poller keeps running
+```
+
+```
+tmux attach -t twitch     # come back to it
+tmux ls                   # what's running
+```
+
+Does **not** survive a reboot. `screen -S twitch` works the same way.
+
+### nohup — one command, no dependencies
+
+```
+nohup python3 -m twitchmetrics poll themeparkgiant > /dev/null 2>&1 &
+echo $! > /tmp/twitch.pid
+```
+
+Output still goes to `data/metrics_<channel>.log`, which is why stdout can be
+discarded. To stop it:
+
+```
+kill $(cat /tmp/twitch.pid)
+```
+
+That sends SIGTERM, so it shuts down cleanly. Also does not survive a reboot.
+
+### cron — if you would rather not have a long-running process
+
+`--once` takes a single sample and exits, so cron can drive the schedule
+instead:
+
+```
+*/5 * * * * cd /opt/twitch-metrics && /usr/bin/python3 -m twitchmetrics poll themeparkgiant --once >> data/cron.log 2>&1
+```
+
+The trade-off: a fresh process every five minutes re-reads the token cache and
+re-resolves the channel id, and cron's sparse environment is a common source of
+"works in my shell, not in cron" problems. Prefer systemd unless you have a
+reason.
+
+### macOS
+
+`launchd` is the local equivalent of systemd. A minimal agent at
+`~/Library/LaunchAgents/com.you.twitchmetrics.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>Label</key><string>com.you.twitchmetrics</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/python3</string>
+    <string>-m</string><string>twitchmetrics</string>
+    <string>poll</string><string>themeparkgiant</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/you/Dev/twitch-stream-viewer-count</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+</dict></plist>
+```
+
+```
+launchctl load ~/Library/LaunchAgents/com.you.twitchmetrics.plist
+launchctl unload ~/Library/LaunchAgents/com.you.twitchmetrics.plist
+```
+
+Use an absolute path to the interpreter — launchd does not inherit your shell
+PATH.
+
+## Log growth
+
+`data/*.log` grows without bound. At a 5-minute interval that is roughly 2 MB a
+year, so it is not urgent, but for a permanent install:
+
+```
+sudo tee /etc/logrotate.d/twitch-metrics <<'CONF'
+/opt/twitch-metrics/data/*.log {
+    weekly
+    rotate 8
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+CONF
+```
+
+`copytruncate` matters — the poller holds no persistent handle, but it appends,
+and rotating out from under it without truncating would leave a sparse file.
+
+The CSVs are the data and should not be rotated.
 
 ## Optional: PNG conversion
 
