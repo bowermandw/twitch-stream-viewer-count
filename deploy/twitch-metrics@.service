@@ -16,7 +16,20 @@
 # log, and one crashing or being stopped does not affect the others. They share
 # the cached tokens, which are written atomically and refreshed under a lock.
 #
-# Edit User, Group and WorkingDirectory to match your install.
+# BEFORE ENABLING, edit User, Group and WorkingDirectory below to match your
+# install. The values here are placeholders and WILL fail if left as-is:
+#
+#   User=twitch does not exist by default -> systemd exits 217/USER before
+#   running anything, and the service restart-loops with no Python output.
+#
+# Create the account:      useradd -r -s /usr/sbin/nologin twitch
+# Or run as yourself:      set User= and Group= to an existing account.
+#
+# If the checkout lives under /root or /home, also set ProtectHome=no —
+# read-only would stop the poller writing its CSV.
+#
+# Confirm what systemd resolved:
+#   systemctl show -p User -p WorkingDirectory twitch-metrics@yourchannel
 
 [Unit]
 Description=Twitch metrics poller for %i

@@ -179,9 +179,44 @@ picks up the other's fresh token instead of rotating again.
 current sample, writes a summary line and exits 0 — it does not die mid-write,
 and it does not sit out the rest of the polling interval first.
 
-If it won't start, `journalctl -u twitch-metrics@themeparkgiant -n 50` almost
-always says why — usually a wrong `WorkingDirectory`, or a `User` that can't
-read `.env`.
+### If it won't start
+
+`journalctl -u twitch-metrics@themeparkgiant -n 50` almost always says why. The
+common ones, all caused by the template's placeholders not matching your
+install:
+
+| Journal says | Cause | Fix |
+|---|---|---|
+| `status=217/USER` | `User=twitch` doesn't exist on this machine | create it, or set `User=` to an account that does |
+| `status=200/CHDIR` | `WorkingDirectory` doesn't exist | point it at your actual checkout |
+| `No module named twitchmetrics` | right directory, wrong interpreter or cwd | check `ExecStart` python path and `WorkingDirectory` |
+| starts, then `Permission denied` writing the CSV | `ProtectSystem`/`ProtectHome` blocking the data dir | add the path to `ReadWritePaths` |
+
+`217/USER` is the one that catches people, because systemd fails *before*
+running anything: there is no Python traceback, the service just restart-loops,
+and nothing is ever written. `systemctl status` shows `activating
+(auto-restart)` rather than `failed`, which reads like it's still coming up.
+
+**Check what systemd actually resolved** rather than what you think the file
+says:
+
+```
+systemctl show -p User -p WorkingDirectory -p ExecStart twitch-metrics@themeparkgiant
+```
+
+### Keeping the checkout in a home directory
+
+If it lives in `/root` or `/home/you` rather than `/opt`, the template's
+`ProtectHome=read-only` makes that path unwritable and the poller can't write
+its CSV. Set `ProtectHome=no` and point `ReadWritePaths` at the data directory.
+
+### Drop-ins on a template unit
+
+`systemctl edit twitch-metrics@themeparkgiant` writes to
+`twitch-metrics@themeparkgiant.service.d/`, which applies to that instance only.
+Settings meant for every channel belong in the template file itself — editing
+`/etc/systemd/system/twitch-metrics@.service` is the reliable way to change
+`User`, `WorkingDirectory` and friends for all of them.
 
 ### Changing the polling interval
 
