@@ -183,6 +183,29 @@ If it won't start, `journalctl -u twitch-metrics@themeparkgiant -n 50` almost
 always says why — usually a wrong `WorkingDirectory`, or a `User` that can't
 read `.env`.
 
+### Changing the polling interval
+
+`TWITCH_INTERVAL` in `.env` applies to every instance:
+
+```
+TWITCH_INTERVAL=60
+```
+
+For a single instance, add an override rather than editing the shared template:
+
+```
+sudo systemctl edit twitch-metrics@themeparkgiant
+```
+
+```ini
+[Service]
+Environment=TWITCH_INTERVAL=60
+```
+
+Then `sudo systemctl restart twitch-metrics@themeparkgiant`. Overrides live in
+`/etc/systemd/system/twitch-metrics@themeparkgiant.service.d/` and survive
+updates to the template.
+
 ### tmux — quickest thing that survives disconnecting
 
 No root, no unit file. Good for trying it out before committing to a service.

@@ -129,6 +129,26 @@ twitch-metrics poll themeparkgiant --viewers-only   # viewers alone
 twitch-metrics poll themeparkgiant --interval 60    # every minute
 ```
 
+### Changing the interval
+
+No code edit needed. Either flag it per run, or set it once in `.env`:
+
+```
+TWITCH_INTERVAL=60
+```
+
+Precedence is **`--interval` > `TWITCH_INTERVAL` > 300 seconds**, with a minimum
+of 10. A value that isn't a number is reported rather than silently ignored,
+since a typo in a service file would otherwise poll at the wrong rate unnoticed.
+
+Samples land on wall-clock boundaries, so 60 gives you :00, :01, :02 and 300
+gives :00, :05, :10.
+
+Twitch's rate limit is 800 points per minute. Polling three metrics every 60
+seconds for one channel uses 3 — even a dozen channels at that rate is nowhere
+near it. The real cost is file size: one channel at 60s writes about 1,440 rows
+a day, roughly 100 MB a year, against 20 MB at the default.
+
 ### Running it in the background
 
 `Ctrl-C`, `SIGTERM` and `SIGHUP` all shut down cleanly — the poller finishes the

@@ -140,6 +140,26 @@ with tempfile.TemporaryDirectory() as tmp:
                                 cwd=root, capture_output=True, text=True)
         check(label, result.returncode != 0, "expected non-zero exit")
 
+# --- interval configuration -----------------------------------------------
+section("interval")
+_saved = os.environ.pop("TWITCH_INTERVAL", None)
+check("defaults to 300", config.resolve_interval(None) == 300)
+os.environ["TWITCH_INTERVAL"] = "60"
+check("TWITCH_INTERVAL is honoured", config.resolve_interval(None) == 60)
+check("--interval beats the env var", config.resolve_interval(120) == 120)
+for _bad in ("sixty", "5", "-1", "1.5"):
+    os.environ["TWITCH_INTERVAL"] = _bad
+    try:
+        config.resolve_interval(None)
+        check("rejects {!r}".format(_bad), False, "accepted it")
+    except SystemExit:
+        check("rejects {!r}".format(_bad), True)
+os.environ["TWITCH_INTERVAL"] = ""   # emptying a line means "unset", as for TWITCH_CHANNEL
+check("empty value falls back to the default", config.resolve_interval(None) == 300)
+os.environ.pop("TWITCH_INTERVAL", None)
+if _saved is not None:
+    os.environ["TWITCH_INTERVAL"] = _saved
+
 # --- concurrency safety ---------------------------------------------------
 section("concurrency")
 from twitchmetrics import useroauth as _uo  # noqa: E402

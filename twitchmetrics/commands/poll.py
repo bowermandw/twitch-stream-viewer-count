@@ -46,9 +46,9 @@ def add_arguments(parser):
                         help="skip chat size (avoids needing a user token)")
     parser.add_argument("--viewers-only", action="store_true",
                         help="record viewers alone, to viewers_<channel>.csv")
-    parser.add_argument("--interval", type=int, default=config.INTERVAL_SECONDS,
-                        metavar="SEC", help="seconds between samples (default {})".format(
-                            config.INTERVAL_SECONDS))
+    parser.add_argument("--interval", type=int, default=None, metavar="SEC",
+                        help="seconds between samples (default: TWITCH_INTERVAL, "
+                             "else {})".format(config.DEFAULT_INTERVAL_SECONDS))
 
 
 def _sample_viewers(channel, token, client_id):
@@ -200,7 +200,7 @@ def seconds_until_next_tick(interval):
 
 def run(args):
     config.ensure_dirs()
-    interval = max(10, args.interval)
+    interval = config.resolve_interval(args.interval)
     channel = config.resolve_channel(args.channel)
 
     kind = "viewers" if args.viewers_only else "metrics"

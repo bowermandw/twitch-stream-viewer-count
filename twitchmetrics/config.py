@@ -23,7 +23,8 @@ TOKEN_CACHE_PATH = os.path.join(DATA_DIR, ".app_token.json")
 USER_TOKEN_PATH = os.path.join(DATA_DIR, ".user_token.json")
 
 DEFAULT_CHANNEL = "themeparkgiant"
-INTERVAL_SECONDS = 300  # 5 minutes
+DEFAULT_INTERVAL_SECONDS = 300  # 5 minutes
+MIN_INTERVAL_SECONDS = 10
 HTTP_TIMEOUT = 20       # stops a hung socket stalling a poll loop
 
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
@@ -102,6 +103,30 @@ def resolve_channel(cli_value=None):
             or os.environ.get("TWITCH_CHANNEL")
             or load_env_file().get("TWITCH_CHANNEL")
             or DEFAULT_CHANNEL).strip()
+
+
+def resolve_interval(cli_value=None):
+    """Seconds between samples.
+
+    Precedence: --interval > TWITCH_INTERVAL env/.env > DEFAULT_INTERVAL_SECONDS.
+    An unparseable value is reported rather than silently falling back, since a
+    typo in a service file would otherwise poll at the wrong rate unnoticed.
+    """
+    if cli_value is not None:
+        raw, source = cli_value, "--interval"
+    else:
+        raw = os.environ.get("TWITCH_INTERVAL") or load_env_file().get("TWITCH_INTERVAL")
+        source = "TWITCH_INTERVAL"
+        if raw is None:
+            return DEFAULT_INTERVAL_SECONDS
+    try:
+        seconds = int(str(raw).strip())
+    except (TypeError, ValueError):
+        sys.exit("{} must be a whole number of seconds, got {!r}.".format(source, raw))
+    if seconds < MIN_INTERVAL_SECONDS:
+        sys.exit("{} must be at least {} seconds, got {}.".format(
+            source, MIN_INTERVAL_SECONDS, seconds))
+    return seconds
 
 
 # --------------------------------------------------------------------------
