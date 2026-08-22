@@ -238,7 +238,7 @@ def authorize(client_id, client_secret, scopes, open_browser=True, manual=False)
     except OSError as exc:
         sys.exit("Can't listen on {} ({}).\n"
                  "Free that port, set TWITCH_REDIRECT_URI to another URL registered on\n"
-                 "your Twitch app, or use --manual to paste the code back instead:\n"
+                 "your Twitch app, or paste the code back instead:\n"
                  "  {} auth --manual".format(REDIRECT_URI, exc, config.invocation()))
 
     _CallbackHandler.result = {}
@@ -256,6 +256,8 @@ def authorize(client_id, client_secret, scopes, open_browser=True, manual=False)
             pass
 
     print("Waiting for the redirect back to {} ...".format(REDIRECT_URI))
+    print("(On a server: this needs `ssh -L 3000:localhost:3000 user@host` from the\n"
+          " machine running the browser, or Ctrl-C and re-run with --manual.)")
     thread.join(timeout=300)
     server.server_close()
 

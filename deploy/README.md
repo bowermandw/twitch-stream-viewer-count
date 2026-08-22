@@ -65,19 +65,40 @@ to open a browser, which a server has no use for. This writes `.env` at mode
 Viewers and followers need only the app token, which works headlessly. **Chat
 size needs a user token, and getting one requires a browser.**
 
-Two options:
+Authorizing straight from a server doesn't work on its own: you paste the URL
+into a browser on your desktop, approve, and the redirect to
+`http://localhost:3000` resolves to **your desktop's** localhost, not the
+server's. The server sits waiting for a callback that never arrives.
 
-**A. Authorize on your laptop, copy the token up.** The refresh token keeps it
-alive indefinitely, so this is a one-time step:
+### A. SSH tunnel — the normal flow, made to work
+
+Forward your desktop's port 3000 to the server's, so the redirect reaches the
+listener.
+
+**On your desktop**, open the tunnel and leave it running:
 
 ```
-# on your laptop
-python3 -m twitchmetrics auth
-scp data/.user_token.json server:/opt/twitch-metrics/data/
-ssh server chmod 600 /opt/twitch-metrics/data/.user_token.json
+ssh -L 3000:localhost:3000 user@your-server
 ```
 
-**B. Paste the code back — no tunnel, no second checkout.**
+**In that same session** (or any other shell on the server):
+
+```
+cd /opt/twitch-metrics
+python3 -m twitchmetrics auth --no-browser
+```
+
+Copy the printed URL into your desktop browser and approve. The redirect now
+travels back down the tunnel, the server catches it, and you get:
+
+```
+Authorized as yourname (user id 12345678).
+```
+
+Close the tunnel afterwards — it's only needed for this one step. The refresh
+token keeps the credential alive from then on.
+
+### B. Paste the code back — no tunnel needed
 
 ```
 python3 -m twitchmetrics auth --manual
@@ -85,8 +106,7 @@ python3 -m twitchmetrics auth --manual
 
 It prints the authorize URL. Open that in a browser on any machine and approve.
 The browser then tries to reach `http://localhost:3000` and **fails to connect**
-— expected, since that's your desktop's localhost, not the server's. The address
-bar still holds the code:
+— expected. The address bar still holds the code:
 
 ```
 http://localhost:3000/?code=k2p9x...&scope=moderator%3Aread%3Achatters&state=...
@@ -95,18 +115,24 @@ http://localhost:3000/?code=k2p9x...&scope=moderator%3Aread%3Achatters&state=...
 Copy that whole URL and paste it at the prompt. The `state` parameter is checked
 against the one just issued, so the CSRF protection survives the detour.
 
-**C. Forward the callback port over SSH**, if you'd rather use the normal flow:
+Useful when you can't open a tunnel — a jump host, a locked-down bastion, or a
+console session with no SSH of your own.
+
+### C. Authorize on your laptop, copy the token up
+
+If you already have the project checked out locally with the same credentials:
 
 ```
-ssh -L 3000:localhost:3000 server
-cd /opt/twitch-metrics && python3 -m twitchmetrics auth --no-browser
+# on your laptop
+python3 -m twitchmetrics auth
+scp data/.user_token.json server:/opt/twitch-metrics/data/
+ssh server chmod 600 /opt/twitch-metrics/data/.user_token.json
 ```
 
-The tunnel makes your desktop's port 3000 reach the server's, so the redirect
-lands where the listener is waiting.
+### D. Skip it
 
-**D. Skip it.** `--no-chatters` records viewers and followers only, and needs no
-user token at all:
+`--no-chatters` records viewers and followers only, and needs no user token at
+all:
 
 ```
 python3 -m twitchmetrics poll themeparkgiant --no-chatters

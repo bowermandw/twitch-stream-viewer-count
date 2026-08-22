@@ -336,14 +336,39 @@ twitch-metrics auth --manual    # headless: paste the code back
 
 ### On a machine with no browser
 
-`--manual` prints the authorize URL and waits. Open it in a browser anywhere,
-approve, and the browser will try to reach `http://localhost:3000` and fail —
-that's your desktop's localhost, not the server's. The address bar still holds
-`?code=...`; paste that whole URL back at the prompt. State is verified, so the
-CSRF check survives the detour.
+Authorizing from a server needs one extra step, because the redirect to
+`http://localhost:3000` resolves to whichever machine the *browser* is on.
 
-A `ssh -L 3000:localhost:3000 server` tunnel also works if you prefer the normal
-flow. See [`deploy/README.md`](deploy/README.md).
+**SSH tunnel** — forwards your desktop's port 3000 to the server's, so the
+normal flow works unchanged. On your desktop:
+
+```
+ssh -L 3000:localhost:3000 user@your-server
+```
+
+Leave that open, and in it run:
+
+```
+python3 -m twitchmetrics auth --no-browser
+```
+
+Paste the printed URL into your desktop browser, approve, and the redirect
+travels back down the tunnel to the waiting listener. The tunnel is only needed
+for this one step.
+
+**Or skip the tunnel** with `--manual`, which prints the URL and waits for you
+to paste the redirect back:
+
+```
+twitch-metrics auth --manual
+```
+
+The browser will fail to reach `localhost:3000` — expected — but the address bar
+still holds `?code=...`. Paste that whole URL at the prompt. State is verified,
+so the CSRF check survives the detour.
+
+Full server notes, including copying an existing token up instead, are in
+[`deploy/README.md`](deploy/README.md).
 
 The token lasts about four hours and refreshes itself from the stored refresh
 token, so the browser step happens once. Requesting a new scope carries the
