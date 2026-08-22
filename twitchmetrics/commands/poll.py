@@ -173,7 +173,7 @@ def run(args):
             log("start    chat size enabled as moderator {}".format(payload.get("login")))
         except SystemExit as exc:
             log("start    chat size disabled — {}".format(str(exc).splitlines()[0]))
-            log("start    (authorize with: twitch-metrics auth)")
+            log("start    (authorize with: {} auth)".format(config.invocation()))
 
     if args.once:
         poll_once(state)

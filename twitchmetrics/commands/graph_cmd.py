@@ -63,9 +63,9 @@ def run(args):
 
     if not os.path.exists(path):
         sys.exit("No data file at {}\n"
-                 "Collect some first:  twitch-metrics poll {}\n"
-                 "Or make fake data:   twitch-metrics testdata testchannel".format(
-                     path, label))
+                 "Collect some first:  {prog} poll {}\n"
+                 "Or make fake data:   {prog} testdata testchannel".format(
+                     path, label, prog=config.invocation()))
     samples = storage.read_samples(path)
 
     if args.list_days:

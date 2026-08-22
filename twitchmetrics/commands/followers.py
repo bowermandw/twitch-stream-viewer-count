@@ -89,8 +89,9 @@ def run(args):
             sys.exit("Twitch rejected the request ({}).\n{}\n\n"
                      "Listing followers needs a token for the broadcaster or one of\n"
                      "their moderators, with the {} scope:\n"
-                     "  twitch-metrics auth --scope {}".format(
-                         exc.code, detail, api.SCOPE_FOLLOWERS, api.SCOPE_FOLLOWERS))
+                     "  {} auth --scope {}".format(
+                         exc.code, detail, api.SCOPE_FOLLOWERS,
+                         config.invocation(), api.SCOPE_FOLLOWERS))
         sys.exit("HTTP {} from Twitch.\n{}".format(exc.code, detail))
     except (urllib.error.URLError, TimeoutError, OSError) as exc:
         sys.exit("Could not reach Twitch: {}".format(exc))
@@ -124,8 +125,8 @@ def run(args):
     if not rows:
         print("\nNo follower details returned. Twitch withholds them unless the token\n"
               "belongs to the broadcaster or a moderator and carries {}.\n"
-              "  twitch-metrics auth --scope {}".format(api.SCOPE_FOLLOWERS,
-                                                        api.SCOPE_FOLLOWERS))
+              "  {} auth --scope {}".format(api.SCOPE_FOLLOWERS,
+                                            config.invocation(), api.SCOPE_FOLLOWERS))
         return 0
 
     if args.recent:

@@ -239,8 +239,9 @@ def user_token(scopes, interactive=True):
             combined = sorted(set(scopes) | set(payload.get("scopes") or []))
             if not interactive:
                 raise SystemExit(
-                    "The stored token lacks the {} scope. Run:  twitch-metrics auth {}".format(
-                        ", ".join(missing), " ".join("--scope " + s for s in combined)))
+                    "The stored token lacks the {} scope. Run:  {} auth {}".format(
+                        ", ".join(missing), config.invocation(),
+                        " ".join("--scope " + s for s in combined)))
             # Carry already-granted scopes into the new login so adding one
             # doesn't silently drop another command's access.
             scopes = combined
@@ -255,14 +256,14 @@ def user_token(scopes, interactive=True):
 
     if not payload:
         if not interactive:
-            raise SystemExit("No usable user token. Run:  twitch-metrics auth")
+            raise SystemExit("No usable user token. Run:  {} auth".format(config.invocation()))
         payload = authorize(client_id, client_secret, scopes)
     return payload
 
 
 def describe(payload):
     if not payload:
-        print("No user token stored. Run:  twitch-metrics auth")
+        print("No user token stored. Run:  {} auth".format(config.invocation()))
         return
     left = payload["expires_at"] - time.time()
     print("  user        {} (id {})".format(payload.get("login", "?"),

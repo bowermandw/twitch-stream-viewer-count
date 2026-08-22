@@ -102,7 +102,7 @@ def run(args):
         if not confirm("Replace it?", default_yes=False):
             if verify(shown, existing.get("TWITCH_CLIENT_SECRET", ""), channel):
                 print("\nExisting credentials are valid. Nothing to do.")
-                print("Run:  twitch-metrics poll {}".format(channel))
+                print("Run:  {} poll {}".format(config.invocation(), channel))
                 return 0
             print("\nExisting credentials do NOT work — let's replace them.")
         print()
@@ -137,11 +137,12 @@ def run(args):
                 return 1
 
     if not verify(client_id, client_secret, channel):
-        print("\nNothing was written to .env. Fix the above and re-run:  twitch-metrics setup")
+        print("\nNothing was written to .env. Fix the above and re-run:  "
+              "{} setup".format(config.invocation()))
         return 1
 
     config.write_env(client_id, client_secret)
     print("\nWrote {} (permissions 0600).".format(config.ENV_PATH))
     print("\nSetup complete. Start collecting data with:\n")
-    print("    twitch-metrics poll {}\n".format(channel))
+    print("    {} poll {}\n".format(config.invocation(), channel))
     return 0

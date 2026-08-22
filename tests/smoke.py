@@ -140,5 +140,18 @@ with tempfile.TemporaryDirectory() as tmp:
                                 cwd=root, capture_output=True, text=True)
         check(label, result.returncode != 0, "expected non-zero exit")
 
+# --- invocation name ------------------------------------------------------
+section("invocation name")
+result = subprocess.run([sys.executable, "-m", "twitchmetrics", "--help"],
+                        cwd=root, capture_output=True, text=True)
+check("-m help says 'python3 -m twitchmetrics'",
+      "usage: python3 -m twitchmetrics" in result.stdout)
+check("-m help doesn't claim the console script name",
+      "twitch-metrics setup" not in result.stdout)
+result = subprocess.run([sys.executable, "-m", "twitchmetrics", "graph", "no_such_channel_xyz"],
+                        cwd=root, capture_output=True, text=True)
+check("runtime hints use the same invocation",
+      "python3 -m twitchmetrics poll" in (result.stdout + result.stderr))
+
 print("\n{} passed, {} failed".format(passed, failed))
 sys.exit(1 if failed else 0)

@@ -108,5 +108,5 @@ def run(args):
     print("  chatters    peak {}  avg {}".format(max(chat), round(sum(chat) / len(chat))))
     print("  followers   {} -> {}  (+{})".format(
         args.followers, rows[-1]["followers"], rows[-1]["followers"] - args.followers))
-    print("\nGraph it with:\n    twitch-metrics graph {}".format(args.channel))
+    print("\nGraph it with:\n    {} graph {}".format(config.invocation(), args.channel))
     return 0

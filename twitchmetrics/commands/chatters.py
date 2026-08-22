@@ -28,16 +28,17 @@ def explain(exc, broadcaster_label, moderator_label, mismatch=False):
             return ("Twitch rejected the request (401).\n{}\n\n"
                     "moderator_id has to be the account the token belongs to.\n"
                     "Drop --moderator to use it automatically, or re-authorize as {}:\n"
-                    "  twitch-metrics auth --force".format(detail, moderator_label))
+                    "  {} auth --force".format(detail, moderator_label, config.invocation()))
         return ("Twitch rejected the token (401).\n{}\n\n"
-                "Re-authorize with:  twitch-metrics auth --force".format(detail))
+                "Re-authorize with:  {} auth --force".format(detail, config.invocation()))
     if exc.code == 403:
         return ("Forbidden (403).\n{}\n\n"
                 "This endpoint only answers for a moderator of the channel.\n"
                 "  - {} must be a moderator of {} (or be the broadcaster)\n"
                 "  - the stored token must belong to {}\n\n"
-                "Check who the token is for:  twitch-metrics auth --status".format(
-                    detail, moderator_label, broadcaster_label, moderator_label))
+                "Check who the token is for:  {} auth --status".format(
+                    detail, moderator_label, broadcaster_label, moderator_label,
+                    config.invocation()))
     return "HTTP {} from Twitch.\n{}".format(exc.code, detail)
 
 

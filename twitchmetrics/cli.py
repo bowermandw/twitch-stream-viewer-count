@@ -1,9 +1,14 @@
-"""Command line entry point: `twitch-metrics <command>`."""
+"""Command line entry point.
+
+Invoked either as the installed `twitch-metrics` console script or as
+`python3 -m twitchmetrics`. Help text and hints report whichever was used, so
+they never suggest a command the reader doesn't have.
+"""
 
 import argparse
 import sys
 
-from . import __version__
+from . import __version__, config
 from .commands import (auth_cmd, chatters, followers, graph_cmd, poll, setup_cmd,
                        testdata_cmd, users)
 
@@ -20,11 +25,11 @@ COMMANDS = [
 
 EPILOG = """
 examples:
-  twitch-metrics setup
-  twitch-metrics poll themeparkgiant
-  twitch-metrics graph themeparkgiant --date today
-  twitch-metrics followers themeparkgiant --recent 10
-  twitch-metrics chatters themeparkgiant
+  {prog} setup
+  {prog} poll themeparkgiant
+  {prog} graph themeparkgiant --date today
+  {prog} followers themeparkgiant --recent 10
+  {prog} chatters themeparkgiant
 
 Every command takes the channel as its first argument, falling back to
 TWITCH_CHANNEL in .env and then the built-in default.
@@ -32,10 +37,12 @@ TWITCH_CHANNEL in .env and then the built-in default.
 
 
 def build_parser():
+    prog = config.invocation()
     parser = argparse.ArgumentParser(
-        prog="twitch-metrics",
+        prog=prog,
         description="Poll and chart Twitch channel metrics. Standard library only.",
-        epilog=EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
+        epilog=EPILOG.format(prog=prog),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version",
                         version="twitch-metrics {}".format(__version__))
     subparsers = parser.add_subparsers(dest="command", metavar="<command>")

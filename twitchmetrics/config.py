@@ -30,6 +30,18 @@ TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 HELIX = "https://api.twitch.tv/helix"
 
 
+def invocation():
+    """How this program was actually started, for help text and hints.
+
+    Running `python3 -m twitchmetrics` shouldn't print advice to type
+    `twitch-metrics`, which only exists if the console script was installed.
+    """
+    name = os.path.basename(sys.argv[0] or "")
+    if name in ("__main__.py", "-c", ""):
+        return "python3 -m twitchmetrics"
+    return name
+
+
 def ensure_dirs():
     for path in (DATA_DIR, CHARTS_DIR):
         os.makedirs(path, exist_ok=True)
@@ -71,13 +83,13 @@ def load_credentials():
             "Add them to {} as:\n"
             "  TWITCH_CLIENT_ID=...\n"
             "  TWITCH_CLIENT_SECRET=...\n"
-            "Or run:  twitch-metrics setup".format(", ".join(missing), ENV_PATH))
+            "Or run:  {} setup".format(", ".join(missing), ENV_PATH, invocation()))
     return client_id, client_secret
 
 
 def write_env(client_id, client_secret):
     with open(ENV_PATH, "w", encoding="utf-8") as handle:
-        handle.write("# Twitch API credentials — created by `twitch-metrics setup`\n")
+        handle.write("# Twitch API credentials — created by `{} setup`\n".format(invocation()))
         handle.write("# Keep this file private; it is gitignored.\n")
         handle.write("TWITCH_CLIENT_ID={}\n".format(client_id))
         handle.write("TWITCH_CLIENT_SECRET={}\n".format(client_secret))
