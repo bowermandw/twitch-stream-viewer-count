@@ -14,6 +14,10 @@ def add_arguments(parser):
     parser.add_argument("--revoke", action="store_true", help="revoke and delete the token")
     parser.add_argument("--no-browser", action="store_true",
                         help="print the URL instead of opening a browser")
+    parser.add_argument("--manual", action="store_true",
+                        help="headless flow: paste the redirect URL back instead of "
+                             "listening on the callback port. Use on a server with no "
+                             "browser and no SSH tunnel.")
 
 
 def run(args):
@@ -29,10 +33,11 @@ def run(args):
               else "Nothing stored.")
         return 0
 
-    if args.force:
+    if args.force or args.manual:
         client_id, client_secret = config.load_credentials()
         useroauth.authorize(client_id, client_secret, scopes,
-                            open_browser=not args.no_browser)
+                            open_browser=not (args.no_browser or args.manual),
+                            manual=args.manual)
     else:
         useroauth.user_token(scopes)
 

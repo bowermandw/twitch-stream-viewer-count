@@ -331,7 +331,19 @@ moderates the channel.
 twitch-metrics auth --status    # who it's for, scopes, time left
 twitch-metrics auth --force     # log in again, e.g. as someone else
 twitch-metrics auth --revoke    # revoke and delete it
+twitch-metrics auth --manual    # headless: paste the code back
 ```
+
+### On a machine with no browser
+
+`--manual` prints the authorize URL and waits. Open it in a browser anywhere,
+approve, and the browser will try to reach `http://localhost:3000` and fail —
+that's your desktop's localhost, not the server's. The address bar still holds
+`?code=...`; paste that whole URL back at the prompt. State is verified, so the
+CSRF check survives the detour.
+
+A `ssh -L 3000:localhost:3000 server` tunnel also works if you prefer the normal
+flow. See [`deploy/README.md`](deploy/README.md).
 
 The token lasts about four hours and refreshes itself from the stored refresh
 token, so the browser step happens once. Requesting a new scope carries the

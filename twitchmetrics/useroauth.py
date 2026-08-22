@@ -156,7 +156,66 @@ class _CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass  # keep the local callback server quiet
 
 
-def authorize(client_id, client_secret, scopes, open_browser=True):
+def _exchange(client_id, client_secret, code):
+    try:
+        return _post_form(config.TOKEN_URL, {
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "code": code,
+            "grant_type": "authorization_code",
+            "redirect_uri": REDIRECT_URI,
+        })
+    except urllib.error.HTTPError as exc:
+        sys.exit("Could not exchange the code for a token: HTTP {}\n{}".format(
+            exc.code, exc.read().decode("utf-8", "replace")[:300]))
+
+
+def _authorize_manual(client_id, client_secret, scopes, url, state):
+    """Headless flow: the operator pastes the redirect URL back.
+
+    On a machine with no browser, the redirect lands in a browser elsewhere and
+    fails to reach this host — but the address bar still holds ?code=... , which
+    is all we need. Avoids requiring an SSH tunnel.
+    """
+    print("Authorize in a browser on any machine:\n\n  {}\n".format(url))
+    print("After approving, the browser will try to open {} and fail to".format(REDIRECT_URI))
+    print("connect. That is expected — the address bar still holds the code.\n")
+    print("Copy that whole URL and paste it here.\n")
+    try:
+        pasted = input("Redirect URL (or just the code): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        sys.exit("\nCancelled.")
+
+    if not pasted:
+        sys.exit("Nothing pasted.")
+
+    # Anything URL-shaped gets parsed, so a denial or an error page is reported
+    # as such rather than being posted to Twitch as if it were a code.
+    if "://" in pasted or "?" in pasted or "=" in pasted:
+        query = urllib.parse.parse_qs(urllib.parse.urlparse(pasted).query or pasted)
+        if query.get("error"):
+            sys.exit("Twitch returned an error instead of a code: {} — {}".format(
+                query["error"][0], (query.get("error_description") or [""])[0]))
+        code = (query.get("code") or [""])[0]
+        if not code:
+            sys.exit("No authorization code in what you pasted.\n"
+                     "Expected a URL like {}/?code=...&state=...".format(REDIRECT_URI))
+        returned_state = (query.get("state") or [""])[0]
+        if returned_state and returned_state != state:
+            sys.exit("State mismatch — discarding this response as a safety measure.")
+        if not returned_state:
+            print("\nNote: no state parameter present; skipping that check.")
+    else:
+        code = pasted  # a bare code, copied by hand out of the URL
+        print("\nNote: bare code pasted, so the state check is skipped.")
+
+    payload = _store(_exchange(client_id, client_secret, code), scopes)
+    print("\nAuthorized as {} (user id {}).".format(
+        payload.get("login", "?"), payload.get("user_id", "?")))
+    return payload
+
+
+def authorize(client_id, client_secret, scopes, open_browser=True, manual=False):
     """Run the authorization code flow and return the stored token payload."""
     state = secrets.token_urlsafe(24)
     url = "{}?{}".format(AUTHORIZE_URL, urllib.parse.urlencode({
@@ -168,15 +227,19 @@ def authorize(client_id, client_secret, scopes, open_browser=True):
         "force_verify": "true",  # always show the account picker
     }))
 
+    if manual:
+        return _authorize_manual(client_id, client_secret, scopes, url, state)
+
     parsed = urllib.parse.urlparse(REDIRECT_URI)
     port = parsed.port or 80
     try:
         server = http.server.HTTPServer((parsed.hostname or "localhost", port),
                                         _CallbackHandler)
     except OSError as exc:
-        sys.exit("Can't listen on {} ({}).\nFree that port, or set "
-                 "TWITCH_REDIRECT_URI to another URL registered on your Twitch "
-                 "app.".format(REDIRECT_URI, exc))
+        sys.exit("Can't listen on {} ({}).\n"
+                 "Free that port, set TWITCH_REDIRECT_URI to another URL registered on\n"
+                 "your Twitch app, or use --manual to paste the code back instead:\n"
+                 "  {} auth --manual".format(REDIRECT_URI, exc, config.invocation()))
 
     _CallbackHandler.result = {}
     thread = threading.Thread(target=server.handle_request, daemon=True)
@@ -205,19 +268,7 @@ def authorize(client_id, client_secret, scopes, open_browser=True):
     if result.get("state") != state:
         sys.exit("State mismatch — discarding this response as a safety measure.")
 
-    try:
-        raw = _post_form(config.TOKEN_URL, {
-            "client_id": client_id,
-            "client_secret": client_secret,
-            "code": result["code"],
-            "grant_type": "authorization_code",
-            "redirect_uri": REDIRECT_URI,
-        })
-    except urllib.error.HTTPError as exc:
-        sys.exit("Could not exchange the code for a token: HTTP {}\n{}".format(
-            exc.code, exc.read().decode("utf-8", "replace")[:300]))
-
-    payload = _store(raw, scopes)
+    payload = _store(_exchange(client_id, client_secret, result["code"]), scopes)
     print("\nAuthorized as {} (user id {}).".format(
         payload.get("login", "?"), payload.get("user_id", "?")))
     return payload

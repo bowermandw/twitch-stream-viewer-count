@@ -77,15 +77,35 @@ scp data/.user_token.json server:/opt/twitch-metrics/data/
 ssh server chmod 600 /opt/twitch-metrics/data/.user_token.json
 ```
 
-**B. Forward the callback port over SSH** and authorize from the server:
+**B. Paste the code back — no tunnel, no second checkout.**
+
+```
+python3 -m twitchmetrics auth --manual
+```
+
+It prints the authorize URL. Open that in a browser on any machine and approve.
+The browser then tries to reach `http://localhost:3000` and **fails to connect**
+— expected, since that's your desktop's localhost, not the server's. The address
+bar still holds the code:
+
+```
+http://localhost:3000/?code=k2p9x...&scope=moderator%3Aread%3Achatters&state=...
+```
+
+Copy that whole URL and paste it at the prompt. The `state` parameter is checked
+against the one just issued, so the CSRF protection survives the detour.
+
+**C. Forward the callback port over SSH**, if you'd rather use the normal flow:
 
 ```
 ssh -L 3000:localhost:3000 server
 cd /opt/twitch-metrics && python3 -m twitchmetrics auth --no-browser
-# paste the printed URL into your local browser
 ```
 
-**C. Skip it.** `--no-chatters` records viewers and followers only, and needs no
+The tunnel makes your desktop's port 3000 reach the server's, so the redirect
+lands where the listener is waiting.
+
+**D. Skip it.** `--no-chatters` records viewers and followers only, and needs no
 user token at all:
 
 ```
