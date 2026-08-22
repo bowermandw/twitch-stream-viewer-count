@@ -287,8 +287,8 @@ def render(session, channel, bucket_minutes, width, height, show_buckets=True):
     add(text(peak_x, 52, fmt_count(peak), size=30, fill=FG, weight="700", anchor="end"))
     add(text(peak_x, 74, "Peak", size=13, fill=MUTED, anchor="end"))
     # The reference chart stops at the number; the time is the useful addition.
-    add(text(peak_x, 92, "at {}  ·  {}".format(
-        fmt_elapsed(peak_offset), fmt_clock(peak_sample["when"])),
+    add(text(peak_x, 92, "at {}  ·  {} in".format(
+        fmt_clock(peak_sample["when"]), fmt_elapsed(peak_offset)),
         size=12, fill=DIM, anchor="end"))
 
     add(text(avg_x, 52, fmt_count(average), size=30, fill=FG, weight="700", anchor="end"))
@@ -556,8 +556,10 @@ def draw_panel(out, metric, session, geom, bucket_minutes, show_buckets, duratio
         caption = "{:+,} over the stream   ·   {} → {}".format(
             gained, fmt_count(stats["first"]), fmt_count(stats["last"]))
     else:
-        caption = "peak {} at {}   ·   avg {}".format(
-            fmt_count(stats["peak"]), fmt_elapsed(stats["peak_at"]), fmt_count(stats["avg"]))
+        peak_when = session[0]["when"] + timedelta(seconds=stats["peak_at"])
+        caption = "peak {} at {} ({} in)   ·   avg {}".format(
+            fmt_count(stats["peak"]), fmt_clock(peak_when),
+            fmt_elapsed(stats["peak_at"]), fmt_count(stats["avg"]))
     out.append(text(right, top - 12, caption, size=12, fill=MUTED, anchor="end"))
     out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
@@ -600,6 +602,10 @@ def render_stacked(session, channel, bucket_minutes, width, show_buckets=True,
         out.append(text(tile_x, 52, big, size=27, fill=metric["color"],
                         weight="700", anchor="end"))
         out.append(text(tile_x, 74, label, size=12, fill=MUTED, anchor="end"))
+        if metric["key"] != "followers":
+            out.append(text(tile_x, 91, "at {}".format(
+                fmt_clock(start + timedelta(seconds=stats["peak_at"]))),
+                size=11, fill=DIM, anchor="end"))
         tile_x -= 190
 
     for index, metric in enumerate(metrics):
@@ -685,6 +691,10 @@ def render_composite(session, channel, width, height, metrics=None, day=None):
         out.append(text(tile_x, 74, "Followers gained" if metric["key"] == "followers"
                         else "Peak {}".format(metric["label"].lower()),
                         size=12, fill=MUTED, anchor="end"))
+        if metric["key"] != "followers":
+            out.append(text(tile_x, 91, "at {}".format(
+                fmt_clock(start + timedelta(seconds=stats["peak_at"]))),
+                size=11, fill=DIM, anchor="end"))
         tile_x -= 190
 
     legend_x = left
@@ -747,9 +757,10 @@ def print_summary(session, bucket_minutes, metrics=None):
             print("    end     {}".format(fmt_count(stats["last"])))
             print("    gained  {:+,}".format(stats["last"] - stats["first"]))
         else:
-            print("    peak    {}  at {} ({})".format(
-                fmt_count(stats["peak"]), fmt_elapsed(stats["peak_at"]),
-                fmt_clock(start + timedelta(seconds=stats["peak_at"]))))
+            print("    peak    {}  at {}  ({} into the stream)".format(
+                fmt_count(stats["peak"]),
+                fmt_clock(start + timedelta(seconds=stats["peak_at"])),
+                fmt_elapsed(stats["peak_at"])))
             print("    average {}".format(fmt_count(stats["avg"])))
             print("    low     {}".format(fmt_count(stats["low"])))
 

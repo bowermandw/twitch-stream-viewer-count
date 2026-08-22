@@ -1,7 +1,7 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1300" height="470" viewBox="0 0 1300 470" font-family="Roboto, -apple-system, BlinkMacSystemFont, &quot;Helvetica Neue&quot;, Arial, sans-serif">
 <rect width="1300" height="470" fill="#0f0f0f"/>
 <text x="34.0" y="46.0" font-size="21" fill="#f1f1f1" font-weight="700" text-anchor="start">Stream metrics</text>
-<text x="34.0" y="74.0" font-size="14" fill="#aaaaaa" font-weight="normal" text-anchor="start">While live · testchannel  ·  each series scaled to its own range</text>
+<text x="34.0" y="74.0" font-size="14" fill="#aaaaaa" font-weight="normal" text-anchor="start">While live · testchannel · each series scaled to its own range</text>
 <line x1="34.0" y1="396.0" x2="1196.0" y2="396.0" stroke="#303030" stroke-width="1"/>
 <line x1="34.0" y1="334.5" x2="1196.0" y2="334.5" stroke="#303030" stroke-width="1"/>
 <line x1="34.0" y1="273.0" x2="1196.0" y2="273.0" stroke="#303030" stroke-width="1"/>
@@ -11,8 +11,10 @@
 <text x="1280.0" y="74.0" font-size="12" fill="#aaaaaa" font-weight="normal" text-anchor="end">Followers gained</text>
 <text x="1090.0" y="52.0" font-size="27" fill="#4ade80" font-weight="700" text-anchor="end">45</text>
 <text x="1090.0" y="74.0" font-size="12" fill="#aaaaaa" font-weight="normal" text-anchor="end">Peak in chat</text>
+<text x="1090.0" y="91.0" font-size="11" fill="#717171" font-weight="normal" text-anchor="end">at 2:50 AM</text>
 <text x="900.0" y="52.0" font-size="27" fill="#4fb3e8" font-weight="700" text-anchor="end">740</text>
 <text x="900.0" y="74.0" font-size="12" fill="#aaaaaa" font-weight="normal" text-anchor="end">Peak concurrent viewers</text>
+<text x="900.0" y="91.0" font-size="11" fill="#717171" font-weight="normal" text-anchor="end">at 4:45 AM</text>
 <polyline points="34.0,396.0 46.1,360.4 58.2,330.7 70.3,310.2 82.4,295.9 94.5,282.9 106.6,278.1 118.7,264.5 130.8,266.5 142.9,272.5 155.0,255.4 167.1,251.9 179.2,241.8 191.4,233.7 203.5,228.2 215.6,216.3 227.7,222.2 239.8,215.3 251.9,208.3 264.0,210.7 276.1,193.6 288.2,206.9 300.3,203.7 312.4,196.1 324.5,195.4 336.6,194.0 348.7,211.8 360.8,215.9 372.9,220.1 385.0,222.9 397.1,213.9 409.2,225.7 421.3,222.2 433.4,214.2 445.5,204.8 457.6,199.9 469.8,198.2 481.9,197.1 494.0,198.2 506.1,196.1 518.2,192.6 530.3,188.7 542.4,179.7 554.5,173.0 566.6,182.5 578.7,186.6 590.8,191.9 602.9,150.0 615.0,191.2 627.1,175.1 639.2,185.9 651.3,194.0 663.4,202.3 675.5,203.4 687.6,206.5 699.7,217.0 711.8,206.2 723.9,212.5 736.0,217.0 748.1,225.7 760.2,226.4 772.4,228.9 784.5,237.2 796.6,254.0 808.7,236.2 820.8,239.3 832.9,240.4 845.0,237.9 857.1,230.6 869.2,241.8 881.3,242.8 893.4,247.7 905.5,247.0 917.6,258.5 929.7,257.5 941.8,262.7 953.9,266.9 966.0,262.4 978.1,261.0 990.2,258.9 1002.3,258.5 1014.4,262.7 1026.5,266.5 1038.6,270.7 1050.8,256.1 1062.9,257.5 1075.0,254.3 1087.1,259.9 1099.2,261.3 1111.3,259.9 1123.4,266.2 1135.5,270.0 1147.6,267.2 1159.7,271.8 1171.8,292.0 1183.9,352.4 1196.0,366.3" fill="none" stroke="#4fb3e8" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" opacity="0.95"/>
 <line x1="34.0" y1="448.0" x2="54.0" y2="448.0" stroke="#4fb3e8" stroke-width="2.5" stroke-linecap="round"/>
 <text x="61.0" y="452.0" font-size="12" fill="#aaaaaa" font-weight="normal" text-anchor="start">Concurrent viewers  35 – 740</text>
