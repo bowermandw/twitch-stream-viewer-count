@@ -9,17 +9,22 @@ numpy, no `pip install`.
 
 ![Example chart](docs_chart_testchannel.png)
 
-*Generated with `python3 graph.py testchannel` from the sample data committed to
-this repo. The header carries the peak, **when** the peak happened, and the
-average; the amber segments are per-30-minute averages.*
+*Generated from the sample data committed to this repo. The header carries the
+peak, **when** the peak happened, and the average; the amber segments are
+per-30-minute averages.*
+
+Polling all three metrics gives a panel each:
+
+![All three metrics](docs_chart_metrics.png)
 
 ### What it does
 
 - Polls the Twitch Helix API on an interval and appends one CSV row per sample
+- Records viewers, followers and chat size together, or viewers alone
 - Records offline polls too, so a gap in the data means "not running" rather than "not streaming"
 - Handles token refresh, rate limits, outages and network loss without dying
 - Keeps each channel in its own files, so several can be polled at once
-- Charts any broadcast in the file as a self-contained SVG
+- Charts any broadcast as a self-contained SVG — one metric or all three
 - Ships synthetic sample data so you can try the chart before collecting anything
 
 ## Setup
@@ -127,6 +132,7 @@ polling more often is fine.
 |---|---|
 | `setup.py` | One-time credential setup and verification |
 | `twitch_viewers.py` | The poller |
+| `metrics.py` | Polls viewers, followers and chat size together |
 | `graph.py` | Charts the collected data as an SVG |
 | `user_info.py` | Account details for one or more logins |
 | `followers.py` | Follower count, list, and follow checks |
@@ -135,7 +141,8 @@ polling more often is fine.
 | `make_test_data.py` | Generates realistic fake data for testing the chart |
 | `.env` | Your credentials (gitignored, mode 0600) |
 | `.user_token.json` | User access token, if authorized (gitignored, mode 0600) |
-| `viewers_<channel>.csv` | Collected data, one file per channel |
+| `viewers_<channel>.csv` | Viewer data from `twitch_viewers.py` |
+| `metrics_<channel>.csv` | All three metrics from `metrics.py` |
 | `poll_<channel>.log` | Status line history, one file per channel |
 | `chart_<channel>.svg` | Generated chart |
 | `.token_cache.json` | Cached app token, shared across channels |
@@ -162,6 +169,43 @@ stream sessions.
 
 **`poll_<channel>.log`** — the same status lines printed to the console, for
 checking on a long run after the fact.
+
+## Polling all three metrics
+
+`twitch_viewers.py` records viewers only. `metrics.py` records viewers,
+followers and chat size on the same tick, into one CSV:
+
+```
+python3 metrics.py themeparkgiant
+python3 metrics.py themeparkgiant --once
+python3 metrics.py ign --no-chatters
+```
+
+```
+themeparkgiant  LIVE     viewers      51  followers      751  chat     4
+```
+
+Columns are `timestamp_utc, is_live, viewer_count, follower_count,
+chatter_count, title, game, started_at, stream_id`, written to
+`metrics_<channel>.csv`.
+
+Followers and chat size are recorded **even when the channel is offline** —
+people follow and bots sit in chat between streams — while `viewer_count` is
+blank. Only `is_live` marks a broadcast.
+
+### What each metric needs
+
+| Metric | Token | Works for |
+|---|---|---|
+| Viewers | app | any channel |
+| Followers | app | any channel |
+| Chat size | user + `moderator:read:chatters` | channels you moderate |
+
+Chat size is the only one that needs a browser login, so it degrades rather
+than blocking: without a usable token, or on a channel you don't moderate, the
+column is left blank and the other two carry on. `--no-chatters` skips it
+outright. If chat requests fail three times running it stops asking, so a
+permission change mid-run doesn't fill the log with errors.
 
 ## Graphing
 
@@ -202,6 +246,28 @@ python3 graph.py IGN --no-buckets    # just the curve
 Hourly blocks on the same data:
 
 ![Hourly averages](docs_chart_hourly.png)
+
+### Multiple metrics
+
+When `metrics_<channel>.csv` exists, `graph.py` uses it automatically and draws
+a panel per metric — the second image at the top of this README. Each panel
+gets its own axis, because the three live on completely different scales.
+
+Followers deliberately **do not** use a zero-based axis: on a 0–800 scale, a
+40-follower gain over a stream is an invisible flat line. The panel spans the
+actual range instead, and the header reports the change rather than the total.
+
+`--composite` overlays all three on one plot instead, each normalised to its
+own range with the real range in the legend:
+
+![Composite](docs_chart_composite.png)
+
+```
+python3 graph.py testchannel                  # a panel per metric
+python3 graph.py testchannel --composite      # all three overlaid
+python3 graph.py testchannel --only chatters  # just one
+python3 graph.py testchannel --viewers-only   # ignore metrics data
+```
 
 ### Picking a broadcast
 
@@ -328,12 +394,18 @@ python3 make_test_data.py testchannel
 python3 graph.py testchannel --open
 ```
 
-`viewers_testchannel.csv` and `chart_testchannel.svg` are committed, so the
-chart above can be reproduced without running the poller at all. The generator
+`viewers_testchannel.csv`, `metrics_testchannel.csv` and the generated charts
+are committed, so every chart above can be reproduced without running a poller
+or holding credentials. The generator
 writes the same columns the poller produces, so `graph.py` can't tell the
 difference. The curve is shaped like a real broadcast
 — a ramp at the start, a mid-stream bump, correlated jitter rather than random
-static, occasional spikes, a slow decline and a sharp drop at the end. It also
+static, occasional spikes, a slow decline and a sharp drop at the end.
+
+The three metrics are generated as one correlated system rather than
+independently: chat size tracks viewers with a bot floor beneath it, and
+followers accrue faster while more people are watching, with the occasional
+unfollow so the line isn't suspiciously monotonic. It also
 writes a short earlier broadcast plus offline rows, so session-splitting gets
 exercised.
 

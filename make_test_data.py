@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Generate a realistic fake viewers_*.csv so the graph can be designed and
-tested without waiting for a real 8-hour stream.
+"""Generate realistic fake data so the graphs can be designed and tested
+without waiting for a real 8-hour stream.
 
-Produces the exact same columns twitch_viewers.py writes, so graph.py cannot
-tell the difference.
+Writes two files, matching what the two pollers produce, so graph.py cannot
+tell them from real data:
+
+    viewers_<channel>.csv   what twitch_viewers.py records (viewers only)
+    metrics_<channel>.csv   what metrics.py records (viewers, followers, chat)
+
+The three metrics are generated as one correlated system rather than
+independently: chat size tracks viewers with a bot floor beneath it, and
+followers accumulate faster while more people are watching.
 """
 
 import argparse
@@ -13,6 +20,7 @@ import os
 import random
 from datetime import datetime, timedelta, timezone
 
+import metrics as metrics_mod
 import twitch_viewers as tv
 
 # Deliberately synthetic, and comma-laden so the CSV quoting stays exercised.
@@ -58,7 +66,33 @@ def viewer_curve(minutes, total_minutes, peak_level, rng, state, floor_frac=0.06
     return max(0, int(round(value)))
 
 
-def session_rows(start, minutes, interval, peak_level, stream_id, rng):
+BOT_FLOOR = 2          # bots that sit in chat whether or not anyone is watching
+CHAT_RATE = 0.055      # roughly what fraction of viewers actually join chat
+FOLLOW_RATE = 0.00018  # new followers per viewer per minute
+
+
+def chat_size(viewers, rng):
+    """Chat tracks viewers, but loosely, and never drops below the bots."""
+    if viewers <= 0:
+        return BOT_FLOOR
+    engaged = viewers * CHAT_RATE * rng.uniform(0.72, 1.30)
+    return max(BOT_FLOOR, int(round(BOT_FLOOR + engaged)))
+
+
+def follower_growth(viewers, minutes_elapsed, interval, rng):
+    """Followers gained in one interval — more arrive while more are watching."""
+    expected = viewers * FOLLOW_RATE * (interval / 60.0)
+    gained = int(expected)
+    if rng.random() < (expected - gained):
+        gained += 1
+    # The occasional unfollow, so the line isn't suspiciously monotonic.
+    if rng.random() < 0.04:
+        gained -= 1
+    return gained
+
+
+def session_rows(start, minutes, interval, peak_level, stream_id, rng,
+                 followers_start=700):
     rows = []
     state = {"noise": 0.0}
     started_at = start.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -70,76 +104,112 @@ def session_rows(start, minutes, interval, peak_level, stream_id, rng):
            for i in range(steps)]
     scale = peak_level / max(raw) if max(raw) else 1.0
 
+    followers = followers_start
     for i in range(steps):
         when = start + timedelta(seconds=i * interval)
         viewers = int(round(raw[i] * scale))
-        rows.append([
-            when.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "true",
-            viewers,
-            TITLE,
-            GAME,
-            started_at,
-            stream_id,
-        ])
-    return rows, start + timedelta(seconds=(steps - 1) * interval)
+        followers += follower_growth(viewers, i * interval / 60.0, interval, rng)
+        rows.append({
+            "when": when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "live": True,
+            "viewers": viewers,
+            "followers": followers,
+            "chatters": chat_size(viewers, rng),
+            "title": TITLE,
+            "game": GAME,
+            "started_at": started_at,
+            "stream_id": stream_id,
+        })
+    return rows, start + timedelta(seconds=(steps - 1) * interval), followers
 
 
-def offline_rows(start, count, interval):
-    return [
-        [
-            (start + timedelta(seconds=i * interval)).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "false", "", "", "", "", "",
-        ]
-        for i in range(1, count + 1)
-    ]
+def offline_rows(start, count, interval, followers, rng):
+    """Offline samples still carry followers and the bots idling in chat."""
+    out = []
+    for i in range(1, count + 1):
+        followers += 1 if rng.random() < 0.25 else 0
+        out.append({
+            "when": (start + timedelta(seconds=i * interval)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "live": False,
+            "viewers": "",
+            "followers": followers,
+            "chatters": BOT_FLOOR,
+            "title": "", "game": "", "started_at": "", "stream_id": "",
+        })
+    return out, followers
+
+
+def write_csv(path, header, rows):
+    with open(path, "w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(header)
+        writer.writerows(rows)
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("channel", nargs="?", default="testchannel",
-                        help="channel name; sets the output filename")
+                        help="channel name; sets the output filenames")
     parser.add_argument("--hours", type=float, default=8.0, help="stream length (default 8)")
     parser.add_argument("--interval", type=int, default=300,
-                        help="seconds between samples (default 300, matching the poller)")
+                        help="seconds between samples (default 300, matching the pollers)")
     parser.add_argument("--peak", type=int, default=740, help="approximate peak viewers")
+    parser.add_argument("--followers", type=int, default=700,
+                        help="follower count at the start (default 700)")
     parser.add_argument("--seed", type=int, default=7, help="RNG seed for reproducibility")
     parser.add_argument("--single", action="store_true",
                         help="only the main session (default also writes a short earlier one)")
     args = parser.parse_args()
 
     rng = random.Random(args.seed)
-    csv_path, _ = tv.paths_for(args.channel)
+    viewers_path, _ = tv.paths_for(args.channel)
+    metrics_path, _ = metrics_mod.paths_for(args.channel)
 
     # Anchor to a fixed date so regenerating gives byte-identical output.
     clock = datetime(2026, 8, 18, 9, 5, 0, tzinfo=timezone.utc)
     rows = []
+    followers = args.followers
 
     if not args.single:
-        # A short earlier broadcast, so graph.py has to pick the right session.
-        early, clock = session_rows(clock, 45, args.interval, 180, "319000000001", rng)
+        # A short earlier broadcast, so the graph has to pick the right session.
+        early, clock, followers = session_rows(
+            clock, 45, args.interval, 180, "319000000001", rng, followers)
         rows += early
-        rows += offline_rows(clock, 6, args.interval)
+        gap, followers = offline_rows(clock, 6, args.interval, followers, rng)
+        rows += gap
         clock += timedelta(hours=19)
 
-    main_rows, end = session_rows(
-        clock, args.hours * 60, args.interval, args.peak, "319997409116", rng
-    )
+    main_rows, end, followers = session_rows(
+        clock, args.hours * 60, args.interval, args.peak, "319997409116", rng, followers)
     rows += main_rows
-    rows += offline_rows(end, 3, args.interval)
+    tail, followers = offline_rows(end, 3, args.interval, followers, rng)
+    rows += tail
 
-    with open(csv_path, "w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow(tv.CSV_HEADER)
-        writer.writerows(rows)
+    write_csv(viewers_path, tv.CSV_HEADER, [
+        [r["when"], "true" if r["live"] else "false", r["viewers"], r["title"],
+         r["game"], r["started_at"], r["stream_id"]] for r in rows])
 
-    live = [r for r in rows if r[1] == "true"]
-    counts = [r[2] for r in live]
-    print("Wrote {} ({} rows: {} live, {} offline)".format(
-        os.path.basename(csv_path), len(rows), len(live), len(rows) - len(live)))
-    print("  sessions:   {}".format(1 if args.single else 2))
-    print("  main:       {:.0f}h at {}s intervals".format(args.hours, args.interval))
-    print("  peak:       {}   average: {}".format(max(counts), round(sum(counts) / len(counts))))
+    write_csv(metrics_path, metrics_mod.CSV_HEADER, [
+        [r["when"], "true" if r["live"] else "false", r["viewers"], r["followers"],
+         r["chatters"], r["title"], r["game"], r["started_at"], r["stream_id"]]
+        for r in rows])
+
+    live = [r for r in rows if r["live"]]
+    viewers = [r["viewers"] for r in live]
+    chat = [r["chatters"] for r in live]
+    gained = rows[-1]["followers"] - args.followers
+
+    print("Wrote {} and {}".format(os.path.basename(viewers_path),
+                                   os.path.basename(metrics_path)))
+    print("  rows        {} ({} live, {} offline)".format(
+        len(rows), len(live), len(rows) - len(live)))
+    print("  sessions    {}".format(1 if args.single else 2))
+    print("  main        {:.0f}h at {}s intervals".format(args.hours, args.interval))
+    print("  viewers     peak {}  avg {}".format(max(viewers), round(sum(viewers) / len(viewers))))
+    print("  chatters    peak {}  avg {}".format(max(chat), round(sum(chat) / len(chat))))
+    print("  followers   {} -> {}  (+{})".format(
+        args.followers, rows[-1]["followers"], gained))
     print("\nGraph it with:\n    python3 graph.py {}".format(args.channel))
 
 

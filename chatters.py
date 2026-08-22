@@ -93,6 +93,7 @@ def main():
                         help="print just the number, for scripting")
     args = parser.parse_args()
 
+    tv.log = lambda message: print("  {}".format(message))
     client_id, client_secret = tv.load_credentials()
     token_payload = user_auth.get_user_token([SCOPE])
     token = token_payload["access_token"]

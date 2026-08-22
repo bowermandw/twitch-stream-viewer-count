@@ -5,12 +5,17 @@
 
 # Collected data and generated charts
 viewers_*.csv
+metrics_*.csv
 poll_*.log
+metrics_*.log
 chart_*.svg
 
 # ...except the committed test fixtures, which are synthetic
 !viewers_testchannel.csv
+!metrics_testchannel.csv
 !chart_testchannel.svg
+!chart_testchannel_metrics.svg
+!chart_testchannel_composite.svg
 
 __pycache__/
 *.pyc

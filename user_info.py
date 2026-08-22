@@ -32,11 +32,12 @@ USER_TYPES = {"admin": "Twitch admin", "global_mod": "Global moderator",
 
 def quiet_log(message):
     """twitch_viewers.log() appends to a per-channel poll log; this script has
-    no channel, so keep its auth chatter on stdout instead of creating a file."""
+    no channel, so keep its auth chatter on stdout instead of creating a file.
+
+    Applied in main() rather than at import time: this module is imported by
+    metrics.py and others that do want their own log file.
+    """
     print("  {}".format(message))
-
-
-tv.log = quiet_log
 
 
 def fetch_users(values, token, client_id, by_id=False):
