@@ -372,6 +372,78 @@ def render(session, channel, bucket_minutes, width, height, show_buckets=True):
 # --------------------------------------------------------------------------
 
 
+
+def select_day(samples, day):
+    """Every sample from the first live one of `day` to the last, inclusive.
+
+    Offline rows *between* those two are kept, so a stream that dropped out and
+    came back charts as one continuous day rather than several broadcasts.
+    Dates are matched in local time, since that is the day the user means.
+    """
+    same_day = [s for s in samples if s["when"].astimezone().date() == day]
+    live = [i for i, s in enumerate(same_day) if s["live"]]
+    if not live:
+        return []
+    return same_day[live[0]:live[-1] + 1]
+
+
+def days_present(samples):
+    """Local dates that have at least one live sample."""
+    return sorted({s["when"].astimezone().date() for s in samples if s["live"]})
+
+
+def runs_of(window, key):
+    """Contiguous (elapsed, value) runs, broken wherever the metric is missing.
+
+    Viewers are absent from offline rows, so the line breaks over a downtime
+    instead of drawing a straight segment across it as if it were data.
+    """
+    start = window[0]["when"]
+    runs, current = [], []
+    for sample in window:
+        value = sample.get(key)
+        if value is None:
+            if current:
+                runs.append(current)
+                current = []
+        else:
+            current.append(((sample["when"] - start).total_seconds(), value))
+    if current:
+        runs.append(current)
+    return runs
+
+
+def offline_spans(window):
+    """(from, to) elapsed ranges where the channel was offline."""
+    start = window[0]["when"]
+    spans, opened = [], None
+    for sample in window:
+        elapsed = (sample["when"] - start).total_seconds()
+        if not sample["live"] and opened is None:
+            opened = elapsed
+        elif sample["live"] and opened is not None:
+            spans.append((opened, elapsed))
+            opened = None
+    if opened is not None:
+        spans.append((opened, (window[-1]["when"] - start).total_seconds()))
+    return spans
+
+
+def clock_ticks(start, duration, target=8):
+    """(elapsed, "H:MM PM") ticks on tidy clock boundaries."""
+    for step in (900, 1800, 3600, 7200, 10800, 14400, 21600):
+        if duration / step <= target:
+            break
+    ticks = []
+    first = start.astimezone()
+    offset = (step - (first.hour * 3600 + first.minute * 60 + first.second) % step) % step
+    elapsed = offset
+    while elapsed <= duration:
+        ticks.append((elapsed, fmt_clock(start + timedelta(seconds=elapsed))))
+        elapsed += step
+    return ticks
+
+
 def available_metrics(session):
     """Which metrics actually have data in this session, in display order."""
     out = []
@@ -402,7 +474,8 @@ def summarise(session, key):
     }
 
 
-def draw_panel(out, metric, session, geom, bucket_minutes, show_buckets, duration):
+def draw_panel(out, metric, session, geom, bucket_minutes, show_buckets, duration,
+               spans=(), ticks=None):
     """Render one metric into a panel. geom is (left, right, top, bottom)."""
     left, right, top, bottom = geom
     points = series_of(session, metric["key"])
@@ -440,13 +513,27 @@ def draw_panel(out, metric, session, geom, bucket_minutes, show_buckets, duratio
                            x, top, x, bottom))
             edge += bucket_minutes * 60
 
-    coords = " ".join("{:.1f},{:.1f}".format(sx(t), sy(v)) for t, v in points)
-    out.append('<path d="M {:.1f},{:.1f} L {} L {:.1f},{:.1f} Z" fill="url(#{})"/>'.format(
-        sx(points[0][0]), bottom, coords.replace(" ", " L "),
-        sx(points[-1][0]), bottom, gradient_id))
-    out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="2" '
-               'stroke-linejoin="round" stroke-linecap="round"/>'.format(
-                   coords, metric["color"]))
+    # Shade downtime before the series, so the line sits on top of it.
+    for span_from, span_to in spans:
+        x1, x2 = sx(span_from), sx(span_to)
+        if x2 - x1 >= 1:
+            out.append('<rect x="{:.1f}" y="{:.1f}" width="{:.1f}" height="{:.1f}" '
+                       'fill="#ffffff" opacity="0.055"/>'.format(x1, top, x2 - x1, bottom - top))
+
+    # One path per contiguous run, so a gap stays a gap.
+    for run in runs_of(session, metric["key"]):
+        coords = " ".join("{:.1f},{:.1f}".format(sx(t), sy(v)) for t, v in run)
+        if len(run) > 1:
+            out.append('<path d="M {:.1f},{:.1f} L {} L {:.1f},{:.1f} Z" '
+                       'fill="url(#{})"/>'.format(sx(run[0][0]), bottom,
+                                                  coords.replace(" ", " L "),
+                                                  sx(run[-1][0]), bottom, gradient_id))
+            out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="2" '
+                       'stroke-linejoin="round" stroke-linecap="round"/>'.format(
+                           coords, metric["color"]))
+        else:
+            out.append('<circle cx="{:.1f}" cy="{:.1f}" r="2" fill="{}"/>'.format(
+                sx(run[0][0]), sy(run[0][1]), metric["color"]))
 
     if show_buckets:
         for bucket in bucket_averages(session, bucket_minutes, metric["key"]):
@@ -477,11 +564,13 @@ def draw_panel(out, metric, session, geom, bucket_minutes, show_buckets, duratio
 
 
 def render_stacked(session, channel, bucket_minutes, width, show_buckets=True,
-                   metrics=None):
+                   metrics=None, day=None):
     """One panel per metric, sharing an x-axis."""
     metrics = metrics or available_metrics(session)
     start = session[0]["when"]
     duration = (session[-1]["when"] - start).total_seconds()
+    spans = offline_spans(session) if day else []
+    ticks = clock_ticks(start, duration) if day else None
     height = HEADER_H + len(metrics) * (PANEL_H + PANEL_GAP) + FOOT_H
     left, right = PAD_L, width - PAD_R
 
@@ -493,7 +582,12 @@ def render_stacked(session, channel, bucket_minutes, width, show_buckets=True,
     out.append('<rect width="{}" height="{}" fill="{}"/>'.format(width, height, BG))
 
     out.append(text(PAD_L, 46, "Stream metrics", size=21, fill=FG, weight="700"))
-    out.append(text(PAD_L, 74, "While live · {}".format(channel), size=14, fill=MUTED))
+    subtitle = ("{} · {}".format(channel, day.strftime("%a %-d %b %Y")) if day
+                else "While live · {}".format(channel))
+    if day and spans:
+        offline_total = sum(b - a for a, b in spans)
+        subtitle += "  ·  {} offline mid-day".format(fmt_elapsed(offline_total))
+    out.append(text(PAD_L, 74, subtitle, size=14, fill=MUTED))
 
     # Header tiles, one per metric, right-aligned like the reference chart.
     tile_x = width - PAD_R + 84
@@ -511,27 +605,39 @@ def render_stacked(session, channel, bucket_minutes, width, show_buckets=True,
     for index, metric in enumerate(metrics):
         top = HEADER_H + index * (PANEL_H + PANEL_GAP)
         draw_panel(out, metric, session, (left, right, top, top + PANEL_H),
-                   bucket_minutes, show_buckets, duration)
+                   bucket_minutes, show_buckets, duration, spans=spans, ticks=ticks)
 
     baseline = HEADER_H + len(metrics) * (PANEL_H + PANEL_GAP) - PANEL_GAP
-    out.append(text(left, baseline + 24, "0:00", size=13, fill=MUTED))
-    out.append(text(right, baseline + 24, fmt_elapsed(duration), size=13,
-                    fill=MUTED, anchor="end"))
-    out.append(text((left + right) / 2, baseline + 24, "{} → {}".format(
-        fmt_clock(start), fmt_clock(session[-1]["when"])), size=13, fill=DIM, anchor="middle"))
+    if ticks:
+        for elapsed, label in ticks:
+            x = left + (elapsed / duration) * (right - left) if duration else left
+            out.append(text(x, baseline + 24, label, size=12, fill=MUTED, anchor="middle"))
+    else:
+        out.append(text(left, baseline + 24, "0:00", size=13, fill=MUTED))
+        out.append(text(right, baseline + 24, fmt_elapsed(duration), size=13,
+                        fill=MUTED, anchor="end"))
+        out.append(text((left + right) / 2, baseline + 24, "{} → {}".format(
+            fmt_clock(start), fmt_clock(session[-1]["when"])), size=13, fill=DIM,
+            anchor="middle"))
+    legend_x = left
     if show_buckets:
         out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                    'stroke-width="1.5" opacity="0.5"/>'.format(
-                       left, height - 14, left + 18, height - 14, PANEL_LINE))
-        out.append(text(left + 25, height - 10,
+                       legend_x, height - 14, legend_x + 18, height - 14, PANEL_LINE))
+        out.append(text(legend_x + 25, height - 10,
                         "{}-minute average".format(bucket_minutes), size=12, fill=DIM))
+        legend_x += 170
+    if spans:
+        out.append('<rect x="{:.1f}" y="{:.1f}" width="18" height="10" fill="#ffffff" '
+                   'opacity="0.09"/>'.format(legend_x, height - 20))
+        out.append(text(legend_x + 25, height - 10, "stream offline", size=12, fill=DIM))
     out.append(text(right, height - 10, start.astimezone().strftime("%a %-d %b %Y"),
                     size=12, fill=DIM, anchor="end"))
     out.append("</svg>")
     return "\n".join(out)
 
 
-def render_composite(session, channel, width, height, metrics=None):
+def render_composite(session, channel, width, height, metrics=None, day=None):
     """All metrics on one plot, each scaled to its own range.
 
     The three live on wildly different scales (hundreds of viewers, dozens of
@@ -552,8 +658,17 @@ def render_composite(session, channel, width, height, metrics=None):
                    width, height, width, height))
     out.append('<rect width="{}" height="{}" fill="{}"/>'.format(width, height, BG))
     out.append(text(PAD_L, 46, "Stream metrics", size=21, fill=FG, weight="700"))
-    out.append(text(PAD_L, 74, "While live · {}  ·  each series scaled to its own range".format(
-        channel), size=14, fill=MUTED))
+    out.append(text(PAD_L, 74, "{} · each series scaled to its own range".format(
+        "{} · {}".format(channel, day.strftime("%a %-d %b %Y")) if day
+        else "While live · " + channel), size=14, fill=MUTED))
+
+    spans = offline_spans(session) if day else []
+    for span_from, span_to in spans:
+        x1 = left + (span_from / duration) * (right - left) if duration else left
+        x2 = left + (span_to / duration) * (right - left) if duration else left
+        if x2 - x1 >= 1:
+            out.append('<rect x="{:.1f}" y="{:.1f}" width="{:.1f}" height="{:.1f}" '
+                       'fill="#ffffff" opacity="0.055"/>'.format(x1, top, x2 - x1, bottom - top))
 
     for fraction in (0, 0.25, 0.5, 0.75, 1.0):
         y = bottom - fraction * (bottom - top)
@@ -581,12 +696,15 @@ def render_composite(session, channel, width, height, metrics=None):
         low, high = min(values), max(values)
         span = (high - low) or 1
 
-        coords = " ".join("{:.1f},{:.1f}".format(
-            left + (t / duration) * (right - left) if duration else left,
-            bottom - ((v - low) / span) * (bottom - top)) for t, v in points)
-        out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="2" '
-                   'stroke-linejoin="round" stroke-linecap="round" opacity="0.95"/>'.format(
-                       coords, metric["color"]))
+        for run in runs_of(session, metric["key"]):
+            if len(run) < 2:
+                continue
+            coords = " ".join("{:.1f},{:.1f}".format(
+                left + (t / duration) * (right - left) if duration else left,
+                bottom - ((v - low) / span) * (bottom - top)) for t, v in run)
+            out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="2" '
+                       'stroke-linejoin="round" stroke-linecap="round" opacity="0.95"/>'.format(
+                           coords, metric["color"]))
 
         out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                    'stroke-width="2.5" stroke-linecap="round"/>'.format(
@@ -654,13 +772,20 @@ def main():
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="examples:\n"
                "  python3 graph.py IGN\n"
-               "  python3 graph.py testchannel --bucket 60\n"
-               "  python3 graph.py IGN --session 1 --open\n")
+               "  python3 graph.py themeparkgiant --date 2026-08-22\n"
+               "  python3 graph.py themeparkgiant --date today --composite\n"
+               "  python3 graph.py IGN --list-days\n")
     parser.add_argument("channel", nargs="?", default=None,
                         help="channel name, or a path to a viewers_*.csv")
     parser.add_argument("--bucket", type=int, default=30, metavar="MIN",
                         help="block size for the light average lines (default 30)")
     parser.add_argument("--no-buckets", action="store_true", help="hide the average lines")
+    parser.add_argument("--date", default=None, metavar="YYYY-MM-DD",
+                        help="chart one calendar day (local time), first live sample to "
+                             "last, keeping any offline stretch in between. "
+                             "Accepts 'today' and 'yesterday'.")
+    parser.add_argument("--list-days", action="store_true",
+                        help="list the days with live data and exit")
     parser.add_argument("--session", type=int, default=None, metavar="N",
                         help="which broadcast to chart (default: the most recent)")
     parser.add_argument("--list-sessions", action="store_true",
@@ -694,7 +819,50 @@ def main():
             path = metrics_path
 
     samples = read_samples(path)
-    sessions = split_sessions(samples)
+
+    if args.list_days:
+        days = days_present(samples)
+        if not days:
+            sys.exit("No live samples in {}.".format(os.path.basename(path)))
+        print("{} day(s) with live data in {}:\n".format(len(days), os.path.basename(path)))
+        for day in days:
+            window = select_day(samples, day)
+            counts = [s["viewers"] for s in window if s["viewers"] is not None]
+            down = offline_spans(window)
+            print("  {}  {:>9}  peak {:>6}  {} sample{}{}".format(
+                day.isoformat(),
+                fmt_elapsed((window[-1]["when"] - window[0]["when"]).total_seconds()),
+                fmt_count(max(counts)) if counts else "—", len(window),
+                "s" * (len(window) != 1),
+                "   ({} offline mid-day)".format(fmt_elapsed(sum(b - a for a, b in down)))
+                if down else ""))
+        print("\nChart one with --date YYYY-MM-DD.")
+        return
+
+    day = None
+    if args.date:
+        keyword = args.date.strip().lower()
+        today = datetime.now().astimezone().date()
+        if keyword == "today":
+            day = today
+        elif keyword == "yesterday":
+            day = today - timedelta(days=1)
+        else:
+            try:
+                day = datetime.strptime(args.date.strip(), "%Y-%m-%d").date()
+            except ValueError:
+                sys.exit("Bad --date '{}'. Use YYYY-MM-DD, 'today' or 'yesterday'.".format(
+                    args.date))
+        session = select_day(samples, day)
+        if not session:
+            available = days_present(samples)
+            sys.exit("No live samples on {} in {}.{}".format(
+                day.isoformat(), os.path.basename(path),
+                "\nDays with data: " + ", ".join(d.isoformat() for d in available)
+                if available else ""))
+        sessions = [session]
+    else:
+        sessions = split_sessions(samples)
     if not sessions:
         sys.exit(
             "{} has no complete broadcast yet (need 2+ consecutive live samples).\n"
@@ -712,6 +880,8 @@ def main():
         print("\nChart one with --session N (default is the most recent).")
         return
 
+    if day and args.session is not None:
+        sys.exit("--date and --session select different things; use one or the other.")
     index = args.session if args.session is not None else len(sessions) - 1
     if not 0 <= index < len(sessions):
         sys.exit("No session {} — the file has {} (0-{}). Try --list-sessions.".format(
@@ -731,29 +901,43 @@ def main():
     suffix = ""
     if args.composite and multi:
         svg = render_composite(session, label, args.width, max(args.height, 470),
-                               metrics=metrics)
+                               metrics=metrics, day=day)
         suffix = "_composite"
     elif multi:
         svg = render_stacked(session, label, args.bucket, args.width,
-                             show_buckets=not args.no_buckets, metrics=metrics)
+                             show_buckets=not args.no_buckets, metrics=metrics, day=day)
         suffix = "_metrics"
-    elif metrics and metrics[0]["key"] != "viewers":
-        # A single non-viewer metric still reads best as one panel.
+    elif metrics and (day or metrics[0]["key"] != "viewers"):
+        # A single non-viewer metric reads best as one panel, and a day window
+        # can contain offline rows that only the panel renderer handles.
         svg = render_stacked(session, label, args.bucket, args.width,
-                             show_buckets=not args.no_buckets, metrics=metrics)
-        suffix = "_" + metrics[0]["key"]
+                             show_buckets=not args.no_buckets, metrics=metrics, day=day)
+        suffix = "" if (day and metrics[0]["key"] == "viewers") else "_" + metrics[0]["key"]
     else:
         svg = render(session, label, args.bucket, args.width, args.height,
                      show_buckets=not args.no_buckets)
 
+    if day:
+        suffix += "_" + day.isoformat()
     out_path = args.output or os.path.join(
         tv.BASE_DIR, "chart_{}{}.svg".format(
             tv.channel_slug(label.replace(".csv", "")), suffix))
     with open(out_path, "w", encoding="utf-8") as handle:
         handle.write(svg)
 
-    print("{}  — broadcast {} of {}  ({})\n".format(
-        label, index + 1, len(sessions), os.path.basename(path)))
+    if day:
+        down = offline_spans(session)
+        print("{}  — {}  ({})".format(label, day.strftime("%a %-d %b %Y"),
+                                      os.path.basename(path)))
+        if down:
+            print("  {} offline in {} stretch{} mid-day, kept in the chart\n".format(
+                fmt_elapsed(sum(b - a for a, b in down)), len(down),
+                "es" if len(down) != 1 else ""))
+        else:
+            print()
+    else:
+        print("{}  — broadcast {} of {}  ({})\n".format(
+            label, index + 1, len(sessions), os.path.basename(path)))
     print_summary(session, args.bucket, metrics)
     print("\n  chart     {}".format(out_path))
 

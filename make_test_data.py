@@ -18,6 +18,7 @@ import csv
 import math
 import os
 import random
+import sys
 from datetime import datetime, timedelta, timezone
 
 import metrics as metrics_mod
@@ -158,6 +159,10 @@ def main():
     parser.add_argument("--followers", type=int, default=700,
                         help="follower count at the start (default 700)")
     parser.add_argument("--seed", type=int, default=7, help="RNG seed for reproducibility")
+    parser.add_argument("--break", dest="breaks", action="append", default=None,
+                        metavar="H:M",
+                        help="insert an offline gap M minutes long, H hours into the "
+                             "stream (repeatable, e.g. --break 3:35)")
     parser.add_argument("--single", action="store_true",
                         help="only the main session (default also writes a short earlier one)")
     args = parser.parse_args()
@@ -180,9 +185,38 @@ def main():
         rows += gap
         clock += timedelta(hours=19)
 
-    main_rows, end, followers = session_rows(
-        clock, args.hours * 60, args.interval, args.peak, "319997409116", rng, followers)
-    rows += main_rows
+    # A day's streaming may be one sitting or several with breaks between.
+    breaks = []
+    for spec in (args.breaks or []):
+        try:
+            at_hours, minutes = spec.split(":")
+            breaks.append((float(at_hours) * 60, float(minutes)))
+        except ValueError:
+            sys.exit("Bad --break '{}'. Use HOURS:MINUTES, e.g. 3:35.".format(spec))
+    breaks.sort()
+
+    segments, previous = [], 0.0
+    for at_minute, _ in breaks:
+        segments.append(at_minute - previous)
+        previous = at_minute
+    segments.append(args.hours * 60 - previous)
+
+    for index, length in enumerate(segments):
+        if length <= 0:
+            continue
+        # Twitch issues a new stream id each time a broadcast restarts.
+        stream_id = "3199974091{:02d}".format(16 + index)
+        segment, clock, followers = session_rows(
+            clock, length, args.interval, args.peak, stream_id, rng, followers)
+        rows += segment
+        if index < len(breaks):
+            gap_minutes = breaks[index][1]
+            gap_samples = max(1, int(gap_minutes * 60 // args.interval))
+            gap, followers = offline_rows(clock, gap_samples, args.interval, followers, rng)
+            rows += gap
+            clock += timedelta(seconds=gap_samples * args.interval)
+
+    end = clock
     tail, followers = offline_rows(end, 3, args.interval, followers, rng)
     rows += tail
 
@@ -205,7 +239,9 @@ def main():
     print("  rows        {} ({} live, {} offline)".format(
         len(rows), len(live), len(rows) - len(live)))
     print("  sessions    {}".format(1 if args.single else 2))
-    print("  main        {:.0f}h at {}s intervals".format(args.hours, args.interval))
+    print("  main        {:.0f}h at {}s intervals{}".format(
+        args.hours, args.interval,
+        "  ({} break{})".format(len(breaks), "s" * (len(breaks) != 1)) if breaks else ""))
     print("  viewers     peak {}  avg {}".format(max(viewers), round(sum(viewers) / len(viewers))))
     print("  chatters    peak {}  avg {}".format(max(chat), round(sum(chat) / len(chat))))
     print("  followers   {} -> {}  (+{})".format(

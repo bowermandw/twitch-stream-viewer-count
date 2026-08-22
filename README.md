@@ -207,6 +207,17 @@ column is left blank and the other two carry on. `--no-chatters` skips it
 outright. If chat requests fail three times running it stops asking, so a
 permission change mid-run doesn't fill the log with errors.
 
+### The CSV always appends
+
+Both pollers open the file in append mode and write the header only when it's
+empty, so stopping and restarting — minutes or days later — continues the same
+file. Nothing is overwritten, and no marker is written at the join.
+
+That means a gap in the timestamps is the *only* record that polling stopped.
+`graph.py` infers one when the interval between samples exceeds 2.5× the median,
+and treats the samples either side as separate broadcasts. `--date` ignores that
+and takes the whole day.
+
 ## Graphing
 
 ```
@@ -268,6 +279,51 @@ python3 graph.py testchannel --composite      # all three overlaid
 python3 graph.py testchannel --only chatters  # just one
 python3 graph.py testchannel --viewers-only   # ignore metrics data
 ```
+
+### Charting one day
+
+```
+python3 graph.py themeparkgiant --date 2026-08-22
+python3 graph.py themeparkgiant --date today
+python3 graph.py themeparkgiant --list-days
+```
+
+This charts a **calendar day** rather than a single broadcast: from the first
+live sample of that day to the last, keeping any offline stretch in between so
+the day reads continuously.
+
+![One day with breaks](docs_chart_day.png)
+
+That day was three sittings with two breaks. Three things to notice:
+
+- The **viewers** line breaks over each gap rather than drawing a straight
+  segment across it, because there is genuinely no viewer count while offline.
+- **Followers** run unbroken straight through — people follow between streams,
+  and that is real data.
+- Offline stretches are **shaded**, and the x-axis switches to clock times,
+  since a day view is easier to read against the wall clock than elapsed time.
+
+Dates are matched in **local time**, which is the day you mean when you type
+one, even though the CSV stores UTC.
+
+Without `--date`, the same file splits into separate broadcasts at each break:
+
+```
+$ python3 graph.py breaktest --list-sessions
+4 broadcast(s) in metrics_breaktest.csv:
+  [0] Tue 18 Aug 5:05 AM    0:45:00  peak    180  avg    109  (10 samples)
+  [1] Wed 19 Aug 12:50 AM    2:30:00  peak    740  avg    528  (31 samples)
+  [2] Wed 19 Aug 4:00 AM    2:30:00  peak    740  avg    464  (31 samples)
+  [3] Wed 19 Aug 6:55 AM    3:00:00  peak    740  avg    538  (37 samples)
+
+$ python3 graph.py breaktest --list-days
+2 day(s) with live data in metrics_breaktest.csv:
+  2026-08-18    0:45:00  peak    180  10 samples
+  2026-08-19    9:05:00  peak    740  112 samples   (0:55:00 offline mid-day)
+```
+
+Use `--session` for one sitting, `--date` for a whole day. They can't be
+combined, since they select different things.
 
 ### Picking a broadcast
 
@@ -412,7 +468,12 @@ exercised.
 ```
 python3 make_test_data.py testchannel --hours 4 --peak 2000 --interval 60
 python3 make_test_data.py testchannel --single --seed 42
+python3 make_test_data.py breaktest --break 2.5:40 --break 5:25
 ```
+
+`--break H:M` inserts an offline gap M minutes long, H hours in — repeatable,
+and each restart gets a new `stream_id` the way Twitch issues one. That's what
+the day chart above is generated from.
 
 The seed is fixed by default, so regenerating gives identical data.
 

@@ -13,9 +13,12 @@ chart_*.svg
 # ...except the committed test fixtures, which are synthetic
 !viewers_testchannel.csv
 !metrics_testchannel.csv
+!viewers_breaktest.csv
+!metrics_breaktest.csv
 !chart_testchannel.svg
 !chart_testchannel_metrics.svg
 !chart_testchannel_composite.svg
+!chart_breaktest_metrics_2026-08-19.svg
 
 __pycache__/
 *.pyc
