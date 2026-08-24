@@ -122,7 +122,7 @@ def get(url, params, key):
 def channel_filter(value):
     """The channels.list filter for either a handle or a raw UC… channel id.
 
-    Accepts what a person would paste: "themeparkgiant", "@themeparkgiant", or
+    Accepts what a person would paste: "testchannel", "@testchannel", or
     the id out of a /channel/ URL.
     """
     value = str(value).strip().lstrip("@")

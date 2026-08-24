@@ -5,10 +5,10 @@
 #
 #   sudo cp deploy/youtube-metrics@.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now youtube-metrics@themeparkgiant
+#   sudo systemctl enable --now youtube-metrics@testchannel
 #
-#   systemctl status youtube-metrics@themeparkgiant
-#   journalctl -u youtube-metrics@themeparkgiant -f
+#   systemctl status youtube-metrics@testchannel
+#   journalctl -u youtube-metrics@testchannel -f
 #   systemctl stop 'youtube-metrics@*'
 #
 # This runs alongside twitch-metrics@.service rather than replacing it: the two

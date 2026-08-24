@@ -9,6 +9,7 @@ in parsing, session detection, chart building and CLI wiring.
 """
 
 import glob
+import json
 import os
 import re
 import stat
@@ -20,8 +21,8 @@ from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from twitchmetrics import (chart, config, drive, driveoauth, png, storage,  # noqa: E402
-                          youtube)
+from twitchmetrics import (chart, config, drive, driveoauth, png, retry, s3,  # noqa: E402
+                          storage, youtube)
 from twitchmetrics.commands import daily  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -31,6 +32,28 @@ VIEWERS = os.path.join(FIXTURES, "viewers_testchannel.csv")
 YOUTUBE = os.path.join(FIXTURES, "youtube_testchannel.csv")
 
 passed = failed = 0
+
+
+class no_env_file(object):
+    """Point config.ENV_PATH at an empty file for the block.
+
+    Every resolver falls back to .env after the environment, so a test that only
+    clears an environment variable still reads whatever the developer happens to
+    have configured. Two of these passed for months purely because .env had no
+    YOUTUBE_CHANNEL in it.
+    """
+
+    def __enter__(self):
+        self._saved = config.ENV_PATH
+        self._dir = tempfile.TemporaryDirectory()
+        config.ENV_PATH = os.path.join(self._dir.name, ".env")
+        open(config.ENV_PATH, "w").close()
+        return config.ENV_PATH
+
+    def __exit__(self, *exc):
+        config.ENV_PATH = self._saved
+        self._dir.cleanup()
+        return False
 
 
 def check(label, condition, detail=""):
@@ -174,7 +197,8 @@ with tempfile.TemporaryDirectory() as tmp:
 # --- interval configuration -----------------------------------------------
 section("interval")
 _saved = os.environ.pop("TWITCH_INTERVAL", None)
-check("defaults to 300", config.resolve_interval(None) == 300)
+with no_env_file():
+    check("defaults to 300", config.resolve_interval(None) == 300)
 os.environ["TWITCH_INTERVAL"] = "60"
 check("TWITCH_INTERVAL is honoured", config.resolve_interval(None) == 60)
 check("--interval beats the env var", config.resolve_interval(120) == 120)
@@ -186,7 +210,8 @@ for _bad in ("sixty", "5", "-1", "1.5"):
     except SystemExit:
         check("rejects {!r}".format(_bad), True)
 os.environ["TWITCH_INTERVAL"] = ""   # emptying a line means "unset", as for TWITCH_CHANNEL
-check("empty value falls back to the default", config.resolve_interval(None) == 300)
+with no_env_file():
+    check("empty value falls back to the default", config.resolve_interval(None) == 300)
 os.environ.pop("TWITCH_INTERVAL", None)
 if _saved is not None:
     os.environ["TWITCH_INTERVAL"] = _saved
@@ -233,9 +258,9 @@ check("graph recovers the channel name from a youtube path",
 
 # channel_filter is the whole "handle or id" decision, and it is pure.
 check("a bare handle becomes forHandle",
-      youtube.channel_filter("themeparkgiant") == {"forHandle": "@themeparkgiant"})
+      youtube.channel_filter("testchannel") == {"forHandle": "@testchannel"})
 check("a pasted @handle is the same thing",
-      youtube.channel_filter("@themeparkgiant") == {"forHandle": "@themeparkgiant"})
+      youtube.channel_filter("@testchannel") == {"forHandle": "@testchannel"})
 _uc = "UC" + "a" * 22
 check("a UC… id is used as an id", youtube.channel_filter(_uc) == {"id": _uc})
 check("a handle that merely starts with UC is still a handle",
@@ -273,8 +298,12 @@ check("hostile youtube names stay inside data/",
       == os.path.abspath(config.DATA_DIR))
 
 _saved_ch = os.environ.pop("YOUTUBE_CHANNEL", None)
-check("youtube channel falls back to the default",
-      config.resolve_youtube_channel(None) == config.DEFAULT_YOUTUBE_CHANNEL)
+with no_env_file():
+    check("youtube channel falls back to the default",
+          config.resolve_youtube_channel(None) == config.DEFAULT_YOUTUBE_CHANNEL)
+    check("the built-in default names nobody real",
+          config.DEFAULT_YOUTUBE_CHANNEL == "testchannel"
+          and config.DEFAULT_CHANNEL == "testchannel")
 os.environ["YOUTUBE_CHANNEL"] = "@somebody"
 check("YOUTUBE_CHANNEL is honoured, @ stripped",
       config.resolve_youtube_channel(None) == "somebody")
@@ -294,11 +323,13 @@ check("the default interval leaves room for a second channel",
 
 _saved_yi = os.environ.pop("YOUTUBE_INTERVAL", None)
 _saved_ti = os.environ.pop("TWITCH_INTERVAL", None)
-check("youtube defaults to 60", config.resolve_youtube_interval(None) == 60)
+with no_env_file():
+    check("youtube defaults to 60", config.resolve_youtube_interval(None) == 60)
 os.environ["TWITCH_INTERVAL"] = "300"
-check("TWITCH_INTERVAL does not leak into the youtube budget",
-      config.resolve_youtube_interval(None) == 60)
-check("twitch still reads its own", config.resolve_interval(None) == 300)
+with no_env_file():
+    check("TWITCH_INTERVAL does not leak into the youtube budget",
+          config.resolve_youtube_interval(None) == 60)
+    check("twitch still reads its own", config.resolve_interval(None) == 300)
 os.environ["YOUTUBE_INTERVAL"] = "180"
 check("YOUTUBE_INTERVAL is honoured", config.resolve_youtube_interval(None) == 180)
 check("--interval beats the env var", config.resolve_youtube_interval(600) == 600)
@@ -310,8 +341,9 @@ for _bad in ("thirty", "30", "-1", "1.5"):
     except SystemExit:
         check("youtube rejects {!r}".format(_bad), True)
 os.environ["YOUTUBE_INTERVAL"] = ""
-check("an emptied value falls back to the default",
-      config.resolve_youtube_interval(None) == 60)
+with no_env_file():
+    check("an emptied value falls back to the default",
+          config.resolve_youtube_interval(None) == 60)
 for _name, _saved in (("YOUTUBE_INTERVAL", _saved_yi), ("TWITCH_INTERVAL", _saved_ti)):
     os.environ.pop(_name, None)
     if _saved is not None:
@@ -468,14 +500,18 @@ check("graph and daily share one parser",
 section("daily discovery")
 with tempfile.TemporaryDirectory() as _wants:
     for _name in ("twitch-metrics@alpha.service", "twitch-metrics@beta.service",
+                  "youtube-metrics@alpha.service", "youtube-metrics@gamma.service",
                   "unrelated.service", "twitch-metrics@.service"):
         open(os.path.join(_wants, _name), "w").close()
-    check("finds enabled instances", daily.units_in(_wants) == ["alpha", "beta"],
+    check("finds enabled instances of both pollers",
+          daily.units_in(_wants) == ["alpha", "beta", "gamma"],
           str(daily.units_in(_wants)))
+    check("a channel polled on both platforms is one channel, not two",
+          daily.units_in(_wants).count("alpha") == 1)
     check("ignores unrelated units", "unrelated" not in daily.units_in(_wants))
     check("ignores the bare template", "" not in daily.units_in(_wants))
     _found, _source = daily.discover_channels(wants_dirs=[_wants])
-    check("discovery finds them", _found == ["alpha", "beta"], str(_found))
+    check("discovery finds them", _found == ["alpha", "beta", "gamma"], str(_found))
     check("discovery reports its source", "systemd" in _source, _source)
     check("an empty wants dir discovers nothing",
           daily.discover_channels(wants_dirs=[os.path.join(_wants, "nope")])[0] == [])
@@ -516,54 +552,77 @@ check("a dark day is not counted as a failure",
 
 # --- daily: the render and convert path -----------------------------------
 section("daily render")
-if not png.converter_path():
-    skipped("daily renders a PNG", "rsvg-convert not installed")
-else:
-    with tempfile.TemporaryDirectory() as tmp:
-        import shutil as _shutil
-        _shutil.copy(BREAKS, os.path.join(tmp, "metrics_breaktest.csv"))
-        _env = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
-                    TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"),
-                    TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
-        for _k in ("TWITCH_DAILY_CHANNELS", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
-            _env.pop(_k, None)
-        _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
-                             "--date", "2026-08-19", "--dry-run"],
-                            cwd=root, capture_output=True, text=True, env=_env)
-        _out = os.path.join(tmp, "chart_breaktest_2026-08-19.png")
-        check("daily --dry-run exits 0", _r.returncode == 0,
-              (_r.stderr or _r.stdout).strip()[-200:])
-        check("daily wrote a PNG next to the SVG", os.path.exists(_out))
-        check("the PNG is really a PNG",
-              os.path.exists(_out) and open(_out, "rb").read(4) == b"\x89PNG")
-        check("the SVG is kept too",
-              os.path.exists(os.path.join(tmp, "chart_breaktest_2026-08-19.svg")))
-        check("no .part file is left behind", not glob.glob(os.path.join(tmp, "*.part")))
-        check("--dry-run needs no Google credentials",
-              "GOOGLE_CLIENT" not in (_r.stdout + _r.stderr))
-        check("--dry-run doesn't try to authorize",
-              "drive --auth" not in (_r.stdout + _r.stderr))
-        check("the summary is the last line", "stop " in _r.stdout.strip().splitlines()[-1])
-        check("it logs to data/daily.log", os.path.exists(os.path.join(tmp, "daily.log")))
+with tempfile.TemporaryDirectory() as tmp:
+    import shutil as _shutil
+    # One channel polled on both platforms: the Twitch fixture's live day is
+    # 2026-08-19, the YouTube fixture's is 2026-08-21, so each date exercises
+    # "one platform has data, the other doesn't".
+    _shutil.copy(BREAKS, os.path.join(tmp, "metrics_breaktest.csv"))
+    _shutil.copy(YOUTUBE, os.path.join(tmp, "youtube_breaktest.csv"))
+    _env = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"),
+                TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
+    for _k in ("TWITCH_DAILY_CHANNELS", "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        _env.pop(_k, None)
 
-        _r2 = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
-                              "nosuchchannel", "--date", "2026-08-19", "--dry-run"],
-                             cwd=root, capture_output=True, text=True, env=_env)
-        check("one bad channel makes it exit 1", _r2.returncode == 1)
-        check("the good channel still ran", "chart_breaktest" in _r2.stdout)
-        check("and the failure is named", "nosuchchannel" in _r2.stdout)
+    def _daily(argv, env=_env):
+        return subprocess.run([sys.executable, "-m", "twitchmetrics", "daily"] + argv,
+                              cwd=root, capture_output=True, text=True, env=env)
+
+    _r = _daily(["breaktest", "--date", "2026-08-21", "--dry-run"])
+    check("daily --dry-run exits 0 when a platform has data", _r.returncode == 0,
+          (_r.stderr or _r.stdout).strip()[-200:])
+    check("it renders the YouTube day",
+          os.path.exists(os.path.join(tmp, "chart_breaktest_youtube_2026-08-21.svg")))
+    check("charts are named per platform, so the two can't overwrite each other",
+          "chart_breaktest_twitch_2026-08-21.svg"
+          != "chart_breaktest_youtube_2026-08-21.svg")
+    check("no PNG is written — the website serves SVG",
+          not glob.glob(os.path.join(tmp, "*.png")))
+    check("no .part file is left behind", not glob.glob(os.path.join(tmp, "*.part")))
+    check("--dry-run needs no AWS credentials",
+          "AWS_ACCESS_KEY_ID" not in (_r.stdout + _r.stderr))
+    check("--dry-run publishes nothing", "s3-website" not in (_r.stdout + _r.stderr))
+    check("the summary is the last line", "stop " in _r.stdout.strip().splitlines()[-1])
+    check("it logs to data/daily.log", os.path.exists(os.path.join(tmp, "daily.log")))
+
+    _r = _daily(["breaktest", "--date", "2026-08-19", "--dry-run"])
+    check("the other platform's day renders too",
+          os.path.exists(os.path.join(tmp, "chart_breaktest_twitch_2026-08-19.svg")))
+
+    # A channel with no CSV for one platform at all: not applicable, not broken.
+    _shutil.copy(YOUTUBE, os.path.join(tmp, "youtube_ytonly.csv"))
+    _r = _daily(["ytonly", "--date", "2026-08-21", "--dry-run"])
+    check("a channel polled on one platform only still exits 0", _r.returncode == 0,
+          (_r.stderr or _r.stdout).strip()[-200:])
+    check("and says nothing at all about the platform it isn't polled on",
+          "WARN" not in _r.stdout, _r.stdout.strip()[-200:])
+    check("backfilling a day one platform has no rows for is a skip, not a fault",
+          "nothing to backfill" in _r.stdout or "WARN" not in _r.stdout)
+
+    _r = _daily(["breaktest", "nosuchchannel", "--date", "2026-08-21", "--dry-run"])
+    check("one bad channel makes it exit 1", _r.returncode == 1)
+    check("the good channel still ran", "breaktest" in _r.stdout)
+    check("and the failure is named", "nosuchchannel" in _r.stdout)
 
 # --- daily: preflight fails loudly ----------------------------------------
 section("daily preflight")
 with tempfile.TemporaryDirectory() as tmp:
+    import shutil as _shutil2
+    _shutil2.copy(YOUTUBE, os.path.join(tmp, "youtube_breaktest.csv"))
     # sys.executable is absolute, so emptying PATH hides rsvg-convert only.
+    # It used to be a hard requirement; publishing SVG means it is now nothing
+    # to do with the report, and this proves it.
     _bare = dict(os.environ, PATH=tmp, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                 TWITCH_ENV_FILE=os.path.join(tmp, ".env"),
                  TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"))
+    _bare.pop("TWITCH_DAILY_CHANNELS", None)
     _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
-                         "--dry-run"], cwd=root, capture_output=True, text=True, env=_bare)
-    check("a missing rsvg-convert exits non-zero", _r.returncode != 0)
-    check("and says which package provides it",
-          "librsvg2-bin" in (_r.stdout + _r.stderr))
+                         "--date", "2026-08-21", "--dry-run"],
+                        cwd=root, capture_output=True, text=True, env=_bare)
+    check("a missing rsvg-convert no longer matters", _r.returncode == 0,
+          (_r.stderr or _r.stdout).strip()[-200:])
+    check("and nothing mentions it", "librsvg" not in (_r.stdout + _r.stderr))
     _empty = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
                   TWITCH_DAILY_CHANNELS="",
                   TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"))
@@ -574,8 +633,293 @@ with tempfile.TemporaryDirectory() as tmp:
           "TWITCH_DAILY_CHANNELS" in (_r.stdout + _r.stderr))
     _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "--list-channels"],
                         cwd=root, capture_output=True, text=True, env=_empty)
-    check("--list-channels needs no converter and no token",
+    check("--list-channels needs no credentials and no boto3",
           "Traceback" not in _r.stderr, _r.stderr.strip()[-200:])
+
+# --- s3 naming ------------------------------------------------------------
+section("s3 naming")
+check("a bucket name carries the shared prefix",
+      s3.bucket_name("testchannel").startswith(config.BUCKET_PREFIX))
+check("no underscore survives — a bucket name is a DNS label",
+      "_" not in s3.bucket_slug("some_channel_name"))
+check("a slug can't start or end with a hyphen",
+      not s3.bucket_slug("_weird_").startswith("-")
+      and not s3.bucket_slug("_weird_").endswith("-"))
+check("runs of hyphens collapse", "--" not in s3.bucket_slug("a___b___c"))
+check("a hostile channel can't escape into a path",
+      "/" not in s3.bucket_slug("../../etc/passwd")
+      and ".." not in s3.bucket_slug("../../etc/passwd"))
+check("an empty slug still yields a usable name", s3.bucket_slug("///") == "channel")
+check("names stay inside the 63-character limit",
+      len(s3.bucket_name("x" * 200)) <= s3.MAX_BUCKET_NAME,
+      str(len(s3.bucket_name("x" * 200))))
+check("a long name is still prefixed and suffixed correctly",
+      s3.bucket_name("x" * 200).startswith("tm-")
+      and len(s3.bucket_name("x" * 200).rsplit("-", 1)[1]) == s3.SUFFIX_BYTES * 2)
+check("two calls give different buckets — the namespace is global",
+      s3.bucket_name("same") != s3.bucket_name("same"))
+check("IGN and ign share one bucket slug",
+      s3.bucket_slug("IGN") == s3.bucket_slug("ign"))
+
+check("a chart key is platform/date.svg",
+      s3.object_key("twitch", date(2026, 8, 24)) == "twitch/2026-08-24.svg")
+check("the date component can't contain a slash",
+      "/" not in s3.object_key("twitch", date(2026, 8, 24)).split("/", 1)[1])
+check("a key round-trips through parse_key",
+      s3.parse_key(s3.object_key("youtube", date(2026, 8, 24)))
+      == ("youtube", "2026-08-24"))
+check("index.html is not mistaken for a chart", s3.parse_key("index.html") is None)
+check("nor is a stray upload", s3.parse_key("twitch/notes.txt") is None)
+check("nor a nearly-right key", s3.parse_key("twitch/2026-8-4.svg") is None)
+
+# The dash/dot split is frozen history, so it is worth pinning every one.
+for _region in ("us-east-1", "us-west-1", "us-west-2", "eu-west-1", "ap-southeast-1",
+                "ap-southeast-2", "ap-northeast-1", "sa-east-1", "us-gov-west-1"):
+    check("{} uses the dash endpoint".format(_region),
+          s3.website_url("b", _region) == "http://b.s3-website-{}.amazonaws.com".format(_region))
+for _region in ("us-east-2", "eu-west-2", "eu-central-1", "ca-central-1", "ap-south-1"):
+    check("{} uses the dot endpoint".format(_region),
+          s3.website_url("b", _region) == "http://b.s3-website.{}.amazonaws.com".format(_region))
+check("website endpoints are http — S3 does not serve TLS on them",
+      s3.website_url("b", "us-east-1").startswith("http://"))
+
+check("the read policy grants exactly GetObject",
+      s3.public_read_policy("b")["Statement"][0]["Action"] == ["s3:GetObject"])
+check("and only inside that bucket",
+      s3.public_read_policy("b")["Statement"][0]["Resource"] == ["arn:aws:s3:::b/*"])
+check("the policy is JSON-serialisable as-is",
+      "PublicReadGetObject" in json.dumps(s3.public_read_policy("b")))
+
+# --- s3 the page ----------------------------------------------------------
+section("s3 index page")
+_days = {"2026-08-24": ["twitch", "youtube"],
+         "2026-08-23": ["youtube"],
+         "2026-08-22": ["twitch", "youtube"]}
+_page = s3.render_index("testchannel", date(2026, 8, 24), _days)
+check("the page is a whole document",
+      _page.startswith("<!doctype html>") and _page.rstrip().endswith("</html>"))
+check("the channel is the heading", "<h1>testchannel</h1>" in _page)
+check("today's charts are displayed", _page.count("<img") == 2)
+check("today's twitch chart by relative key", 'src="twitch/2026-08-24.svg"' in _page)
+check("today's youtube chart too", 'src="youtube/2026-08-24.svg"' in _page)
+check("past days are links, not images",
+      'href="youtube/2026-08-23.svg"' in _page
+      and 'src="youtube/2026-08-23.svg"' not in _page)
+check("every past day is linked", _page.count("<li>") == 2)
+check("today is not repeated in the list", "<li><span>2026-08-24" not in _page)
+check("newest past day comes first",
+      _page.index("2026-08-23") < _page.index("2026-08-22"))
+check("the page is self-contained — no external asset",
+      "http://" not in _page.replace("http://www.w3.org", "") and "https://" not in _page)
+check("no script anywhere", "<script" not in _page.lower())
+check("a channel name is escaped",
+      "&lt;script&gt;" in s3.render_index("<script>", date(2026, 8, 24), {}))
+_empty_page = s3.render_index("x", date(2026, 8, 24), {})
+check("a day with no charts says so rather than showing a broken image",
+      "<img" not in _empty_page and "No graph for" in _empty_page)
+check("and the first day says the list is empty",
+      "first day" in s3.render_index("x", date(2026, 8, 24),
+                                     {"2026-08-24": ["twitch"]}))
+check("the CSS survived not being run through str.format",
+      "{ color-scheme: dark; }" in _page)
+
+# --- s3 the bucket registry -----------------------------------------------
+section("s3 bucket registry")
+check("the registry sits in data/ with the other state",
+      os.path.dirname(os.path.abspath(config.S3_BUCKETS_PATH))
+      == os.path.abspath(config.DATA_DIR))
+_real_buckets = config.S3_BUCKETS_PATH
+with tempfile.TemporaryDirectory() as tmp:
+    config.S3_BUCKETS_PATH = os.path.join(tmp, ".s3_buckets.json")
+    check("an absent registry reads as empty", s3._load_buckets() == {})
+    check("an unknown channel has no bucket", s3.bucket_for("nobody") is None)
+    s3.remember("IGN", "tm-ign-abc123", "us-east-1")
+    check("a bucket round-trips", s3.bucket_for("ign")["bucket"] == "tm-ign-abc123")
+    check("lookup is case-insensitive, like the CSVs",
+          s3.bucket_for("IGN") == s3.bucket_for("ign"))
+    check("the registry is written 0600",
+          stat.S_IMODE(os.stat(config.S3_BUCKETS_PATH).st_mode) == 0o600)
+    check("no temp file is left behind",
+          not [f for f in os.listdir(tmp) if ".tmp" in f])
+    check("target_path names the real bucket",
+          s3.target_path("ign", date(2026, 8, 24))
+          == "tm-ign-abc123/twitch/2026-08-24.svg")
+    with open(config.S3_BUCKETS_PATH, "w") as _h:
+        _h.write("{")
+    check("a half-written registry reads as empty, not a crash", s3._load_buckets() == {})
+    check("and require_bucket exits with the command to run",
+          raises(SystemExit, s3.require_bucket, "ign"))
+config.S3_BUCKETS_PATH = _real_buckets
+
+# --- s3 retries -----------------------------------------------------------
+section("s3 retries")
+check("throttling is retried", s3._is_retryable(200, "SlowDown"))
+check("a 503 is retried", s3._is_retryable(503, ""))
+check("a 500 is retried", s3._is_retryable(500, "InternalError"))
+check("a clock skew is retried", s3._is_retryable(200, "RequestTimeTooSkewed"))
+check("AccessDenied is not retried", not s3._is_retryable(403, "AccessDenied"))
+check("a missing bucket is not retried", not s3._is_retryable(404, "NoSuchBucket"))
+check("an invalid region is not retried",
+      not s3._is_retryable(400, "InvalidLocationConstraint"))
+_waits = [retry.retry_after(i) for i in range(retry.MAX_ATTEMPTS)]
+check("backoff grows", _waits == sorted(_waits), str(_waits))
+check("backoff stays bounded", max(_waits) < 20, str(_waits))
+
+
+class _FakeClientError(Exception):
+    def __init__(self, code, status):
+        super().__init__(code)
+        self.response = {"Error": {"Code": code},
+                         "ResponseMetadata": {"HTTPStatusCode": status}}
+
+
+check("an error code is read off a botocore-shaped exception",
+      s3._error_code(_FakeClientError("SlowDown", 503)) == "SlowDown")
+check("and the status with it", s3._status(_FakeClientError("SlowDown", 503)) == 503)
+check("a plain exception has no code", s3._error_code(ValueError("nope")) == "")
+check("an unrecognised exception is not classified, so it is re-raised",
+      s3._classify(ValueError("nope")) is None)
+check("a throttle is classified as retryable",
+      s3._classify(_FakeClientError("SlowDown", 503)) == (True, None))
+check("a permission error is classified as final",
+      s3._classify(_FakeClientError("AccessDenied", 403)) == (False, None))
+check("an unclassifiable error escapes with_backoff untouched",
+      raises(ValueError, retry.with_backoff, "x",
+             lambda: (_ for _ in ()).throw(ValueError("nope")), s3._classify))
+check("a final error is raised, not retried four times",
+      raises(_FakeClientError, retry.with_backoff, "x",
+             lambda: (_ for _ in ()).throw(_FakeClientError("AccessDenied", 403)),
+             s3._classify))
+check("a call that works is simply returned", retry.with_backoff("x", lambda: 7) == 7)
+check("giving up is its own exception type", issubclass(retry.GaveUp, RuntimeError))
+check("s3 translates it so daily can catch one type",
+      issubclass(s3.S3Error, Exception) and "GaveUp" in
+      open(os.path.join(root, "twitchmetrics/s3.py")).read())
+
+# --- boto3 stays optional -------------------------------------------------
+section("boto3 stays optional")
+_s3_src = open(os.path.join(root, "twitchmetrics/s3.py")).read()
+check("boto3 is imported inside a function, never at module scope",
+      "\nimport boto3" not in _s3_src and "    import boto3" in _s3_src)
+check("the failure names the fix", "pip install boto3" in _s3_src)
+_imports_boto3 = re.compile(r"^\s*(import|from)\s+boto3\b", re.M)
+for _mod in ("commands/daily.py", "commands/s3_cmd.py", "cli.py"):
+    check("{} never imports boto3 itself".format(_mod),
+          not _imports_boto3.search(
+              open(os.path.join(root, "twitchmetrics", _mod)).read()))
+check("only s3.py imports it at all",
+      [m for m in ("s3.py", "commands/daily.py", "commands/s3_cmd.py", "cli.py",
+                   "commands/graph_cmd.py", "chart.py")
+       if _imports_boto3.search(open(os.path.join(root, "twitchmetrics", m)).read())]
+      == ["s3.py"])
+check("daily imports s3 lazily too",
+      "    from .. import s3" in
+      open(os.path.join(root, "twitchmetrics/commands/daily.py")).read())
+
+# Source-text checks can be defeated, so prove it: a boto3.py that refuses to
+# import, earlier on the path than any real one, must not break the CLI.
+with tempfile.TemporaryDirectory() as tmp:
+    with open(os.path.join(tmp, "boto3.py"), "w") as _h:
+        _h.write("raise ImportError('boto3 is not installed')\n")
+    import shutil as _shutil3
+    _shutil3.copy(YOUTUBE, os.path.join(tmp, "youtube_breaktest.csv"))
+    _poisoned = dict(os.environ, PYTHONPATH=tmp, TWITCH_DATA_DIR=tmp,
+                     TWITCH_CHARTS_DIR=tmp, TWITCH_ENV_FILE=os.path.join(tmp, ".env"),
+                     TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"),
+                     TWITCH_CLIENT_ID="x", TWITCH_CLIENT_SECRET="y")
+    _poisoned.pop("TWITCH_DAILY_CHANNELS", None)
+    for _label, _argv in [
+        ("the help still works", ["--help"]),
+        ("graph still works", ["graph", YOUTUBE, "--output", os.path.join(tmp, "a.svg")]),
+        ("youtube --help still works", ["youtube", "--help"]),
+        ("poll --once still runs", ["poll", "nochannel", "--once", "--viewers-only"]),
+        ("daily --list-channels still works", ["daily", "--list-channels", "breaktest"]),
+        ("daily --dry-run still renders", ["daily", "breaktest", "--date", "2026-08-21",
+                                           "--dry-run"]),
+    ]:
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
+                            cwd=root, capture_output=True, text=True, env=_poisoned)
+        check("without boto3, " + _label, _r.returncode == 0,
+              (_r.stderr or _r.stdout).strip()[-200:])
+        check("without boto3, " + _label + " — and it isn't asked for",
+              "pip install boto3" not in (_r.stdout + _r.stderr))
+    # `s3 --list` reports "nothing yet" with exit 1, like daily --list-channels;
+    # the claim here is only that boto3 is not what stopped it.
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "s3", "--list"],
+                        cwd=root, capture_output=True, text=True, env=_poisoned)
+    check("without boto3, s3 --list still reads the registry",
+          "pip install boto3" not in (_r.stdout + _r.stderr)
+          and "Traceback" not in _r.stderr)
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "s3", "--setup", "x"],
+                        cwd=root, capture_output=True, text=True, env=_poisoned)
+    check("but publishing says to install it", _r.returncode != 0
+          and "pip install boto3" in (_r.stdout + _r.stderr),
+          (_r.stdout + _r.stderr).strip()[-160:])
+    check("and doesn't traceback about it", "Traceback" not in _r.stderr)
+
+# --- s3 command -----------------------------------------------------------
+section("s3 command")
+with tempfile.TemporaryDirectory() as tmp:
+    _env = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
+    for _k in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY"):
+        _env.pop(_k, None)
+    for _label, _argv, _want_zero in [
+        ("--list on an empty registry is not a crash", ["s3", "--list"], False),
+        ("--dry-run --setup needs no network", ["s3", "x", "--setup", "--dry-run"], True),
+        ("no mode says how to set up", ["s3", "x"], False),
+        ("--url without a bucket fails cleanly", ["s3", "x", "--url"], False),
+    ]:
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
+                            cwd=root, capture_output=True, text=True, env=_env)
+        check(_label, (_r.returncode == 0) == _want_zero,
+              "exit {}: {}".format(_r.returncode, (_r.stderr or _r.stdout).strip()[-140:]))
+        check(_label + " — no traceback", "Traceback" not in _r.stderr,
+              _r.stderr.strip()[-200:])
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "s3", "x", "--url"],
+                        cwd=root, capture_output=True, text=True, env=_env)
+    check("and points at --setup", "--setup" in (_r.stdout + _r.stderr))
+
+# --- aws configuration ----------------------------------------------------
+section("aws configuration")
+_saved_aws = {k: os.environ.pop(k, None) for k in
+              ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
+               "AWS_DEFAULT_REGION", "AWS_ACCOUNT_ID")}
+_real_env2 = config.ENV_PATH
+with tempfile.TemporaryDirectory() as tmp:
+    config.ENV_PATH = os.path.join(tmp, ".env")
+    check("no keys is not an error — boto3 has its own chain",
+          config.load_aws_credentials() == (None, None))
+    check("but asking for them insists", raises(SystemExit, config.load_aws_credentials,
+                                                True))
+    check("the region defaults", config.resolve_aws_region() == config.DEFAULT_AWS_REGION)
+    os.environ["AWS_DEFAULT_REGION"] = "eu-west-2"
+    check("AWS_DEFAULT_REGION is honoured, as the AWS CLI spells it",
+          config.resolve_aws_region() == "eu-west-2")
+    os.environ["AWS_REGION"] = "us-west-2"
+    check("AWS_REGION wins over it", config.resolve_aws_region() == "us-west-2")
+    check("--region wins over both", config.resolve_aws_region("ap-south-1") == "ap-south-1")
+    check("no account pin by default", config.expected_aws_account() is None)
+    os.environ["AWS_ACCOUNT_ID"] = "123456789012"
+    check("a pinned account is read back",
+          config.expected_aws_account() == "123456789012")
+    os.environ["AWS_ACCOUNT_ID"] = "  "
+    check("a blank pin means no pin", config.expected_aws_account() is None)
+    os.environ.pop("AWS_ACCOUNT_ID", None)
+    check("the mismatch message names both accounts",
+          "{got}" in s3.WRONG_ACCOUNT and "{want}" in s3.WRONG_ACCOUNT)
+    check("preflight checks the pin before anything is created",
+          open(os.path.join(root, "twitchmetrics/s3.py")).read()
+          .split("def preflight")[1].split("def ")[0].count("WRONG_ACCOUNT") == 1)
+    os.environ["AWS_ACCESS_KEY_ID"] = "AKIAEXAMPLE"
+    os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
+    check("keys are read from the environment",
+          config.load_aws_credentials(required=True) == ("AKIAEXAMPLE", "secret"))
+config.ENV_PATH = _real_env2
+for _k, _v in _saved_aws.items():
+    os.environ.pop(_k, None)
+    if _v is not None:
+        os.environ[_k] = _v
 
 # --- drive query building -------------------------------------------------
 section("drive queries")
@@ -728,26 +1072,24 @@ for _k, _v in _saved_google.items():
 with tempfile.TemporaryDirectory() as tmp:
     _env = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
                 TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
-    for _label, _argv in [
-        ("drive --status works with no token", ["drive", "--status"]),
-        ("drive --dry-run needs no network",
-         ["drive", "testchannel", "--file", PLAIN, "--dry-run"]),
-    ]:
-        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
-                            cwd=root, capture_output=True, text=True, env=_env)
-        check(_label, _r.returncode == 0, (_r.stderr or _r.stdout).strip()[-200:])
-        check(_label + " — no traceback", "Traceback" not in _r.stderr)
-    for _label, _argv in [
-        ("drive rejects a bad --date", ["drive", "x", "--date", "nonsense"]),
-        ("drive reports a missing file",
-         ["drive", "x", "--file", os.path.join(tmp, "nope.png")]),
-        ("drive upload without a token fails cleanly", ["drive", "x", "--file", PLAIN]),
-    ]:
-        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
-                            cwd=root, capture_output=True, text=True, env=_env)
-        check(_label, _r.returncode != 0, "expected non-zero exit")
-        check(_label + " — no traceback", "Traceback" not in _r.stderr,
-              _r.stderr.strip()[-200:])
+    # Drive is retired: unregistered from the CLI, but the module is kept and
+    # must still import cleanly, so it can be brought back with one line and
+    # cannot rot unnoticed in the meantime.
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "drive", "--status"],
+                        cwd=root, capture_output=True, text=True, env=_env)
+    check("the drive subcommand is retired", _r.returncode != 0)
+    check("and argparse says so rather than crashing", "Traceback" not in _r.stderr)
+    check("drive is not offered in the help",
+          "drive " not in subprocess.run(
+              [sys.executable, "-m", "twitchmetrics", "--help"],
+              cwd=root, capture_output=True, text=True).stdout)
+    check("but drive.py still imports", hasattr(drive, "upload_chart"))
+    check("and driveoauth.py with it", hasattr(driveoauth, "drive_token"))
+    check("drive.py says it is retired and how to restore it",
+          "RETIRED" in (drive.__doc__ or "") and "cli.py" in (drive.__doc__ or ""))
+    check("png.py is kept too, though nothing calls it",
+          hasattr(png, "to_png") and "png.require_converter" not in
+          open(os.path.join(root, "twitchmetrics/commands/daily.py")).read())
 
 # --- drive setup ordering -------------------------------------------------
 section("drive setup")
@@ -790,8 +1132,10 @@ check("the timer is installed into timers.target", "WantedBy=timers.target" in _
 check("data and charts are both writable",
       "ReadWritePaths=" in _svc and "/data" in _svc and "/charts" in _svc)
 check("the placeholders still fail loudly", "User=twitch" in _svc)
-check("it says which package provides rsvg-convert", "librsvg2-bin" in _svc)
-check("it warns about missing fonts", "fonts-dejavu" in _svc)
+check("it no longer demands rsvg-convert", "librsvg2-bin" not in _svc)
+check("nor a font package", "fonts-dejavu" not in _svc)
+check("it names what publishing does need", "boto3" in _svc)
+check("and where the AWS keys come from", "AWS_ACCESS_KEY_ID" in _svc)
 
 # --- no dependencies ------------------------------------------------------
 section("no dependencies")

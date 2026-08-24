@@ -9,8 +9,8 @@ import argparse
 import sys
 
 from . import __version__, config
-from .commands import (auth_cmd, chatters, daily, drive_cmd, followers, graph_cmd,
-                       poll, setup_cmd, testdata_cmd, users, youtube_cmd)
+from .commands import (auth_cmd, chatters, daily, followers, graph_cmd, poll,
+                       s3_cmd, setup_cmd, testdata_cmd, users, youtube_cmd)
 
 COMMANDS = [
     ("setup", setup_cmd, "register credentials and verify them"),
@@ -18,8 +18,8 @@ COMMANDS = [
     ("poll", poll, "record viewers, followers and chat size on an interval"),
     ("youtube", youtube_cmd, "record YouTube live viewers and subscriber count"),
     ("graph", graph_cmd, "render collected samples as an SVG chart"),
-    ("daily", daily, "chart every polled channel and upload the PNGs to Drive"),
-    ("drive", drive_cmd, "upload rendered charts to your own Google Drive"),
+    ("daily", daily, "chart every polled channel and publish to its website"),
+    ("s3", s3_cmd, "create and inspect a channel's S3 static website"),
     ("users", users, "account details for one or more logins"),
     ("followers", followers, "follower count, list, and follow checks"),
     ("chatters", chatters, "how many accounts are joined to chat"),
@@ -29,13 +29,13 @@ COMMANDS = [
 EPILOG = """
 examples:
   {prog} setup
-  {prog} poll themeparkgiant
-  {prog} youtube themeparkgiant --once
-  {prog} graph themeparkgiant --date today
+  {prog} poll testchannel
+  {prog} youtube testchannel --once
+  {prog} graph testchannel --date today
   {prog} daily --dry-run
-  {prog} drive --status
-  {prog} followers themeparkgiant --recent 10
-  {prog} chatters themeparkgiant
+  {prog} s3 --setup testchannel
+  {prog} followers testchannel --recent 10
+  {prog} chatters testchannel
 
 Every command takes the channel as its first argument, falling back to
 TWITCH_CHANNEL in .env and then the built-in default — except `youtube`, which
@@ -47,7 +47,8 @@ def build_parser():
     prog = config.invocation()
     parser = argparse.ArgumentParser(
         prog=prog,
-        description="Poll and chart Twitch channel metrics. Standard library only.",
+        description="Poll and chart Twitch and YouTube channel metrics. "
+                    "Collecting needs nothing installed.",
         epilog=EPILOG.format(prog=prog),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version",

@@ -1,0 +1,607 @@
+"""Publishing the daily charts to an S3 static website, one bucket per channel.
+
+Each channel gets its own bucket serving a single page: today's graph for every
+platform it is polled on, and prior days as links. The bucket holds nothing but
+that page and the charts:
+
+    index.html
+    twitch/2026-08-24.svg
+    youtube/2026-08-24.svg
+
+The page is rebuilt from a listing of the bucket rather than from anything kept
+locally, so a run after a week's gap still produces a correct index, and a chart
+uploaded by hand shows up in it.
+
+boto3 is imported lazily, inside _boto3(). cli.py imports every command module
+at startup, so a module-scope import here would take the whole CLI down on a
+machine that only polls — and polling is meant to need nothing installed.
+"""
+
+import html
+import json
+import os
+import re
+import secrets
+import stat
+
+from . import config, retry
+from .logging import log
+
+INDEX_KEY = "index.html"
+SVG_TYPE = "image/svg+xml"
+
+# Not `immutable`: re-running the report for today legitimately replaces today's
+# chart, and a year-long cache would hide that from anyone who had already
+# looked. Five minutes is long enough to be worth having.
+CHART_CACHE = "public, max-age=300"
+
+MAX_BUCKET_NAME = 63   # a bucket name is a DNS label, and that is the limit
+
+# The suffix does two jobs, and the second sets the size. Bucket names are
+# global, so it has to avoid a collision — a couple of bytes would do. But the
+# site is public-read and its only protection is that nobody knows the URL, and
+# the channel name is guessable, so this is also the whole keyspace an outsider
+# would have to search. Ten hex characters is a trillion; six would be a
+# weekend's worth of requests.
+SUFFIX_BYTES = 5
+
+PLATFORMS = ("twitch", "youtube")
+PLATFORM_LABELS = {"twitch": "Twitch", "youtube": "YouTube"}
+
+# These nine regions predate the dotted website endpoint and still answer on
+# s3-website-<region>; everything since uses s3-website.<region>. It is frozen
+# history rather than a rule, so it is a list and not an algorithm.
+DASH_REGIONS = frozenset((
+    "us-east-1", "us-west-1", "us-west-2", "eu-west-1", "ap-southeast-1",
+    "ap-southeast-2", "ap-northeast-1", "sa-east-1", "us-gov-west-1",
+))
+
+# "Slow down" or "try again", as opposed to "you may not" — retrying an
+# AccessDenied four times just wastes fifteen seconds and says the same thing.
+RETRY_CODES = ("SlowDown", "RequestTimeout", "RequestTimeoutException",
+               "InternalError", "ServiceUnavailable", "RequestTimeTooSkewed",
+               "TooManyRequests", "RequestThrottled", "ThrottlingException")
+
+KEY_RE = re.compile(r"^([a-z]+)/(\d{4}-\d{2}-\d{2})\.svg$")
+
+NO_BOTO3 = """The daily report needs boto3, which isn't installed.
+
+  pip install boto3
+  pip install -e '.[aws]'        # from a checkout
+
+Polling and `graph` still need nothing installed — only publishing does."""
+
+WRONG_ACCOUNT = """These credentials are for AWS account {got}, not {want}.
+
+AWS_ACCOUNT_ID in {env} pins the account this project may touch, and nothing
+will be created or uploaded while they disagree. Either AWS_PROFILE or the
+credential chain is pointing somewhere else, or the pin itself is stale."""
+
+ACCOUNT_BLOCKED = """S3 refused the public-read policy on {bucket}.
+
+Almost always this is account-level Block Public Access, which is separate from
+the per-bucket setting and wins over it. Clear it once, by hand:
+
+  S3 console -> Block Public Access (account settings) -> Edit -> clear all four
+
+The bucket has been created and is remembered, so re-running --setup will pick
+up where this left off."""
+
+
+class S3Error(Exception):
+    """An S3 call that failed in a way the caller should log and move past."""
+
+
+# --------------------------------------------------------------------------
+# errors and retries
+# --------------------------------------------------------------------------
+
+
+def _error_code(exc):
+    """The S3 error code out of a botocore ClientError, or "" for anything else.
+
+    Duck-typed rather than isinstance(ClientError) on purpose: botocore is only
+    imported lazily, so naming the class here would defeat that.
+    """
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return ""
+    return str((response.get("Error") or {}).get("Code") or "")
+
+
+def _status(exc):
+    """The HTTP status behind a botocore error, or 0 when there isn't one."""
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return 0
+    try:
+        return int((response.get("ResponseMetadata") or {}).get("HTTPStatusCode") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _is_retryable(status, code):
+    """Whether S3's answer is worth another attempt after a pause."""
+    if status in (429, 500, 502, 503, 504):
+        return True
+    return code in RETRY_CODES
+
+
+def _classify(exc):
+    """(retryable, retry_after) for an S3 error, or None for one that isn't ours.
+
+    S3 sends no Retry-After, so the delay is always the backoff schedule's.
+    """
+    code = _error_code(exc)
+    if not code:
+        return None
+    return _is_retryable(_status(exc), code), None
+
+
+def _with_backoff(what, call):
+    """Retry one idempotent S3 call. PUT is keyed by path, so replay is harmless."""
+    try:
+        return retry.with_backoff(what, call, _classify)
+    except retry.GaveUp as exc:
+        raise S3Error(str(exc)) from exc
+
+
+# --------------------------------------------------------------------------
+# naming — all pure, all cheap to test
+# --------------------------------------------------------------------------
+
+
+def bucket_slug(channel):
+    """The DNS-safe part of a bucket name.
+
+    channel_slug() is right for filenames and wrong for buckets: it keeps
+    underscores, which are illegal in a bucket name because the name becomes a
+    DNS label. Runs of hyphens collapse and the ends are trimmed, since a name
+    may not begin or end with one either.
+    """
+    slug = re.sub(r"[^a-z0-9-]", "-", config.channel_slug(channel).lower())
+    slug = re.sub(r"-{2,}", "-", slug).strip("-")
+    room = MAX_BUCKET_NAME - len(config.BUCKET_PREFIX) - 1 - SUFFIX_BYTES * 2
+    return slug[:room].strip("-") or "channel"
+
+
+def bucket_name(channel):
+    """A fresh globally-unique bucket name for a channel.
+
+    Random-suffixed because bucket names are shared across every AWS account,
+    so "tm-testchannel" may well belong to a stranger. Called once, by
+    --setup; after that the name is read back out of the registry.
+    """
+    return "{}{}-{}".format(config.BUCKET_PREFIX, bucket_slug(channel),
+                            secrets.token_hex(SUFFIX_BYTES))
+
+
+def object_key(platform, day):
+    """Where one platform's chart for one day lives: 'twitch/2026-08-24.svg'."""
+    return "{}/{}.svg".format(str(platform).strip("/. "), day.isoformat())
+
+
+def parse_key(key):
+    """(platform, 'YYYY-MM-DD') for a chart key, or None for anything else.
+
+    The index is built only from keys matching this, so index.html and any
+    stray upload are ignored rather than turned into a broken link.
+    """
+    match = KEY_RE.match(str(key))
+    return (match.group(1), match.group(2)) if match else None
+
+
+def website_url(bucket, region):
+    """The bucket's static-website URL.
+
+    HTTP only: S3 website endpoints do not serve TLS. Putting CloudFront in
+    front is the way to get HTTPS, and is deliberately out of scope here.
+    """
+    separator = "-" if region in DASH_REGIONS else "."
+    return "http://{}.s3-website{}{}.amazonaws.com".format(bucket, separator, region)
+
+
+def public_read_policy(bucket):
+    """The one statement a static website needs: anyone may GET an object.
+
+    A bucket policy rather than an ACL because new buckets have Object
+    Ownership set to bucket-owner-enforced, which disables ACLs outright — an
+    ACL request answers AccessControlListNotSupported.
+    """
+    return {
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Sid": "PublicReadGetObject",
+            "Effect": "Allow",
+            "Principal": "*",
+            "Action": ["s3:GetObject"],
+            "Resource": ["arn:aws:s3:::{}/*".format(bucket)],
+        }],
+    }
+
+
+def target_path(channel, day, platform="twitch"):
+    """Where the chart will land, for --dry-run and log lines."""
+    known = bucket_for(channel)
+    return "{}/{}".format(known["bucket"] if known else "(no bucket yet)",
+                          object_key(platform, day))
+
+
+# --------------------------------------------------------------------------
+# the bucket registry
+# --------------------------------------------------------------------------
+
+
+def _load_buckets():
+    """Remembered buckets. A missing or half-written file reads as empty."""
+    try:
+        with open(config.S3_BUCKETS_PATH, encoding="utf-8") as handle:
+            known = json.load(handle)
+        return known if isinstance(known, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_buckets(known):
+    """Atomic, and 0600 — it names infrastructure, even if it holds no secret."""
+    config.ensure_dirs()
+    temporary = config.S3_BUCKETS_PATH + ".tmp{}".format(os.getpid())
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump(known, handle, indent=2, sort_keys=True)
+    os.chmod(temporary, stat.S_IRUSR | stat.S_IWUSR)  # 0600
+    os.replace(temporary, config.S3_BUCKETS_PATH)
+
+
+def bucket_for(channel):
+    """{"bucket", "region"} for a channel, or None when --setup hasn't run."""
+    entry = _load_buckets().get(config.channel_slug(channel))
+    return entry if isinstance(entry, dict) and entry.get("bucket") else None
+
+
+def remember(channel, bucket, region):
+    """Record a channel's bucket. The random suffix cannot be recomputed."""
+    known = _load_buckets()
+    known[config.channel_slug(channel)] = {"bucket": bucket, "region": region}
+    _save_buckets(known)
+    return known[config.channel_slug(channel)]
+
+
+def require_bucket(channel):
+    """The channel's bucket, or exit saying how to make one."""
+    known = bucket_for(channel)
+    if not known:
+        raise SystemExit(
+            "No S3 bucket for '{}' yet.\n"
+            "Create one:  {} s3 --setup {}".format(
+                channel, config.invocation(), channel))
+    return known
+
+
+# --------------------------------------------------------------------------
+# transport
+# --------------------------------------------------------------------------
+
+
+def _boto3():
+    """The boto3 module, or exit saying how to install it."""
+    try:
+        import boto3
+    except ImportError as exc:
+        raise SystemExit(NO_BOTO3) from exc
+    return boto3
+
+
+def _client(service, region=None):
+    """A boto3 client: explicit keys when .env has them, boto3's own chain when not."""
+    boto3 = _boto3()
+    region = config.resolve_aws_region(region)
+    key, secret = config.load_aws_credentials()
+    if key and secret:
+        session = boto3.session.Session(aws_access_key_id=key,
+                                        aws_secret_access_key=secret,
+                                        region_name=region)
+    else:
+        session = boto3.session.Session(region_name=region)
+    return session.client(service)
+
+
+def preflight(region=None):
+    """Prove the credential works and say who it is, before anything is rendered.
+
+    Same reason the Drive report checked its token first: charting four channels
+    and then discovering the key is wrong wastes the run and reads as a chart
+    bug rather than a credentials one.
+    """
+    try:
+        who = _with_backoff("aws identity",
+                            lambda: _client("sts", region).get_caller_identity())
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any failure here is fatal and final
+        raise SystemExit(
+            "AWS rejected these credentials: {}\n"
+            "Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in {}, or "
+            "~/.aws/credentials.".format(exc, config.ENV_PATH))
+    account = str(who.get("Account") or "")
+    log("start    aws account {} as {}".format(
+        account or "?", (who.get("Arn") or "?").rsplit("/", 1)[-1]))
+
+    # Checked before anything is created. A laptop with SSO profiles for a dozen
+    # accounts resolves the chain to whichever AWS_PROFILE names, and several of
+    # those are usually administrator; this makes the wrong one a refusal.
+    want = config.expected_aws_account()
+    if want and account != want:
+        raise SystemExit(WRONG_ACCOUNT.format(got=account or "unknown", want=want,
+                                              env=config.ENV_PATH))
+    return who
+
+
+# --------------------------------------------------------------------------
+# setting a channel's site up
+# --------------------------------------------------------------------------
+
+
+def account_block(account_id, region=None):
+    """Account-wide Block Public Access settings; {} when none, None if unreadable.
+
+    Account level and bucket level are separate settings and AWS applies the
+    more restrictive of the two, so the bucket policy is refused while the
+    account block is on no matter what this program does to the bucket. Read it
+    up front so --setup can say that rather than reporting a bare AccessDenied.
+    """
+    try:
+        answer = _client("s3control", region).get_public_access_block(
+            AccountId=str(account_id))
+        return answer.get("PublicAccessBlockConfiguration") or {}
+    except SystemExit:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) == "NoSuchPublicAccessBlockConfiguration":
+            return {}  # nothing set at all, which is what a website wants
+        return None    # no permission to look; the policy call will settle it
+
+
+def warn_if_account_blocked(account_id, region=None):
+    """Log the account-level block, if it is on, in terms of what to click."""
+    blocked = account_block(account_id, region)
+    if not blocked:
+        return False
+    names = sorted(name for name, value in blocked.items() if value)
+    if not names:
+        return False
+    log("WARN     account-level Block Public Access is on: {}".format(", ".join(names)))
+    log("WARN     it overrides the per-bucket setting, so the policy will be refused")
+    log("WARN     clear it: S3 console -> Block Public Access (account settings)")
+    return True
+
+
+def create_site(channel, region=None):
+    """Create and configure a channel's website bucket. (entry, created_now).
+
+    Idempotent by way of the registry: a channel that already has a bucket is
+    left alone, so re-running after a half-finished setup does not strand a
+    second bucket nobody knows about.
+    """
+    region = config.resolve_aws_region(region)
+    existing = bucket_for(channel)
+    if existing:
+        return existing, False
+
+    bucket = bucket_name(channel)
+    s3 = _client("s3", region)
+
+    params = {"Bucket": bucket}
+    # us-east-1 is the one region that must NOT be named: it is the API default,
+    # and sending LocationConstraint for it fails as InvalidLocationConstraint.
+    if region != "us-east-1":
+        params["CreateBucketConfiguration"] = {"LocationConstraint": region}
+    _with_backoff("create bucket", lambda: s3.create_bucket(**params))
+    # Remembered before it is configured: the name is random and unguessable, so
+    # a failure in the next three calls must not lose track of what was created.
+    remember(channel, bucket, region)
+
+    # Order matters. The block has to be cleared before the policy, or
+    # put_bucket_policy is refused; the policy is the only way to grant read,
+    # because bucket-owner-enforced ownership leaves ACLs disabled.
+    _with_backoff("clear block-public-access",
+                  lambda: s3.delete_public_access_block(Bucket=bucket))
+    try:
+        _with_backoff("put bucket policy", lambda: s3.put_bucket_policy(
+            Bucket=bucket, Policy=json.dumps(public_read_policy(bucket))))
+    except Exception as exc:  # noqa: BLE001
+        if _error_code(exc) == "AccessDenied":
+            raise SystemExit(ACCOUNT_BLOCKED.format(bucket=bucket)) from exc
+        raise
+    _with_backoff("put website config", lambda: s3.put_bucket_website(
+        Bucket=bucket,
+        WebsiteConfiguration={"IndexDocument": {"Suffix": INDEX_KEY}}))
+
+    return {"bucket": bucket, "region": region}, True
+
+
+# --------------------------------------------------------------------------
+# publishing
+# --------------------------------------------------------------------------
+
+
+def upload_chart(channel, path, platform, day):
+    """Put one SVG at '<platform>/<date>.svg'. Returns {"bucket", "key", "url"}."""
+    known = require_bucket(channel)
+    key = object_key(platform, day)
+    with open(path, "rb") as handle:
+        body = handle.read()
+    s3 = _client("s3", known["region"])
+    # No ACL argument: ACLs are disabled on a bucket-owner-enforced bucket, and
+    # the bucket policy already grants the public read.
+    _with_backoff("upload {} {}".format(channel, key), lambda: s3.put_object(
+        Bucket=known["bucket"], Key=key, Body=body,
+        ContentType=SVG_TYPE, CacheControl=CHART_CACHE))
+    return {"bucket": known["bucket"], "key": key,
+            "url": "{}/{}".format(website_url(known["bucket"], known["region"]), key)}
+
+
+def list_days(channel):
+    """{'YYYY-MM-DD': [platform, ...]} for every chart in the bucket, newest first."""
+    known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    found = {}
+    token = None
+    while True:
+        params = {"Bucket": known["bucket"]}
+        if token:
+            params["ContinuationToken"] = token
+        page = _with_backoff("list {}".format(channel),
+                             lambda p=dict(params): s3.list_objects_v2(**p))
+        for item in page.get("Contents") or []:
+            parsed = parse_key(item.get("Key") or "")
+            if parsed:
+                platform, day = parsed
+                if platform not in found.setdefault(day, []):
+                    found[day].append(platform)
+        token = page.get("NextContinuationToken") if page.get("IsTruncated") else None
+        if not token:
+            break
+    # Newest first, and dicts keep insertion order, so the page can just iterate.
+    return {day: sorted(found[day]) for day in sorted(found, reverse=True)}
+
+
+def publish_index(channel, today):
+    """Rebuild index.html from what is actually in the bucket and upload it."""
+    known = require_bucket(channel)
+    days = list_days(channel)
+    page = render_index(channel, today, days)
+    s3 = _client("s3", known["region"])
+    _with_backoff("publish index for {}".format(channel), lambda: s3.put_object(
+        Bucket=known["bucket"], Key=INDEX_KEY, Body=page.encode("utf-8"),
+        ContentType="text/html; charset=utf-8",
+        # no-cache, not no-store: the browser may keep it but must revalidate,
+        # or tomorrow's first visit shows today's page.
+        CacheControl="no-cache"))
+    return {"url": website_url(known["bucket"], known["region"]), "days": len(days)}
+
+
+# --------------------------------------------------------------------------
+# the page
+# --------------------------------------------------------------------------
+
+# Hand-built, the way chart.py builds SVG, and for the same reason: no template
+# engine to install. The palette is chart.py's, so the page and the graphs it
+# shows read as one thing rather than a chart pasted onto a white document.
+#
+# STYLE is concatenated rather than interpolated, because every brace in CSS
+# would otherwise have to be doubled to survive str.format().
+STYLE = """
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 32px 24px 64px;
+    background: #0f0f0f; color: #f1f1f1;
+    font: 15px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          Helvetica, Arial, sans-serif;
+  }
+  main { max-width: 1340px; margin: 0 auto; }
+  header { border-bottom: 1px solid #303030; padding-bottom: 18px; margin-bottom: 32px; }
+  h1 { margin: 0; font-size: 27px; font-weight: 600; letter-spacing: -0.01em; }
+  .today { margin: 6px 0 0; color: #aaaaaa; font-size: 14px; }
+  h2 {
+    margin: 0 0 14px; font-size: 13px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.09em; color: #aaaaaa;
+  }
+  .panel { margin-bottom: 34px; }
+  .panel img {
+    display: block; width: 100%; height: auto;
+    border: 1px solid #303030; border-radius: 8px; background: #0f0f0f;
+  }
+  .past { border-top: 1px solid #303030; padding-top: 26px; }
+  .past ul { list-style: none; margin: 0; padding: 0; }
+  .past li {
+    display: flex; gap: 14px; align-items: baseline;
+    padding: 9px 0; border-bottom: 1px solid #1c1c1c;
+  }
+  .past li span { color: #f1f1f1; font-variant-numeric: tabular-nums; min-width: 6.5em; }
+  a { color: #4fb3e8; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .empty { color: #717171; margin: 0; }
+  footer { margin-top: 40px; color: #717171; font-size: 12px; }
+"""
+
+HEAD = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{channel} — stream metrics</title>
+<style>"""
+
+BODY = """</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>{channel}</h1>
+    <p class="today">{date}</p>
+  </header>
+{panels}
+  <section class="past">
+    <h2>Past days</h2>
+{past}
+  </section>
+  <footer>Updated {date} · {count} day(s) recorded</footer>
+</main>
+</body>
+</html>
+"""
+
+PANEL = """  <section class="panel">
+    <h2>{label}</h2>
+    <img src="{key}" alt="{label} concurrent viewers on {date}">
+  </section>"""
+
+
+def render_index(channel, today, days):
+    """The whole site: one HTML page, no JS, no external assets.
+
+    `days` is list_days()' mapping, newest first. Today's charts are shown;
+    every earlier day is a link and nothing more, so the page stays quick to
+    load however many months accumulate.
+
+    Everything interpolated goes through html.escape(): the channel name
+    arrives from a command line argument, and the keys are built from it.
+    """
+    stamp = today.isoformat()
+    pretty = today.strftime("%a %d %b %Y")
+    todays = days.get(stamp) or []
+
+    panels = []
+    for platform in PLATFORMS:
+        if platform not in todays:
+            continue
+        panels.append(PANEL.format(
+            label=html.escape(PLATFORM_LABELS.get(platform, platform)),
+            key=html.escape(object_key(platform, today)),
+            date=html.escape(pretty)))
+    if not panels:
+        panels.append('  <p class="empty">No graph for {} — either nothing was '
+                      'streamed, or the report has not run yet.</p>'.format(
+                          html.escape(pretty)))
+
+    rows = []
+    for day, platforms in days.items():
+        if day == stamp:
+            continue
+        links = " ".join(
+            '<a href="{}">{}</a>'.format(
+                html.escape("{}/{}.svg".format(platform, day)),
+                html.escape(PLATFORM_LABELS.get(platform, platform)))
+            for platform in platforms)
+        rows.append("      <li><span>{}</span>{}</li>".format(html.escape(day), links))
+    past = ("    <ul>\n" + "\n".join(rows) + "\n    </ul>" if rows else
+            '    <p class="empty">Nothing earlier yet — this is the first day.</p>')
+
+    return (HEAD.format(channel=html.escape(str(channel)))
+            + STYLE
+            + BODY.format(channel=html.escape(str(channel)),
+                          date=html.escape(pretty),
+                          panels="\n".join(panels),
+                          past=past,
+                          count=len(days)))

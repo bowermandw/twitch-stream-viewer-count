@@ -14,7 +14,7 @@
 # disagree, which is a good way to upload an empty chart.
 
 [Unit]
-Description=Daily Twitch metrics chart and Drive upload at 17:00
+Description=Daily metrics chart and website publish at 17:00
 Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
 
 [Timer]

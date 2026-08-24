@@ -20,7 +20,7 @@ API for this — it has to be done in a browser, once. It takes about 2 minutes.
      (log in; the dev console requires 2FA on your Twitch account)
 
   2. Fill in the form:
-       Name                 anything unique, e.g. themeparkgiant-viewer-log
+       Name                 anything unique, e.g. testchannel-viewer-log
        OAuth Redirect URLs  http://localhost:3000
                             (required field; used only by `auth`)
        Category             Analytics Tool

@@ -1,7 +1,8 @@
-# systemd unit for the once-a-day chart-and-upload job.
+# systemd unit for the once-a-day chart-and-publish job.
 #
 # NOT a template — one run handles every channel, so there is nothing to put
-# after an @. The channel list comes from the enabled twitch-metrics@ instances.
+# after an @. The channel list comes from the enabled pollers, both platforms:
+# twitch-metrics@ and youtube-metrics@ instances alike.
 #
 #   sudo cp deploy/twitch-metrics-daily.service /etc/systemd/system/
 #   sudo cp deploy/twitch-metrics-daily.timer   /etc/systemd/system/
@@ -23,28 +24,31 @@
 #   User=twitch does not exist by default -> systemd exits 217/USER before
 #   running anything, so there is no Python output to explain it.
 #
-# Three things this job needs that the poller does not:
+# Two things this job needs that the poller does not:
 #
-#   rsvg-convert   apt install librsvg2-bin        — it exits 1 if missing
-#   a font         apt install fonts-dejavu-core   — a minimal server has none,
-#                  and rsvg-convert will happily write a PNG with no text in it
-#   a Drive token  authorized once, interactively; see deploy/README.md
+#   boto3          pip install boto3   — publishing needs it; collecting does not
+#   AWS keys       AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in .env, or
+#                  ~/.aws/credentials, or an instance role. See deploy/README.md.
 #
-# Run this as the SAME User= as the pollers. The Google token is 0600 in the
-# shared data/ directory, and CSV readability otherwise depends on umask.
+# It publishes SVG, which browsers render natively, so there is deliberately no
+# rsvg-convert and no font package to install — both were PNG requirements.
 #
-# Exits 0 when every channel was charted and uploaded — a channel that simply
-# didn't stream is a skip, not a failure. Exits 1 if anything failed, or if no
+# Run this as the SAME User= as the pollers: it reads their CSVs, and CSV
+# readability otherwise depends on umask.
+#
+# Exits 0 when every channel was charted and published — a channel that simply
+# didn't stream is a skip, not a failure, and a channel polled on only one
+# platform is not a failure either. Exits 1 if anything failed, or if no
 # channels were found. The last journal line is always the summary.
 #
 # If the pollers aren't systemd-managed on this box, name the channels instead:
-#   Environment=TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+#   Environment=TWITCH_DAILY_CHANNELS=testchannel,prgskidmark
 #
 # Confirm what systemd resolved:
 #   systemctl show -p User -p WorkingDirectory -p ExecStart twitch-metrics-daily.service
 
 [Unit]
-Description=Twitch metrics daily chart and Drive upload
+Description=Twitch and YouTube metrics daily chart and website publish
 Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
 After=network-online.target
 Wants=network-online.target
@@ -65,9 +69,9 @@ StandardOutput=journal
 StandardError=journal
 
 # Same hardening as the poller, with one difference worth stating: data/ has to
-# be WRITABLE, not just readable. The run appends to data/daily.log and rewrites
-# the Google access token in place. charts/ is writable because the SVG and the
-# PNG are both written there.
+# be WRITABLE, not just readable. The run appends to data/daily.log and records
+# each channel's bucket name in data/.s3_buckets.json. charts/ is writable
+# because that is where the SVGs are rendered before being uploaded.
 #
 # ProtectSystem=strict leaves /etc READ-ONLY rather than hidden, which is what
 # channel discovery needs — it reads the twitch-metrics@ symlinks in

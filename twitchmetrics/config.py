@@ -27,7 +27,10 @@ GOOGLE_TOKEN_PATH = os.path.join(DATA_DIR, ".google_token.json")
 # being used instead of a second one appearing beside it.
 DRIVE_FOLDERS_PATH = os.path.join(DATA_DIR, ".drive_folders.json")
 
-DEFAULT_CHANNEL = "themeparkgiant"
+# A placeholder, not anyone's channel. The real one belongs in .env, which is
+# gitignored — this file is published, and a default here would name a real
+# channel in the repo. TWITCH_CHANNEL and YOUTUBE_CHANNEL override it.
+DEFAULT_CHANNEL = "testchannel"
 DEFAULT_INTERVAL_SECONDS = 300  # 5 minutes
 MIN_INTERVAL_SECONDS = 10
 HTTP_TIMEOUT = 20       # stops a hung socket stalling a poll loop
@@ -39,7 +42,7 @@ HELIX = "https://api.twitch.tv/helix"
 # --- YouTube --------------------------------------------------------------
 YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
 
-DEFAULT_YOUTUBE_CHANNEL = "themeparkgiant"
+DEFAULT_YOUTUBE_CHANNEL = "testchannel"   # as above: set YOUTUBE_CHANNEL in .env
 
 # YouTube bills every request against a fixed daily pool rather than a rate
 # limit, so the interval here is a budget, not a preference. One sample calls
@@ -57,6 +60,33 @@ DRIVE_API = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_API = "https://www.googleapis.com/upload/drive/v3"
 
 DEFAULT_DRIVE_FOLDER = "Twitch Metrics"
+
+# --- AWS S3 ---------------------------------------------------------------
+DEFAULT_AWS_REGION = "us-east-1"
+
+# Bucket names are global across every AWS account, so a channel's bucket gets
+# a random suffix and has to be remembered rather than recomputed.
+S3_BUCKETS_PATH = os.path.join(DATA_DIR, ".s3_buckets.json")
+
+# Every bucket this project creates starts with this, so an IAM policy can be
+# scoped to "arn:aws:s3:::tm-*" and a bug here cannot touch anything else in
+# the account.
+BUCKET_PREFIX = "tm-"
+
+
+def expected_aws_account():
+    """The account id this project is allowed to touch, or None for "any".
+
+    Worth setting on any machine that can reach more than one AWS account. A
+    developer laptop often has SSO profiles for a dozen of them, several with
+    administrator access, and boto3's credential chain will cheerfully resolve
+    to whichever one AWS_PROFILE happens to name. Pinning the id turns
+    "published a stream chart into a client's production account" from a typo
+    into a refusal.
+    """
+    value = (os.environ.get("AWS_ACCOUNT_ID")
+             or load_env_file().get("AWS_ACCOUNT_ID") or "").strip()
+    return value or None
 
 
 def invocation():
@@ -169,6 +199,48 @@ def load_google_credentials(required=True):
     return client_id, client_secret
 
 
+def load_aws_credentials(required=False):
+    """AWS access key and secret; environment wins, .env fills the gaps.
+
+    (None, None) is a meaningful answer, not a failure: it means "no explicit
+    keys", and boto3 then falls back to its own credential chain — an instance
+    role, or ~/.aws/credentials. So this defaults to required=False, unlike
+    load_credentials(), and only the commands that cannot proceed without a
+    named key ask for required=True.
+    """
+    from_file = load_env_file()
+    key = os.environ.get("AWS_ACCESS_KEY_ID") or from_file.get("AWS_ACCESS_KEY_ID")
+    secret = (os.environ.get("AWS_SECRET_ACCESS_KEY")
+              or from_file.get("AWS_SECRET_ACCESS_KEY"))
+
+    missing = [name for name, value in (("AWS_ACCESS_KEY_ID", key),
+                                        ("AWS_SECRET_ACCESS_KEY", secret)) if not value]
+    if missing and required:
+        sys.exit(
+            "Missing AWS credential(s): {}\n"
+            "Add them to {} as:\n"
+            "  AWS_ACCESS_KEY_ID=...\n"
+            "  AWS_SECRET_ACCESS_KEY=...\n"
+            "Or configure them the AWS way, in ~/.aws/credentials.".format(
+                ", ".join(missing), ENV_PATH))
+    if missing:
+        return None, None
+    return key, secret
+
+
+def resolve_aws_region(cli_value=None):
+    """Precedence: --region > AWS_REGION > AWS_DEFAULT_REGION > DEFAULT_AWS_REGION.
+
+    AWS_DEFAULT_REGION is honoured because that is the name the AWS CLI and the
+    SDKs use, and a machine that already has one shouldn't need a second.
+    """
+    from_file = load_env_file()
+    return (cli_value
+            or os.environ.get("AWS_REGION") or from_file.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION") or from_file.get("AWS_DEFAULT_REGION")
+            or DEFAULT_AWS_REGION).strip()
+
+
 def update_env(values):
     """Merge KEY=value pairs into .env, preserving every other line, at 0600.
 
@@ -220,7 +292,7 @@ def resolve_youtube_channel(cli_value=None):
     """Precedence: command line > YOUTUBE_CHANNEL env/.env > DEFAULT_YOUTUBE_CHANNEL.
 
     The @ of a handle is stripped, so a value copied straight out of a channel
-    URL (@themeparkgiant) resolves the same as the bare name.
+    URL (@testchannel) resolves the same as the bare name.
     """
     return (cli_value
             or os.environ.get("YOUTUBE_CHANNEL")
