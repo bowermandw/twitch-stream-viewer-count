@@ -12,8 +12,18 @@ needed, nothing to keep patched. The project uses only the standard library:
 python3 --version      # 3.9+
 ```
 
-That's the whole dependency list. `requirements.txt` is intentionally empty and
-says so.
+That's the whole Python dependency list. `requirements.txt` is intentionally
+empty and says so.
+
+**Two system packages, only if you want the [daily Drive report](#daily-report-to-google-drive):**
+
+```
+apt install librsvg2-bin      # rsvg-convert — the daily job exits 1 without it
+apt install fonts-dejavu-core # or the PNGs come out with no text in them
+```
+
+Neither is a Python package, so there is still nothing for pip to do. Polling
+and `graph` need neither.
 
 ## Install
 
@@ -376,9 +386,10 @@ and rotating out from under it without truncating would leave a sparse file.
 
 The CSVs are the data and should not be rotated.
 
-## Optional: PNG conversion
+## PNG conversion
 
-Charts are SVG, which any browser renders. If you want PNGs:
+Charts are SVG, which any browser renders. `daily` converts them to PNG because
+Drive previews PNG properly and mostly offers an SVG as a download.
 
 ```
 apt install librsvg2-bin           # Debian/Ubuntu
@@ -386,15 +397,160 @@ brew install librsvg               # macOS
 rsvg-convert -w 1600 charts/chart_themeparkgiant_metrics.svg -o chart.png
 ```
 
-Not required for anything the project does.
+Required by `daily`, which checks for it at startup and exits 1 with that
+install line if it is missing. Nothing else here needs it.
+
+**Fonts.** A minimal server image often has none, and `rsvg-convert` will
+cheerfully exit 0 having written a PNG with the text invisible or boxed. `apt
+install fonts-dejavu-core` covers it — the SVG asks for Roboto, then system-ui,
+Helvetica, Arial, sans-serif. Nothing can detect this automatically, so look at
+the first uploaded PNG once.
+
+You may also see `Fontconfig error: No writable cache directories` on stderr
+under the unit's `ProtectHome=read-only`. That is not a failure — the conversion
+is judged by exit status and the PNG's magic bytes, not by stderr.
+
+## Daily report to Google Drive
+
+One `oneshot` service plus a timer. Charts every channel you are polling,
+converts each to PNG, uploads to `Twitch Metrics/<channel>/<date>.png` in your
+own Drive.
+
+### 1. Authorize, once, interactively
+
+The service runs headless and will never prompt — it exits with an actionable
+message instead. So do the browser step first, as the **same user the service
+will run as**, since the token is 0600 in the shared `data/`:
+
+```
+python3 -m twitchmetrics drive --setup
+```
+
+Read what it prints about **publishing the consent screen**: left in "Testing",
+Google expires refresh tokens after 7 days and the daily upload dies mid-week.
+
+On a headless box the redirect needs the same treatment as `auth` — an SSH
+tunnel from the machine with the browser:
+
+```
+ssh -L 3000:localhost:3000 user@your-server        # on your desktop, leave open
+sudo -u twitch python3 -m twitchmetrics drive --auth --no-browser
+```
+
+or no tunnel at all:
+
+```
+sudo -u twitch python3 -m twitchmetrics drive --auth --manual
+```
+
+Both flows use port 3000, the same as `twitch-metrics auth`, so they can't run
+at the same moment. `GOOGLE_REDIRECT_URI` moves one if you need to.
+
+Confirm it took, without uploading anything:
+
+```
+python3 -m twitchmetrics drive --status
+python3 -m twitchmetrics drive --check     # non-interactive, exactly as the service runs
+```
+
+### 2. Install the units
+
+```
+sudo cp deploy/twitch-metrics-daily.service /etc/systemd/system/
+sudo cp deploy/twitch-metrics-daily.timer   /etc/systemd/system/
+sudoedit /etc/systemd/system/twitch-metrics-daily.service   # User, Group, WorkingDirectory
+sudo systemctl daemon-reload
+```
+
+**Enable the timer, not the service.** The service has no `[Install]` section on
+purpose: enabling it would run the report once at every boot as well.
+
+### 3. Test it before trusting the schedule
+
+```
+python3 -m twitchmetrics daily --list-channels   # does discovery see your pollers?
+python3 -m twitchmetrics daily --dry-run         # render and convert, no upload
+systemd-analyze calendar '17:00'                 # what that means in this timezone
+
+sudo systemctl start twitch-metrics-daily.service
+journalctl -u twitch-metrics-daily.service -n 60 --no-pager
+
+sudo systemctl enable --now twitch-metrics-daily.timer
+systemctl list-timers 'twitch-metrics*'
+```
+
+`list-timers` shows the *randomized* next run, so 17:01:43 for a `17:00` unit is
+correct — the unit adds up to two minutes of jitter.
+
+### Channels, and what red means
+
+The channel list comes from the enabled `twitch-metrics@` instances, so a poller
+you enable is automatically in the report. If the pollers aren't systemd-managed
+here, name them instead — in `.env`:
+
+```
+TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+```
+
+or as a drop-in, `sudo systemctl edit twitch-metrics-daily.service`:
+
+```ini
+[Service]
+Environment=TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+```
+
+Exit 0 means every channel was uploaded, or skipped because that channel simply
+didn't stream. Exit 1 means something is actually wrong — a poller that stopped,
+a failed upload, no channels found at all. That distinction is the point: an
+alarm that goes red every time you take a day off is an alarm you stop reading.
+
+### Missed runs
+
+The timer is deliberately **not** `Persistent=true`. A catch-up run isn't told
+which day it missed, so `--date today` after a post-midnight boot would chart the
+nearly-empty new day and upload it under the wrong name. Backfill by hand:
+
+```
+python3 -m twitchmetrics daily --date yesterday
+```
+
+### If the daily job misbehaves
+
+| Journal says | Cause | Fix |
+|---|---|---|
+| `status=217/USER` | `User=twitch` doesn't exist | create it, or use an existing account |
+| `rsvg-convert is not installed` | librsvg missing | `apt install librsvg2-bin` |
+| uploads fine, but the PNG has no text | no fonts on the box | `apt install fonts-dejavu-core` |
+| `No channels to report on` | no enabled `twitch-metrics@` instances | `systemctl enable twitch-metrics@yourchannel`, or set `TWITCH_DAILY_CHANNELS` |
+| `no samples at all on <date>` | that channel's poller isn't running | `systemctl status 'twitch-metrics@*'` |
+| `offline all day, nothing to chart` | the channel didn't stream — not an error | nothing |
+| `No Google Drive authorization` | never authorized, or as the wrong user | `sudo -u twitch python3 -m twitchmetrics drive --auth --manual` |
+| `invalid_grant` | consent screen still in "Testing" (7-day expiry) | publish it, then `drive --auth --force` |
+| the timer never fires | the *service* was enabled instead of the timer | `systemctl disable twitch-metrics-daily.service && systemctl enable --now twitch-metrics-daily.timer` |
+| `Permission denied` writing a PNG | checkout under `/home` or `/root` | `ProtectHome=no` |
+
+### Chart growth
+
+`daily` keeps both the SVG and the PNG in `charts/`, which is useful when an
+upload fails and you want to see what it was going to send — but it grows
+without bound, roughly 0.5 GB a year at four channels. They all regenerate from
+the CSVs, so pruning is safe:
+
+```
+find /opt/twitch-metrics/charts -name '*.png' -mtime +90 -delete
+```
+
+Never rotate `data/*.csv`. That is the actual data.
 
 ## Where things live
 
 | Path | Contents |
 |---|---|
-| `data/` | sample CSVs (Twitch and YouTube), poll logs, cached tokens |
-| `charts/` | generated SVGs |
+| `data/` | sample CSVs (Twitch and YouTube), poll logs, `daily.log`, cached tokens |
+| `charts/` | generated SVGs, and the PNGs `daily` uploads |
 | `.env` | credentials, mode 0600 |
+
+`data/daily.log` is already covered by the `data/*.log` logrotate glob above.
 
 Point them elsewhere with `TWITCH_DATA_DIR` and `TWITCH_CHARTS_DIR` if you'd
 rather keep data on a mounted volume:

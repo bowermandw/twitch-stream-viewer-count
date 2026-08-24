@@ -1,9 +1,9 @@
 """Render collected samples as an SVG chart."""
 
+import argparse
 import os
 import subprocess
 import sys
-from datetime import datetime, timedelta
 
 from .. import chart, config, storage
 
@@ -36,6 +36,21 @@ def add_arguments(parser):
     parser.add_argument("--height", type=int, default=470)
     parser.add_argument("--open", dest="open_it", action="store_true",
                         help="open the chart when done")
+
+
+def default_args(**overrides):
+    """The Namespace argparse would build for `graph`, for callers that aren't the CLI.
+
+    Lets the daily report drive this command instead of duplicating the render
+    branches below: argparse supplies every default, so a flag added here later
+    can never leave that caller with a missing attribute.
+    """
+    parser = argparse.ArgumentParser()
+    add_arguments(parser)
+    args = parser.parse_args([])  # safe: channel is nargs="?" and the rest optional
+    for key, value in overrides.items():
+        setattr(args, key, value)
+    return args
 
 
 def pick_source(channel, viewers_only):
@@ -89,18 +104,10 @@ def run(args):
 
     day = None
     if args.date:
-        keyword = args.date.strip().lower()
-        today = datetime.now().astimezone().date()
-        if keyword == "today":
-            day = today
-        elif keyword == "yesterday":
-            day = today - timedelta(days=1)
-        else:
-            try:
-                day = datetime.strptime(args.date.strip(), "%Y-%m-%d").date()
-            except ValueError:
-                sys.exit("Bad --date '{}'. Use YYYY-MM-DD, 'today' or 'yesterday'.".format(
-                    args.date))
+        try:
+            day = chart.parse_day(args.date)
+        except ValueError as exc:
+            sys.exit(str(exc).replace("Bad date", "Bad --date"))
         window = chart.select_day(samples, day)
         if not window:
             available = chart.days_present(samples)

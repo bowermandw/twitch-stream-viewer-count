@@ -1,0 +1,79 @@
+# systemd unit for the once-a-day chart-and-upload job.
+#
+# NOT a template — one run handles every channel, so there is nothing to put
+# after an @. The channel list comes from the enabled twitch-metrics@ instances.
+#
+#   sudo cp deploy/twitch-metrics-daily.service /etc/systemd/system/
+#   sudo cp deploy/twitch-metrics-daily.timer   /etc/systemd/system/
+#   sudoedit /etc/systemd/system/twitch-metrics-daily.service   # User, Group, WorkingDirectory
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now twitch-metrics-daily.timer
+#
+# Enable the TIMER, not the service. There is deliberately no [Install] section
+# here: `systemctl enable twitch-metrics-daily.service` would run the report
+# once at every boot, on top of the timer.
+#
+# Run it now rather than waiting for 17:00:
+#   sudo systemctl start twitch-metrics-daily.service
+#   journalctl -u twitch-metrics-daily.service -n 60 --no-pager
+#
+# BEFORE ENABLING, edit User, Group and WorkingDirectory to match your install.
+# The values here are placeholders and WILL fail if left as-is:
+#
+#   User=twitch does not exist by default -> systemd exits 217/USER before
+#   running anything, so there is no Python output to explain it.
+#
+# Three things this job needs that the poller does not:
+#
+#   rsvg-convert   apt install librsvg2-bin        — it exits 1 if missing
+#   a font         apt install fonts-dejavu-core   — a minimal server has none,
+#                  and rsvg-convert will happily write a PNG with no text in it
+#   a Drive token  authorized once, interactively; see deploy/README.md
+#
+# Run this as the SAME User= as the pollers. The Google token is 0600 in the
+# shared data/ directory, and CSV readability otherwise depends on umask.
+#
+# Exits 0 when every channel was charted and uploaded — a channel that simply
+# didn't stream is a skip, not a failure. Exits 1 if anything failed, or if no
+# channels were found. The last journal line is always the summary.
+#
+# If the pollers aren't systemd-managed on this box, name the channels instead:
+#   Environment=TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+#
+# Confirm what systemd resolved:
+#   systemctl show -p User -p WorkingDirectory -p ExecStart twitch-metrics-daily.service
+
+[Unit]
+Description=Twitch metrics daily chart and Drive upload
+Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=twitch
+Group=twitch
+WorkingDirectory=/opt/twitch-metrics
+ExecStart=/usr/bin/python3 -m twitchmetrics daily
+
+# One report per day. A wedged upload should fail and be visible, not sit here
+# until tomorrow's timer. There is no Restart= for a oneshot: the timer is the
+# retry policy, and retrying a failed upload the next day is usually right.
+TimeoutStartSec=600
+
+StandardOutput=journal
+StandardError=journal
+
+# Same hardening as the poller, with one difference worth stating: data/ has to
+# be WRITABLE, not just readable. The run appends to data/daily.log and rewrites
+# the Google access token in place. charts/ is writable because the SVG and the
+# PNG are both written there.
+#
+# ProtectSystem=strict leaves /etc READ-ONLY rather than hidden, which is what
+# channel discovery needs — it reads the twitch-metrics@ symlinks in
+# /etc/systemd/system/multi-user.target.wants/. It does not need D-Bus.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/twitch-metrics/data /opt/twitch-metrics/charts
