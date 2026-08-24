@@ -35,11 +35,14 @@ YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
 
 DEFAULT_YOUTUBE_CHANNEL = "themeparkgiant"
 
-# YouTube bills every request against a 10,000 unit/day pool and one sample
-# costs three units (see youtube.UNITS_PER_SAMPLE), so a 10-second interval —
-# fine against Twitch — would exhaust the day's quota before lunch. 60 seconds
-# is 8,640 units/day: inside the pool, and low enough to catch a short stream.
+# YouTube bills every request against a fixed daily pool rather than a rate
+# limit, so the interval here is a budget, not a preference. One sample calls
+# three endpoints at a unit each, which at 60s is 4,320 units a day — room for
+# two channels. A 10-second interval, fine against Twitch, would exhaust the
+# day before lunch, so it is refused rather than quietly overspending.
+DEFAULT_YOUTUBE_INTERVAL_SECONDS = 60
 MIN_YOUTUBE_INTERVAL_SECONDS = 60
+YOUTUBE_UNITS_PER_SAMPLE = 3
 YOUTUBE_DAILY_QUOTA = 10000
 
 
@@ -147,28 +150,50 @@ def resolve_youtube_channel(cli_value=None):
             or DEFAULT_YOUTUBE_CHANNEL).strip().lstrip("@")
 
 
-def resolve_interval(cli_value=None):
-    """Seconds between samples.
+def _interval(cli_value, name, default, minimum, note=""):
+    """Shared body of the interval resolvers.
 
-    Precedence: --interval > TWITCH_INTERVAL env/.env > DEFAULT_INTERVAL_SECONDS.
     An unparseable value is reported rather than silently falling back, since a
     typo in a service file would otherwise poll at the wrong rate unnoticed.
     """
     if cli_value is not None:
         raw, source = cli_value, "--interval"
     else:
-        raw = os.environ.get("TWITCH_INTERVAL") or load_env_file().get("TWITCH_INTERVAL")
-        source = "TWITCH_INTERVAL"
+        raw = os.environ.get(name) or load_env_file().get(name)
+        source = name
         if raw is None:
-            return DEFAULT_INTERVAL_SECONDS
+            return default
     try:
         seconds = int(str(raw).strip())
     except (TypeError, ValueError):
         sys.exit("{} must be a whole number of seconds, got {!r}.".format(source, raw))
-    if seconds < MIN_INTERVAL_SECONDS:
-        sys.exit("{} must be at least {} seconds, got {}.".format(
-            source, MIN_INTERVAL_SECONDS, seconds))
+    if seconds < minimum:
+        sys.exit("{} must be at least {} seconds, got {}.{}".format(
+            source, minimum, seconds, note))
     return seconds
+
+
+def resolve_interval(cli_value=None):
+    """Seconds between Twitch samples.
+
+    Precedence: --interval > TWITCH_INTERVAL env/.env > DEFAULT_INTERVAL_SECONDS.
+    """
+    return _interval(cli_value, "TWITCH_INTERVAL",
+                     DEFAULT_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS)
+
+
+def resolve_youtube_interval(cli_value=None):
+    """Seconds between YouTube samples.
+
+    Precedence: --interval > YOUTUBE_INTERVAL env/.env >
+    DEFAULT_YOUTUBE_INTERVAL_SECONDS. Deliberately not falling back to
+    TWITCH_INTERVAL: an interval chosen there is a rate-limit decision, and
+    reusing it here would silently make it a quota decision instead.
+    """
+    return _interval(cli_value, "YOUTUBE_INTERVAL",
+                     DEFAULT_YOUTUBE_INTERVAL_SECONDS, MIN_YOUTUBE_INTERVAL_SECONDS,
+                     note="\nEach sample costs {} API quota units, out of {:,} a "
+                          "day.".format(YOUTUBE_UNITS_PER_SAMPLE, YOUTUBE_DAILY_QUOTA))
 
 
 # --------------------------------------------------------------------------

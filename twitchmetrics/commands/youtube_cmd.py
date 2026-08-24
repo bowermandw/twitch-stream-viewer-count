@@ -25,9 +25,9 @@ def add_arguments(parser):
                         help="channel handle or UC… id (default: the configured channel)")
     parser.add_argument("--once", action="store_true", help="one sample, then exit")
     parser.add_argument("--interval", type=int, default=None, metavar="SEC",
-                        help="seconds between samples (default: TWITCH_INTERVAL, "
+                        help="seconds between samples (default: YOUTUBE_INTERVAL, "
                              "else {}; minimum {} because of the API quota)".format(
-                                 config.DEFAULT_INTERVAL_SECONDS,
+                                 config.DEFAULT_YOUTUBE_INTERVAL_SECONDS,
                                  config.MIN_YOUTUBE_INTERVAL_SECONDS))
     parser.add_argument("--recent", type=int, default=youtube.DEFAULT_RECENT, metavar="N",
                         help="how many recent uploads to check for the live broadcast "
@@ -189,13 +189,7 @@ def _resolve(channel, key):
 def run(args):
     config.ensure_dirs()
 
-    interval = config.resolve_interval(args.interval)
-    if interval < config.MIN_YOUTUBE_INTERVAL_SECONDS:
-        sys.exit("YouTube polling needs at least {} seconds between samples "
-                 "(asked for {}).\nEach sample costs {} API quota units, out of {:,} a "
-                 "day.".format(config.MIN_YOUTUBE_INTERVAL_SECONDS, interval,
-                               youtube.UNITS_PER_SAMPLE, config.YOUTUBE_DAILY_QUOTA))
-
+    interval = config.resolve_youtube_interval(args.interval)
     samples_per_day = int(round(86400.0 / interval))
     if args.search and samples_per_day > youtube.SEARCH_CALLS_PER_DAY:
         sys.exit("--search allows only {} calls a day, and a {}s interval needs {}.\n"

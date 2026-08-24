@@ -32,8 +32,9 @@ MAX_PAGE = 50        # per-page maximum on the paginated endpoints
 # and small enough to stay inside one page.
 DEFAULT_RECENT = 15
 
-# channels.list + playlistItems.list + videos.list, one unit each.
-UNITS_PER_SAMPLE = 3
+# channels.list + playlistItems.list + videos.list, one unit each. The number
+# lives in config so the interval guard there can explain itself.
+UNITS_PER_SAMPLE = config.YOUTUBE_UNITS_PER_SAMPLE
 
 # search.list has its own allowance, separate from the unit pool, and it is far
 # too small to poll with. Quoted in the messages that mention --search.

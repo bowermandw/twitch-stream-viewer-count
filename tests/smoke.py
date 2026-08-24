@@ -247,6 +247,34 @@ check("one sample costs three units", youtube.UNITS_PER_SAMPLE == 3)
 check("the minimum interval keeps a day inside the quota",
       (86400 // config.MIN_YOUTUBE_INTERVAL_SECONDS) * youtube.UNITS_PER_SAMPLE
       <= config.YOUTUBE_DAILY_QUOTA)
+check("the default interval leaves room for a second channel",
+      2 * (86400 // config.DEFAULT_YOUTUBE_INTERVAL_SECONDS) * youtube.UNITS_PER_SAMPLE
+      <= config.YOUTUBE_DAILY_QUOTA)
+
+_saved_yi = os.environ.pop("YOUTUBE_INTERVAL", None)
+_saved_ti = os.environ.pop("TWITCH_INTERVAL", None)
+check("youtube defaults to 60", config.resolve_youtube_interval(None) == 60)
+os.environ["TWITCH_INTERVAL"] = "300"
+check("TWITCH_INTERVAL does not leak into the youtube budget",
+      config.resolve_youtube_interval(None) == 60)
+check("twitch still reads its own", config.resolve_interval(None) == 300)
+os.environ["YOUTUBE_INTERVAL"] = "180"
+check("YOUTUBE_INTERVAL is honoured", config.resolve_youtube_interval(None) == 180)
+check("--interval beats the env var", config.resolve_youtube_interval(600) == 600)
+for _bad in ("thirty", "30", "-1", "1.5"):
+    os.environ["YOUTUBE_INTERVAL"] = _bad
+    try:
+        config.resolve_youtube_interval(None)
+        check("youtube rejects {!r}".format(_bad), False, "accepted it")
+    except SystemExit:
+        check("youtube rejects {!r}".format(_bad), True)
+os.environ["YOUTUBE_INTERVAL"] = ""
+check("an emptied value falls back to the default",
+      config.resolve_youtube_interval(None) == 60)
+for _name, _saved in (("YOUTUBE_INTERVAL", _saved_yi), ("TWITCH_INTERVAL", _saved_ti)):
+    os.environ.pop(_name, None)
+    if _saved is not None:
+        os.environ[_name] = _saved
 check("search.list is not the default discovery route",
       "search_live_video" not in
       open(os.path.join(root, "twitchmetrics/youtube.py")).read().split(
@@ -259,7 +287,7 @@ with tempfile.TemporaryDirectory() as _tmp:
     _env = dict(os.environ, TWITCH_DATA_DIR=_tmp, TWITCH_CHARTS_DIR=_tmp,
                 TWITCH_ENV_FILE=_empty)
     _env.pop("YOUTUBE_API_KEY", None)
-    _env.pop("TWITCH_INTERVAL", None)
+    _env.pop("YOUTUBE_INTERVAL", None)
 
     def _yt_run(argv, env=_env):
         return subprocess.run([sys.executable, "-m", "twitchmetrics", "youtube"] + argv,

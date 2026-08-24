@@ -261,9 +261,20 @@ uploads playlist instead: a broadcast scheduled ahead of time sits there as
 | recent uploads | `playlistItems.list` | 1 |
 | broadcast state and viewers | `videos.list` | 1 |
 
-Three units against a daily allowance of 10,000 — about 864 a day at the default
-300-second interval. The poller refuses an interval under 60 seconds for that
-reason, and logs its projected daily usage at startup.
+Three units against a daily allowance of 10,000. The default interval is **60
+seconds** — 4,320 units a day, which leaves room for a second channel but not a
+third. Set `YOUTUBE_INTERVAL` (or `--interval`) to stretch it further; anything
+under 60 seconds is refused rather than quietly overspending, and the poller
+logs its projected daily usage at startup:
+
+```
+start    Theme Park Giant (UCzRcwXQzROFtWD764gz5KSQ)
+start    3 units per sample, about 4,320 of 10,000 quota units a day
+```
+
+`YOUTUBE_INTERVAL` is deliberately separate from `TWITCH_INTERVAL`: an interval
+picked over there is a rate-limit decision, and reusing it here would silently
+turn it into a quota one.
 
 To see what the playlist actually knows:
 
@@ -559,7 +570,7 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-105 checks over the committed fixtures — parsing, session detection, day
+116 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring, and
 the quota refusals that stop a mistyped YouTube interval costing a day's data.
 No network, no credentials, no tokens. It won't catch Twitch or YouTube changing

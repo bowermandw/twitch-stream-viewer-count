@@ -199,10 +199,19 @@ be polled on both platforms at once with no shared files at all: this poller
 uses only `YOUTUBE_API_KEY`, and touches none of the cached Twitch tokens.
 
 The one thing to watch is quota rather than rate limiting. Each sample costs
-three of the 10,000 YouTube API units allowed per day, so the `--interval 300`
-in the unit is a budget decision: about 864 units a day per channel. The poller
-logs its projected daily usage at startup and refuses to run faster than every
-60 seconds.
+three of the 10,000 YouTube API units allowed per day, and the default 60-second
+interval spends 4,320 of them — fine for one channel, fine for two, over budget
+for three. Stretch it with `YOUTUBE_INTERVAL` in `.env`, or `--interval` in the
+unit, if you enable more than two instances:
+
+```
+sudo systemctl edit youtube-metrics@thirdchannel
+# [Service]
+# Environment=YOUTUBE_INTERVAL=180
+```
+
+The poller logs its projected daily usage at startup and refuses to run faster
+than every 60 seconds.
 
 ### If it won't start
 

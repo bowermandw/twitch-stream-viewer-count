@@ -16,9 +16,10 @@
 # credentials, so the same machine can poll a creator on both platforms.
 #
 # QUOTA. Every sample costs three of the 10,000 YouTube API units a day, so the
-# interval below is not just a preference — at 300s it uses about 864 units a
-# day, leaving plenty of room for a second channel. The poller refuses to run
-# faster than every 60 seconds.
+# interval is a budget rather than a preference. The default 60 seconds spends
+# 4,320 a day: room for a second instance, but not a third. For more than two,
+# stretch it with Environment=YOUTUBE_INTERVAL=180 in a drop-in, or add
+# --interval to ExecStart below. Under 60 seconds is refused.
 #
 # BEFORE ENABLING, edit User, Group and WorkingDirectory below to match your
 # install. The values here are placeholders and WILL fail if left as-is:
@@ -46,7 +47,7 @@ Type=simple
 User=twitch
 Group=twitch
 WorkingDirectory=/opt/twitch-metrics
-ExecStart=/usr/bin/python3 -m twitchmetrics youtube %i --interval 300
+ExecStart=/usr/bin/python3 -m twitchmetrics youtube %i
 
 # Restart on crash, backing off so a persistent failure doesn't spin.
 Restart=on-failure
