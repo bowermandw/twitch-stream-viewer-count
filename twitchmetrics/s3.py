@@ -28,6 +28,7 @@ from . import config, retry
 from .logging import log
 
 INDEX_KEY = "index.html"
+TITLES_KEY = "titles.json"
 SVG_TYPE = "image/svg+xml"
 
 # Not `immutable`: re-running the report for today legitimately replaces today's
@@ -50,6 +51,10 @@ SUFFIX_BYTES = 5
 PLATFORMS = ("combined", "twitch", "youtube")
 PLATFORM_LABELS = {"combined": "Both platforms", "twitch": "Twitch",
                    "youtube": "YouTube"}
+
+# Whose title the page shows, most authoritative first. They differ for the
+# same broadcast, so one has to win rather than both being printed.
+TITLE_PREFERENCE = ("twitch", "youtube")
 
 # These nine regions predate the dotted website endpoint and still answer on
 # s3-website-<region>; everything since uses s3-website.<region>. It is frozen
@@ -468,11 +473,47 @@ def list_days(channel):
     return {day: sorted(found[day]) for day in sorted(found, reverse=True)}
 
 
-def publish_index(channel, today):
+def load_titles(channel):
+    """{date: {platform: title}} out of the bucket, or {} if it isn't readable.
+
+    Kept in the bucket rather than passed in, so the page keeps its one useful
+    property: index.html can be rebuilt from the bucket and nothing else. A
+    `s3 --publish-index` on a machine with no CSVs still renders the titles.
+    """
+    known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    try:
+        body = s3.get_object(Bucket=known["bucket"], Key=TITLES_KEY)["Body"].read()
+        stored = json.loads(body.decode("utf-8"))
+        return stored if isinstance(stored, dict) else {}
+    except Exception:  # noqa: BLE001 - absent, unreadable or malformed are all "none yet"
+        return {}
+
+
+def save_titles(channel, titles):
+    """Write the title index back, merged rather than replaced."""
+    known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    _with_backoff("save titles for {}".format(channel), lambda: s3.put_object(
+        Bucket=known["bucket"], Key=TITLES_KEY,
+        Body=json.dumps(titles, indent=2, sort_keys=True).encode("utf-8"),
+        ContentType="application/json; charset=utf-8", CacheControl="no-cache"))
+
+
+def publish_index(channel, today, titles=None):
     """Rebuild index.html from what is actually in the bucket and upload it."""
     known = require_bucket(channel)
     days = list_days(channel)
-    page = render_index(channel, today, days)
+
+    stored = load_titles(channel)
+    if titles:
+        merged = dict(stored)
+        merged[today.isoformat()] = titles
+        if merged != stored:
+            save_titles(channel, merged)
+        stored = merged
+
+    page = render_index(channel, today, days, stored.get(today.isoformat()))
     s3 = _client("s3", known["region"])
     _with_backoff("publish index for {}".format(channel), lambda: s3.put_object(
         Bucket=known["bucket"], Key=INDEX_KEY, Body=page.encode("utf-8"),
@@ -506,6 +547,11 @@ STYLE = """
   header { border-bottom: 1px solid #303030; padding-bottom: 18px; margin-bottom: 32px; }
   h1 { margin: 0; font-size: 27px; font-weight: 600; letter-spacing: -0.01em; }
   .today { margin: 6px 0 0; color: #aaaaaa; font-size: 14px; }
+  .stream {
+    margin: 10px 0 0; color: #f1f1f1; font-size: 15px; line-height: 1.4;
+    max-width: 74ch;
+  }
+
   h2 {
     margin: 0 0 14px; font-size: 13px; font-weight: 600;
     text-transform: uppercase; letter-spacing: 0.09em; color: #aaaaaa;
@@ -548,7 +594,7 @@ BODY = """</style>
 <main>
   <header>
     <h1>{channel}</h1>
-    <p class="today">{date}</p>
+    <p class="today">{date}</p>{titles}
   </header>
 {panels}
   <section class="past">
@@ -567,7 +613,7 @@ PANEL = """  <section class="panel{css}">
   </section>"""
 
 
-def render_index(channel, today, days):
+def render_index(channel, today, days, titles=None):
     """The whole site: one HTML page, no JS, no external assets.
 
     `days` is list_days()' mapping, newest first. Today's charts are shown;
@@ -580,6 +626,14 @@ def render_index(channel, today, days):
     stamp = today.isoformat()
     pretty = today.strftime("%a %d %b %Y")
     todays = days.get(stamp) or []
+
+    # The platforms carry different titles for the same broadcast — Twitch's is
+    # the canonical one. YouTube is the fallback rather than a second line, so
+    # a channel streaming only there still gets a title.
+    headline = next((titles[key] for key in TITLE_PREFERENCE
+                     if (titles or {}).get(key)), "")
+    stream_titles = ('\n    <p class="stream">{}</p>'.format(
+        html.escape(headline.strip())) if headline else "")
 
     panels = []
     for platform in PLATFORMS:
@@ -612,6 +666,7 @@ def render_index(channel, today, days):
             + STYLE
             + BODY.format(channel=html.escape(str(channel)),
                           date=html.escape(pretty),
+                          titles=stream_titles,
                           panels="\n".join(panels),
                           past=past,
                           count=len(days)))

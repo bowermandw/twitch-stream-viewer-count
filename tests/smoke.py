@@ -786,6 +786,32 @@ check("and the first day says the list is empty",
 check("the CSS survived not being run through str.format",
       "{ color-scheme: dark; }" in _page)
 
+_tw = "LIVE: Hollywood Studios - Rides & More!"
+_yt = "LIVE: Slinky Dog Dash & MORE!"
+_titled = s3.render_index("t", date(2026, 8, 24), _days, {"twitch": _tw, "youtube": _yt})
+check("the stream title is shown", 'class="stream"' in _titled)
+check("Twitch's title wins when they differ",
+      "Hollywood" in _titled and "Slinky" not in _titled)
+check("it sits with the date, above the charts",
+      _titled.index("stream") < _titled.index("<img"))
+check("YouTube is the fallback, not a second line",
+      "Slinky" in s3.render_index("t", date(2026, 8, 24), _days, {"youtube": _yt}))
+check("only one title line ever",
+      s3.render_index("t", date(2026, 8, 24), _days,
+                      {"twitch": _tw, "youtube": _yt}).count('class="stream"') == 1)
+check("a title is escaped, not injected",
+      "&amp;" in _titled and "<b>" not in
+      s3.render_index("t", date(2026, 8, 24), _days, {"twitch": "<b>x</b>"}))
+check("no titles means no empty line", 'class="stream"' not in _page)
+check("a blank title is not a title",
+      'class="stream"' not in s3.render_index("t", date(2026, 8, 24), _days,
+                                              {"twitch": "   "}))
+check("titles live in the bucket so --publish-index still renders them",
+      "TITLES_KEY" in open(os.path.join(root, "twitchmetrics/s3.py")).read())
+check("an unreadable titles.json is not fatal",
+      "return {}" in open(os.path.join(root, "twitchmetrics/s3.py")).read()
+      .split("def load_titles")[1].split("def save_titles")[0])
+
 # --- s3 the bucket registry -----------------------------------------------
 section("s3 bucket registry")
 check("the registry sits in data/ with the other state",

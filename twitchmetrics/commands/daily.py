@@ -293,6 +293,25 @@ def render_cross_platform(channel, day, live_points):
     return out
 
 
+def day_title(channel, day, source):
+    """The title that platform's stream carried, or "" if there is none.
+
+    The last one seen, not the first: a title edited mid-broadcast is usually
+    being corrected, so what it ended as is what the day was called.
+    """
+    path = source(channel)
+    if not os.path.exists(path):
+        return ""
+    try:
+        samples = storage.read_samples(path)
+    except OSError:
+        return ""
+    titles = [s["title"] for s in samples
+              if s["live"] and s["title"]
+              and s["when"].astimezone().date() == day]
+    return titles[-1] if titles else ""
+
+
 def day_points(channel, day, source):
     """(when, viewers) for one platform's live samples on one day."""
     path = source(channel)
@@ -318,12 +337,16 @@ def report_channel(channel, day, args):
     rendered = []
     outcomes = []
     live_points = {}
+    titles = {}
     for platform, source in PLATFORMS:
         svg, outcome = _render_platform(channel, day, args, platform, source)
         outcomes.append(outcome)
         if svg:
             rendered.append((platform, svg))
             live_points[platform] = day_points(channel, day, source)
+            title = day_title(channel, day, source)
+            if title:
+                titles[platform] = title
 
     # Prepended, so it is uploaded and shown before the per-platform panels.
     cross = render_cross_platform(channel, day, live_points)
@@ -350,7 +373,7 @@ def report_channel(channel, day, args):
         for platform, svg in rendered:
             info = s3.upload_chart(channel, svg, platform, day)
             log("{}  {:<8} -> {}".format(channel, platform, info["url"]))
-        page = s3.publish_index(channel, day)
+        page = s3.publish_index(channel, day, titles)
     except SystemExit as exc:
         log("WARN     {} — {}".format(channel, str(exc).splitlines()[0]))
         return "failed"

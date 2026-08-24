@@ -815,7 +815,7 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-413 checks over the committed fixtures — parsing, session detection, day
+423 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
 channel discovery, bucket naming, the index page, the Drive query and
 multipart builders, and the quota refusals that stop a mistyped YouTube interval
