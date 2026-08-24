@@ -530,10 +530,38 @@ The bucket holds nothing but the page and the charts:
 
 ```
 index.html               rebuilt every run
+combined/2026-08-24.svg  both platforms on one axis — leads the page
 twitch/2026-08-24.svg
 youtube/2026-08-24.svg
 twitch/2026-08-23.svg    …
 ```
+
+### Both platforms on one chart
+
+When a channel streamed on more than one platform that day, the page leads with
+a chart putting every platform's concurrent viewers on **one shared axis**,
+plus a dashed line for the combined total — the number that answers "how many
+people were watching at once, anywhere", which neither per-platform panel does.
+
+Deliberately not normalised the way `graph --composite` is. There the point is
+to compare the *shapes* of metrics living on different scales; here the whole
+question is how the platforms compare in size, and scaling each to its own
+range would answer it backwards — 50 viewers on Twitch and 500 on YouTube would
+draw two curves of equal height.
+
+Two things it is careful about, because both would otherwise lie:
+
+- **Missing is not zero.** A stream that has just gone live really does have 0
+  viewers, so "no sample" is drawn as a break in the line, never as a drop to
+  the floor. A poller sampling a few seconds off the minute is carried across;
+  a real outage is left as a hole.
+- **The total waits for everyone.** The dashed line only appears where *every*
+  platform has a reading. Before the second poller was started, a total built
+  from whichever happened to be running would have undercounted while looking
+  authoritative.
+
+A channel that streamed on only one platform that day gets no combined chart —
+it would trace the single platform's line exactly.
 
 `index.html` is rebuilt from a **listing of the bucket**, not from anything kept
 locally, so a run after a fortnight's gap still produces a correct index, and a
@@ -787,7 +815,7 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-394 checks over the committed fixtures — parsing, session detection, day
+413 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
 channel discovery, bucket naming, the index page, the Drive query and
 multipart builders, and the quota refusals that stop a mistyped YouTube interval

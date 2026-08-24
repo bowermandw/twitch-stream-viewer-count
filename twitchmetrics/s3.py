@@ -45,8 +45,11 @@ MAX_BUCKET_NAME = 63   # a bucket name is a DNS label, and that is the limit
 # weekend's worth of requests.
 SUFFIX_BYTES = 5
 
-PLATFORMS = ("twitch", "youtube")
-PLATFORM_LABELS = {"twitch": "Twitch", "youtube": "YouTube"}
+# Display order on the page. "combined" is not a platform but shares the key
+# layout, so it rides the same list and lands at the top of the page.
+PLATFORMS = ("combined", "twitch", "youtube")
+PLATFORM_LABELS = {"combined": "Both platforms", "twitch": "Twitch",
+                   "youtube": "YouTube"}
 
 # These nine regions predate the dotted website endpoint and still answer on
 # s3-website-<region>; everything since uses s3-website.<region>. It is frozen
@@ -508,6 +511,12 @@ STYLE = """
     text-transform: uppercase; letter-spacing: 0.09em; color: #aaaaaa;
   }
   .panel { margin-bottom: 34px; }
+  /* The cross-platform chart leads the page: it answers "how many people were
+     watching me at once, anywhere", which is the question the per-platform
+     panels below only answer half of each. */
+  .panel.lead { margin-bottom: 42px; padding-bottom: 34px;
+                border-bottom: 1px solid #303030; }
+  .panel.lead h2 { color: #f1f1f1; font-size: 15px; letter-spacing: 0.04em; }
   .panel img {
     display: block; width: 100%; height: auto;
     border: 1px solid #303030; border-radius: 8px; background: #0f0f0f;
@@ -552,7 +561,7 @@ BODY = """</style>
 </html>
 """
 
-PANEL = """  <section class="panel">
+PANEL = """  <section class="panel{css}">
     <h2>{label}</h2>
     <img src="{key}" alt="{label} concurrent viewers on {date}">
   </section>"""
@@ -579,7 +588,8 @@ def render_index(channel, today, days):
         panels.append(PANEL.format(
             label=html.escape(PLATFORM_LABELS.get(platform, platform)),
             key=html.escape(object_key(platform, today)),
-            date=html.escape(pretty)))
+            date=html.escape(pretty),
+            css=" lead" if platform == "combined" else ""))
     if not panels:
         panels.append('  <p class="empty">No graph for {} — either nothing was '
                       'streamed, or the report has not run yet.</p>'.format(

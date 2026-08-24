@@ -17,7 +17,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.parse
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -635,6 +635,69 @@ with tempfile.TemporaryDirectory() as tmp:
                         cwd=root, capture_output=True, text=True, env=_empty)
     check("--list-channels needs no credentials and no boto3",
           "Traceback" not in _r.stderr, _r.stderr.strip()[-200:])
+
+# --- cross-platform chart -------------------------------------------------
+section("cross-platform chart")
+_t0 = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+
+
+def _pts(start_min, count, value, every=1):
+    return [(_t0 + timedelta(minutes=start_min + i * every), value) for i in range(count)]
+
+
+# Twitch from 12:00, YouTube joining at 12:10 — the real shape of a day where
+# one poller was started later than the other.
+_series = [dict(chart.PLATFORMS[0], points=_pts(0, 30, 50)),
+           dict(chart.PLATFORMS[1], points=_pts(10, 20, 500))]
+_grid, _vals, _comb = chart.align_platforms(_series)
+check("the grid spans both platforms", len(_grid) == 30, str(len(_grid)))
+check("a platform with no data yet reads unknown, not zero",
+      _vals["youtube"][0] is None)
+check("and the total waits for it", _comb[0] is None)
+check("the total appears once both are known", _comb[10] == 550)
+check("peak combined is the sum, not either alone",
+      max(v for v in _comb if v is not None) == 550)
+
+# A genuine zero must survive: a stream that just went live has no viewers yet.
+_zero = [dict(chart.PLATFORMS[0], points=[(_t0, 0), (_t0 + timedelta(minutes=1), 7),
+                                          (_t0 + timedelta(minutes=2), 9)])]
+check("a real zero is kept, not treated as missing",
+      chart.align_platforms(_zero)[1]["twitch"][0] == 0)
+
+# A poller sampling off the minute must not punch holes in its own curve.
+_ragged = [(_t0 + timedelta(minutes=i, seconds=13 * (i % 3)), 100) for i in range(20)]
+_col = chart.align_platforms([dict(chart.PLATFORMS[0], points=_ragged)])[1]["twitch"]
+check("off-the-minute sampling doesn't create gaps",
+      all(v == 100 for v in _col), str(_col[:6]))
+
+# But a real outage does break the line rather than bridging it.
+_gapped = _pts(0, 5, 40) + _pts(60, 5, 40)
+_g_grid, _g_vals, _ = chart.align_platforms([dict(chart.PLATFORMS[0], points=_gapped)])
+check("an hour-long hole is not bridged",
+      any(v is None for v in _g_vals["twitch"]))
+check("and the line is drawn as two runs",
+      len(chart._runs(_g_grid, _g_vals["twitch"])) == 2)
+
+_svg = chart.render_platforms(_series, "testchannel", date(2026, 8, 24))
+check("the chart renders", _svg.startswith("<svg") and _svg.endswith("</svg>"))
+check("it names both platforms", "Twitch" in _svg and "YouTube" in _svg)
+check("it shows the combined peak", "550" in _svg and "Peak combined" in _svg)
+check("one platform alone gets no combined line",
+      "Combined" not in chart.render_platforms(_series[:1], "t", date(2026, 8, 24)))
+check("a single sample is not a chart",
+      chart.render_platforms([dict(chart.PLATFORMS[0], points=_pts(0, 1, 5))],
+                             "t", date(2026, 8, 24)) is None)
+check("no data at all is not a chart",
+      chart.render_platforms([], "t", date(2026, 8, 24)) is None)
+check("the combined key sorts to the top of the page",
+      s3.PLATFORMS[0] == "combined")
+check("and it parses like any other chart key",
+      s3.parse_key("combined/2026-08-24.svg") == ("combined", "2026-08-24"))
+_cross_page = s3.render_index("t", date(2026, 8, 24),
+                              {"2026-08-24": ["combined", "twitch", "youtube"]})
+check("the page leads with the combined chart",
+      _cross_page.index("combined/2026-08-24.svg") < _cross_page.index("twitch/2026-08-24.svg"))
+check("and marks it as the lead panel", 'class="panel lead"' in _cross_page)
 
 # --- s3 naming ------------------------------------------------------------
 section("s3 naming")

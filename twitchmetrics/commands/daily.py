@@ -273,6 +273,40 @@ def _render_platform(channel, day, args, platform, source):
     return svg, "rendered"
 
 
+def render_cross_platform(channel, day, live_points):
+    """Chart every platform's viewers together, or None if fewer than two have data.
+
+    Written straight to charts/ rather than through graph_cmd, because `graph`
+    reads one CSV and this is the one chart that spans them.
+    """
+    series = [dict(spec, points=live_points.get(spec["key"]) or [])
+              for spec in chart.PLATFORMS if live_points.get(spec["key"])]
+    if len(series) < 2:
+        return None
+    svg = chart.render_platforms(series, channel, day)
+    if not svg:
+        return None
+    out = config.chart_path(channel, "_combined_" + day.isoformat())
+    os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    with open(out, "w", encoding="utf-8") as handle:
+        handle.write(svg)
+    return out
+
+
+def day_points(channel, day, source):
+    """(when, viewers) for one platform's live samples on one day."""
+    path = source(channel)
+    if not os.path.exists(path):
+        return []
+    try:
+        samples = storage.read_samples(path)
+    except OSError:
+        return []
+    return [(s["when"], s["viewers"]) for s in samples
+            if s["live"] and s["viewers"] is not None
+            and s["when"].astimezone().date() == day]
+
+
 def report_channel(channel, day, args):
     """Chart every platform this channel has, publish them, rebuild its page.
 
@@ -283,11 +317,21 @@ def report_channel(channel, day, args):
 
     rendered = []
     outcomes = []
+    live_points = {}
     for platform, source in PLATFORMS:
         svg, outcome = _render_platform(channel, day, args, platform, source)
         outcomes.append(outcome)
         if svg:
             rendered.append((platform, svg))
+            live_points[platform] = day_points(channel, day, source)
+
+    # Prepended, so it is uploaded and shown before the per-platform panels.
+    cross = render_cross_platform(channel, day, live_points)
+    if cross:
+        rendered.insert(0, ("combined", cross))
+        log("{}  {:<8} {} KB -> {}".format(channel, "combined",
+                                           os.path.getsize(cross) // 1024,
+                                           os.path.basename(cross)))
 
     if not rendered:
         if "failed" in outcomes:

@@ -38,6 +38,14 @@ METRIC_BY_KEY = {m["key"]: m for m in METRICS}
 
 PANEL_LINE = "#ffffff"  # bucket averages inside a panel, over any series colour
 
+# The cross-platform chart. Each platform keeps its own brand colour, softened
+# for a dark ground, because that is the one association a viewer already has.
+PLATFORMS = [
+    {"key": "twitch",  "label": "Twitch",  "color": "#a970ff"},
+    {"key": "youtube", "label": "YouTube", "color": "#ff5c5c"},
+]
+COMBINED_LINE = "#f1f1f1"
+
 # --- layout ---------------------------------------------------------------
 PAD_L, PAD_R = 34, 104
 HEADER_H = 150
@@ -701,6 +709,210 @@ def render_composite(session, channel, width, height, metrics=None, day=None):
                     anchor="end"))
     out.append(text((left + right) / 2, bottom + 24, "{} → {}".format(
         fmt_clock(start), fmt_clock(session[-1]["when"])), size=13, fill=DIM, anchor="middle"))
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+def _sample_gap(points):
+    """The median seconds between one platform's samples; its polling interval."""
+    gaps = sorted((b - a).total_seconds()
+                  for (a, _), (b, _) in zip(points, points[1:]))
+    return gaps[len(gaps) // 2] if gaps else 60.0
+
+
+def align_platforms(series):
+    """(minutes, per_platform_values, combined) on one shared time grid.
+
+    The platforms are polled independently and not always on the same second,
+    so the grid has minutes where one of them simply wasn't sampled. Those are
+    carried forward — but only as far as that platform's own polling interval
+    stretches, after which it reads zero.
+
+    Both halves matter. Without the carry, a poller sampling a few seconds off
+    the minute punches spurious holes through its own curve. Without the
+    cutoff, a Twitch stream that ended at noon stays propped up at its closing
+    number for the rest of the day, and the combined line invents an audience
+    that had gone home.
+
+    Missing reads None, never 0, because 0 is a real answer — a stream that has
+    just gone live genuinely has no viewers yet, and drawing "we don't know"
+    the same as "nobody was watching" would put a cliff in the curve.
+    """
+    # A continuous minute axis, not just the minutes that happen to have samples.
+    # Built from the union it would have no room for a hole: an hour with no
+    # data at all would simply not exist, and the line would be drawn straight
+    # across it as though the audience had drifted rather than the poller died.
+    stamps = [when.replace(second=0, microsecond=0)
+              for entry in series for when, _ in entry["points"]]
+    if not stamps:
+        return [], {entry["key"]: [] for entry in series}, []
+    first, last = min(stamps), max(stamps)
+    span = int((last - first).total_seconds() // 60)
+    grid = [first + timedelta(minutes=i) for i in range(span + 1)]
+    values = {}
+    for entry in series:
+        points = sorted(entry["points"])
+        tolerance = _sample_gap(points) * GAP_TOLERANCE
+        column = []
+        index = 0
+        for minute in grid:
+            while index + 1 < len(points) and points[index + 1][0] <= minute:
+                index += 1
+            when, viewers = points[index] if points else (None, 0)
+            fresh = when is not None and abs((minute - when).total_seconds()) <= tolerance
+            column.append(viewers if fresh else None)
+        values[entry["key"]] = column
+
+    # Only where *every* platform is known. A total built from whichever
+    # happened to be polled would undercount — before the YouTube poller was
+    # started, "combined" would have been Twitch alone, drawn as if it were the
+    # whole audience.
+    combined = []
+    for i in range(len(grid)):
+        known = [values[entry["key"]][i] for entry in series]
+        combined.append(sum(known) if all(v is not None for v in known) else None)
+    return grid, values, combined
+
+
+def _runs(grid, column):
+    """Split a column into runs of consecutive known values, so gaps stay gaps."""
+    runs, current = [], []
+    for when, value in zip(grid, column):
+        if value is None:
+            if len(current) > 1:
+                runs.append(current)
+            current = []
+        else:
+            current.append((when, value))
+    if len(current) > 1:
+        runs.append(current)
+    return runs
+
+
+def render_platforms(series, channel, day, width=1300, height=430, show_combined=True):
+    """Concurrent viewers from every platform, on one shared axis.
+
+    Deliberately not normalised the way render_composite() is. There the point
+    was to compare the *shapes* of metrics on different scales; here the whole
+    question is how the platforms compare in size, and scaling each to its own
+    range would answer it backwards — a channel with fifty Twitch viewers and
+    five hundred on YouTube would show two curves of equal height.
+
+    Gaps are real. A platform not streaming at a given minute is drawn at zero
+    rather than bridged, so a chart of two broadcasts that only half overlap
+    looks like exactly that.
+    """
+    series = [entry for entry in series if entry["points"]]
+    if not series:
+        return None
+
+    grid, values, combined = align_platforms(series)
+    if len(grid) < 2:
+        return None
+    # A total is only worth drawing when there is more than one thing in it;
+    # otherwise it would trace the single platform's line exactly.
+    show_combined = show_combined and len(series) > 1 and any(
+        v is not None for v in combined)
+    start, finish = grid[0], grid[-1]
+    duration = (finish - start).total_seconds() or 1
+
+    known_total = [v for v in combined if v is not None]
+    if not known_total:
+        return None
+    peak_total = max(known_total)
+    top_value, step = nice_axis(peak_total if show_combined else max(
+        max(v for v in column if v is not None) for column in values.values()))
+
+    left, right = PAD_L, width - PAD_R
+    top, bottom = HEADER_H, height - FOOT_H - 26
+
+    def x_of(when):
+        return left + ((when - start).total_seconds() / duration) * (right - left)
+
+    def y_of(value):
+        return bottom - (value / top_value) * (bottom - top)
+
+    out = []
+    out.append('<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" '
+               'viewBox="0 0 {} {}" font-family="Roboto, -apple-system, '
+               'BlinkMacSystemFont, &quot;Helvetica Neue&quot;, Arial, sans-serif">'.format(
+                   width, height, width, height))
+    out.append('<rect width="{}" height="{}" fill="{}"/>'.format(width, height, BG))
+    out.append(text(PAD_L, 46, "Concurrent viewers, everywhere", size=21, fill=FG,
+                    weight="700"))
+    out.append(text(PAD_L, 74, "{} · {}".format(channel, day.strftime("%a %-d %b %Y")),
+                    size=14, fill=MUTED))
+
+    # Headline tiles, right to left: the combined peak first, because "how many
+    # people were watching at once" is the number this chart exists to answer.
+    tile_x = width - PAD_R + 84
+    if show_combined:
+        out.append(text(tile_x, 52, fmt_count(peak_total), size=27, fill=FG,
+                        weight="700", anchor="end"))
+        out.append(text(tile_x, 74, "Peak combined", size=12, fill=MUTED, anchor="end"))
+        out.append(text(tile_x, 91, "at {}".format(
+            fmt_clock(grid[combined.index(peak_total)])), size=11, fill=DIM, anchor="end"))
+        tile_x -= 175
+    for entry in reversed(series):
+        column = values[entry["key"]]
+        peak = max(v for v in column if v is not None)
+        out.append(text(tile_x, 52, fmt_count(peak), size=27,
+                        fill=entry["color"], weight="700", anchor="end"))
+        out.append(text(tile_x, 74, "Peak {}".format(entry["label"]), size=12,
+                        fill=MUTED, anchor="end"))
+        out.append(text(tile_x, 91, "at {}".format(
+            fmt_clock(grid[column.index(peak)])), size=11, fill=DIM, anchor="end"))
+        tile_x -= 175
+
+    gridline = 0
+    while gridline <= top_value:
+        y = y_of(gridline)
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+                   'stroke-width="1"/>'.format(left, y, right, y, GRID))
+        out.append(text(right + 12, y + 4, fmt_count(gridline), size=12, fill=MUTED))
+        gridline += step
+
+    for elapsed, label in clock_ticks(start, duration):
+        x = left + (elapsed / duration) * (right - left)
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+                   'stroke-width="1" opacity="0.55"/>'.format(x, top, x, bottom, GRID))
+        out.append(text(x, bottom + 24, label, size=12, fill=DIM, anchor="middle"))
+
+    for entry in series:
+        for run in _runs(grid, values[entry["key"]]):
+            points = " ".join("{:.1f},{:.1f}".format(x_of(when), y_of(value))
+                              for when, value in run)
+            out.append('<polygon points="{} {:.1f},{:.1f} {:.1f},{:.1f}" fill="{}" '
+                       'opacity="0.13"/>'.format(points, x_of(run[-1][0]), bottom,
+                                                 x_of(run[0][0]), bottom, entry["color"]))
+            out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="2.2" '
+                       'stroke-linejoin="round" stroke-linecap="round"/>'.format(
+                           points, entry["color"]))
+
+    if show_combined:
+        for run in _runs(grid, combined):
+            points = " ".join("{:.1f},{:.1f}".format(x_of(when), y_of(value))
+                              for when, value in run)
+            out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="1.6" '
+                       'stroke-dasharray="5 4" opacity="0.75"/>'.format(
+                           points, COMBINED_LINE))
+
+    legend_x = left
+    entries = [(entry["label"], entry["color"]) for entry in series]
+    if show_combined:
+        entries.append(("Combined", COMBINED_LINE))
+    for label, colour in entries:
+        dash = ' stroke-dasharray="5 4"' if label == "Combined" else ""
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+                   'stroke-width="2.5" stroke-linecap="round"{}/>'.format(
+                       legend_x, height - 22, legend_x + 20, height - 22, colour, dash))
+        out.append(text(legend_x + 27, height - 18, label, size=12, fill=MUTED))
+        legend_x += 27 + len(label) * 7.2 + 30
+
+    out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+               'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
+    out.append(text(right, height - 18, "{} → {}".format(
+        fmt_clock(start), fmt_clock(finish)), size=12, fill=DIM, anchor="end"))
     out.append("</svg>")
     return "\n".join(out)
 
