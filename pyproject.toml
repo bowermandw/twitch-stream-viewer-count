@@ -16,8 +16,10 @@ keywords = ["twitch", "helix", "metrics", "viewers", "followers", "chart"]
 dependencies = []
 
 [project.optional-dependencies]
-# Only needed to convert the generated SVGs to PNG (for a README or a report).
-# The charts themselves need none of this.
+# Still empty, and it stays empty: SVG-to-PNG needs the `rsvg-convert` BINARY
+# (apt install librsvg2-bin), not a Python package, so there is nothing pip can
+# do about it. Required by `daily`, which writes PNGs because Drive previews
+# those and mostly offers an SVG as a download. Polling and `graph` need nothing.
 png = []
 
 [project.scripts]

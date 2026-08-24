@@ -8,6 +8,12 @@ graph.
 virtualenv needed — only the standard library. `urllib` for HTTP, `csv` for
 storage, hand-built SVG for the charts.
 
+That covers polling, charting and the Google Drive upload — Drive is plain REST
+and its OAuth is plain form posts, so `urllib` handles both. The one addition is
+the [daily report](#daily-report), which converts its charts to PNG and so wants
+the `rsvg-convert` binary (`apt install librsvg2-bin`) — a system package, not a
+Python dependency.
+
 ![Example chart](docs/chart_testchannel.png)
 
 Polling all three metrics gives a panel each:
@@ -25,6 +31,7 @@ reproduce without credentials.*
 - Charts a single broadcast or a whole calendar day, one metric or all three
 - Degrades cleanly when a metric needs permissions you don't have
 - Ships synthetic sample data so the charts work before you collect anything
+- Uploads a PNG per channel to your own Google Drive once a day, on a timer
 
 ---
 
@@ -301,6 +308,111 @@ combined, since they select different things.
 
 ---
 
+## Daily report
+
+One command charts every channel you are polling, converts each to PNG and
+uploads them to your own Google Drive. A systemd timer runs it at 17:00; see
+[`deploy/`](deploy/).
+
+```
+twitch-metrics daily                          # today, every polled channel
+twitch-metrics daily --dry-run                # render and convert, no upload
+twitch-metrics daily --date yesterday         # backfill a day
+twitch-metrics daily themeparkgiant           # just this one
+twitch-metrics daily --list-channels          # who's in, and what today looks like
+```
+
+```
+[…] start    daily report for 2026-08-23 — 3 channel(s) from the enabled systemd units
+[…] themeparkgiant  287 KB -> chart_themeparkgiant_2026-08-23.png
+[…] themeparkgiant  uploaded to Twitch Metrics/themeparkgiant/2026-08-23.png
+[…] skip     prgskidmark — offline all day, nothing to chart
+[…] stop     1 uploaded, 1 dark in 6.4s
+```
+
+Files land at `Twitch Metrics/<channel>/<YYYY-MM-DD>.png`, one folder per
+channel. Re-running the same day **replaces** that file rather than adding a
+second copy — Drive allows duplicate names, so the upload looks for the name
+first and patches the bytes if it is already there. The link stays stable and
+Drive keeps the earlier render as a revision.
+
+PNG rather than SVG because Drive previews PNG properly and mostly offers an SVG
+as a download, which is no use on a phone. Conversion is `rsvg-convert`, and the
+job **fails at startup** if it isn't installed rather than rendering everything
+first and then failing per file.
+
+### Which channels
+
+The list comes from the pollers you have enabled, so adding a channel to the
+report is just `systemctl enable twitch-metrics@thatchannel`. In precedence
+order:
+
+| Source | |
+|---|---|
+| positional arguments, or `--channel` (repeatable) | `daily a b` |
+| `TWITCH_DAILY_CHANNELS` in the environment or `.env` | `a,b` or `a b` |
+| enabled `twitch-metrics@*` systemd instances | the normal case |
+| `systemctl list-units` | fallback: started but not enabled |
+| nothing found | **exits 1** — a daily job going quiet is not success |
+
+Enabled rather than *running* on purpose. A channel you enabled whose poller
+died at 03:00 is exactly what the report should shout about; ask "what's
+running?" and that channel drops off the list and the job goes green, which
+disables the alarm at the moment it matters.
+
+### A day off is not a failure
+
+The poller records followers even when a channel is offline, so "didn't stream"
+and "poller wasn't running" look similar in the CSV. They are told apart,
+because otherwise every day you take off turns `systemctl status` red and within
+a fortnight nobody reads it:
+
+| The CSV for that day | Means | Result |
+|---|---|---|
+| has live samples | there's a chart to draw | rendered and uploaded |
+| has rows, none live | you didn't stream | **skipped, exit 0** |
+| has no rows at all | the poller wasn't running | **failure, exit 1** |
+| doesn't exist | never polled, or the wrong `TWITCH_DATA_DIR` | **failure, exit 1** |
+
+Exit codes are 0 and 1 only. A failure on one channel doesn't stop the others —
+every channel is attempted, and the last log line is always the summary.
+
+## Google Drive
+
+```
+twitch-metrics drive --setup     # register an OAuth client, verified before saving
+twitch-metrics drive --auth      # browser login, once
+twitch-metrics drive --status    # which account, which scopes, time left
+twitch-metrics drive --check     # resolve the real target folder, as the service will
+twitch-metrics drive --revoke    # revoke and delete the token
+```
+
+`--setup` walks through creating a Google Cloud project, enabling the Drive API
+and making a **Desktop app** OAuth client. Uploads go to *your* My Drive and are
+owned by you; there is no service account involved.
+
+The scope is `drive.file` — per-file access, so this tool can see only the files
+and folders it created itself, never the rest of your Drive. That is also why
+you should let it create the `Twitch Metrics` folder rather than making one by
+hand: a folder it didn't create is invisible to it, and it would make a second
+one alongside. Renaming or moving the folder afterwards is fine — the folder id
+is remembered, so the uploads follow it.
+
+> **The one trap worth knowing.** If you leave the OAuth consent screen in
+> "Testing", Google expires refresh tokens after **7 days** — the daily upload
+> works all week and then stops. Click **Publish app** so it reads "In
+> production". An app requesting only `drive.file` needs no security review; you
+> just get a one-time "Google hasn't verified this app" screen, where you click
+> Advanced and continue. `drive --status` warns as the week runs out, and the
+> failure itself says what to do.
+
+Authorizing from a server works the same way as `auth` — an
+[SSH tunnel](#on-a-machine-with-no-browser) or `--manual`. Both flows listen on
+port 3000, so they can't run at the same moment; `GOOGLE_REDIRECT_URI` moves one
+if you need to.
+
+---
+
 ## Other lookups
 
 Each takes the channel as its first argument, falling back to `TWITCH_CHANNEL`
@@ -457,9 +569,10 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-38 checks over the committed fixtures — parsing, session detection, day
-selection, gap handling, axis choice, path safety, rendering and CLI wiring. No
-network, no credentials, no tokens. It won't catch Twitch changing an API
+199 checks over the committed fixtures — parsing, session detection, day
+selection, gap handling, axis choice, path safety, rendering, CLI wiring,
+channel discovery, the SVG-to-PNG step, and the Drive query and multipart
+builders. No network, no credentials, no tokens. It won't catch Twitch changing an API
 contract; only regressions in this code.
 
 ---
@@ -474,6 +587,9 @@ twitchmetrics/          the package
   api.py                Helix endpoint wrappers
   storage.py            CSV read and append
   chart.py              SVG rendering
+  png.py                SVG to PNG, via rsvg-convert
+  driveoauth.py         Google access token (browser flow)
+  drive.py              Drive v3 endpoint wrappers
   testdata.py           synthetic data model
   cli.py                subcommand dispatch
   commands/             one module per subcommand
@@ -481,7 +597,7 @@ data/                   samples, logs, cached tokens   (gitignored)
 charts/                 generated SVGs                 (gitignored)
 tests/fixtures/         synthetic sample data           (committed)
 docs/                   README images
-deploy/                 systemd unit and server notes
+deploy/                 systemd units and server notes
 ```
 
 `data/` and `charts/` can be redirected with `TWITCH_DATA_DIR` and
@@ -496,6 +612,10 @@ CSVs, and tokens can be re-fetched.
   about a minute. Treat it as approximate.
 - Twitch's rate limit is 800 points/minute. Polling every 5 minutes uses a
   vanishing fraction of that, so a shorter interval is fine.
-- Charts are SVG. To convert to PNG: `brew install librsvg` or
+- Charts are SVG. To convert one by hand: `brew install librsvg` or
   `apt install librsvg2-bin`, then `rsvg-convert -w 1600 in.svg -o out.png`.
-  Not needed for anything the project itself does.
+  That binary is the one thing `daily` needs installed, because it uploads PNGs;
+  nothing else here uses it.
+- On a minimal Debian with no fonts installed, `rsvg-convert` exits 0 and writes
+  a PNG with the text missing. `apt install fonts-dejavu-core`, and eyeball the
+  first upload once — no test can catch that.

@@ -8,7 +8,7 @@ a plotting library, which is why this package needs nothing installed.
 import html
 import math
 import os
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from . import config
 
@@ -318,6 +318,25 @@ def render(session, channel, bucket_minutes, width, height, show_buckets=True):
 # multi-metric rendering
 # --------------------------------------------------------------------------
 
+
+
+def parse_day(text):
+    """A local date from 'YYYY-MM-DD', 'today' or 'yesterday'.
+
+    Shared by `graph --date` and the daily report so the two can't drift on
+    what "today" means.
+    """
+    keyword = str(text).strip().lower()
+    today = datetime.now().astimezone().date()
+    if keyword == "today":
+        return today
+    if keyword == "yesterday":
+        return today - timedelta(days=1)
+    try:
+        return datetime.strptime(str(text).strip(), "%Y-%m-%d").date()
+    except ValueError:
+        raise ValueError(
+            "Bad date '{}'. Use YYYY-MM-DD, 'today' or 'yesterday'.".format(text))
 
 
 def select_day(samples, day):

@@ -1,0 +1,43 @@
+# Fires the daily report at 17:00 local time.
+#
+#   sudo cp deploy/twitch-metrics-daily.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now twitch-metrics-daily.timer
+#
+#   systemctl list-timers 'twitch-metrics*'     # next run, last run, whether it fired
+#   systemd-analyze calendar '17:00'            # what 17:00 resolves to, in which zone
+#   systemctl status twitch-metrics-daily.timer
+#
+# OnCalendar is in the SYSTEM's local time, and so is the "today" the report
+# charts — Python reads the same /etc/localtime. Change the machine's timezone
+# and the two move together. Setting TZ= on the service would make them
+# disagree, which is a good way to upload an empty chart.
+
+[Unit]
+Description=Daily Twitch metrics chart and Drive upload at 17:00
+Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
+
+[Timer]
+Unit=twitch-metrics-daily.service
+OnCalendar=17:00
+AccuracySec=1min
+
+# Two minutes of jitter, so the upload doesn't land on the same second as every
+# other cron job on the machine. Small enough that the report still means
+# "today, up to about 17:00". Note that `systemctl list-timers` then shows the
+# randomized time, so 17:01:43 for a 17:00 unit is correct, not a bug.
+RandomizedDelaySec=120
+
+# Deliberately NOT Persistent=true.
+#
+# Persistent=true would fire a missed run at the next boot — and a boot after
+# midnight would chart *that* day, which is nearly empty, then upload it under
+# the wrong date. systemd does not tell the job which day it was supposed to
+# run for, so there is no way for `--date today` to be right on a catch-up.
+# Backfill by hand instead, which takes one command:
+#
+#   python3 -m twitchmetrics daily --date yesterday
+Persistent=false
+
+[Install]
+WantedBy=timers.target

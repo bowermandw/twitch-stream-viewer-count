@@ -8,15 +8,20 @@ no .env and no tokens. It won't catch API contract changes — only regressions
 in parsing, session detection, chart building and CLI wiring.
 """
 
+import glob
 import os
+import re
+import stat
 import subprocess
 import sys
 import tempfile
-from datetime import date
+import urllib.parse
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from twitchmetrics import chart, config, storage  # noqa: E402
+from twitchmetrics import chart, config, drive, driveoauth, png, storage  # noqa: E402
+from twitchmetrics.commands import daily  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 PLAIN = os.path.join(FIXTURES, "metrics_testchannel.csv")
@@ -38,6 +43,26 @@ def check(label, condition, detail=""):
 
 def section(name):
     print("\n{}".format(name))
+
+
+def skipped(label, why):
+    """Neither pass nor fail — the machine can't run this one."""
+    print("  skip  {}  ({})".format(label, why))
+
+
+def raises(kind, function, *args, **kwargs):
+    try:
+        function(*args, **kwargs)
+    except kind:
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+def sample(when, live):
+    return {"when": when, "live": live, "viewers": 1 if live else None,
+            "followers": 1, "chatters": 1, "title": "", "game": "", "stream_id": ""}
 
 
 # --- parsing --------------------------------------------------------------
@@ -212,6 +237,359 @@ result = subprocess.run([sys.executable, "-m", "twitchmetrics", "graph", "no_suc
                         cwd=root, capture_output=True, text=True)
 check("runtime hints use the same invocation",
       "python3 -m twitchmetrics poll" in (result.stdout + result.stderr))
+
+# --- date keywords --------------------------------------------------------
+section("date keywords")
+check("'today' is a local date",
+      chart.parse_day("today") == datetime.now().astimezone().date())
+check("'yesterday' is one day back",
+      (chart.parse_day("today") - chart.parse_day("yesterday")).days == 1)
+check("an explicit date parses", chart.parse_day("2026-08-19") == date(2026, 8, 19))
+check("case and spacing don't matter", chart.parse_day("  TODAY ") == chart.parse_day("today"))
+for _bad in ("nonsense", "2026-13-01", "", "19/08/2026"):
+    check("rejects {!r}".format(_bad), raises(ValueError, chart.parse_day, _bad))
+check("graph and daily share one parser",
+      "chart.parse_day" in open(os.path.join(root, "twitchmetrics/commands/graph_cmd.py")).read())
+
+# --- daily: channel discovery ---------------------------------------------
+section("daily discovery")
+with tempfile.TemporaryDirectory() as _wants:
+    for _name in ("twitch-metrics@alpha.service", "twitch-metrics@beta.service",
+                  "unrelated.service", "twitch-metrics@.service"):
+        open(os.path.join(_wants, _name), "w").close()
+    check("finds enabled instances", daily.units_in(_wants) == ["alpha", "beta"],
+          str(daily.units_in(_wants)))
+    check("ignores unrelated units", "unrelated" not in daily.units_in(_wants))
+    check("ignores the bare template", "" not in daily.units_in(_wants))
+    _found, _source = daily.discover_channels(wants_dirs=[_wants])
+    check("discovery finds them", _found == ["alpha", "beta"], str(_found))
+    check("discovery reports its source", "systemd" in _source, _source)
+    check("an empty wants dir discovers nothing",
+          daily.discover_channels(wants_dirs=[os.path.join(_wants, "nope")])[0] == [])
+check("explicit channels win", daily.discover_channels(["one"], wants_dirs=[])[0] == ["one"])
+check("the source phrase reads after 'from'",
+      daily.discover_channels(["one"], wants_dirs=[])[1] == "the command line")
+check("the env list splits on commas and spaces", daily.split_list("a, b  c") == ["a", "b", "c"])
+check("duplicates collapse case-insensitively",
+      daily.discover_channels(["IGN", "ign"])[0] == ["IGN"])
+check("an impossible login is rejected, not half-unescaped",
+      daily.discover_channels(["ok_name", "../../etc/passwd"])[0] == ["ok_name"])
+_saved_daily = os.environ.pop("TWITCH_DAILY_CHANNELS", None)
+os.environ["TWITCH_DAILY_CHANNELS"] = "alpha, beta"
+os.environ["TWITCH_SYSTEMD_WANTS_DIR"] = os.path.join(tempfile.gettempdir(), "no_such_wants")
+check("TWITCH_DAILY_CHANNELS is honoured",
+      daily.discover_channels()[0] == ["alpha", "beta"])
+check("and it says so", daily.discover_channels()[1] == "TWITCH_DAILY_CHANNELS")
+os.environ["TWITCH_DAILY_CHANNELS"] = ""
+check("an empty list is not a channel list", daily.discover_channels()[0] == [])
+os.environ.pop("TWITCH_DAILY_CHANNELS", None)
+os.environ.pop("TWITCH_SYSTEMD_WANTS_DIR", None)
+if _saved_daily is not None:
+    os.environ["TWITCH_DAILY_CHANNELS"] = _saved_daily
+
+# --- daily: dark vs silent ------------------------------------------------
+section("daily day status")
+_brk = storage.read_samples(BREAKS)
+check("a day with live rows is live", daily.classify_day(_brk, date(2026, 8, 19)) == "live")
+check("a day with no rows is silent", daily.classify_day(_brk, date(2020, 1, 1)) == "silent")
+_noon = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+check("a day with only offline rows is dark",
+      daily.classify_day([sample(_noon, False)], _noon.astimezone().date()) == "dark")
+check("one live row is enough to be live",
+      daily.classify_day([sample(_noon, False), sample(_noon, True)],
+                         _noon.astimezone().date()) == "live")
+check("a dark day is not counted as a failure",
+      'log("skip' in open(os.path.join(root, "twitchmetrics/commands/daily.py")).read())
+
+# --- daily: the render and convert path -----------------------------------
+section("daily render")
+if not png.converter_path():
+    skipped("daily renders a PNG", "rsvg-convert not installed")
+else:
+    with tempfile.TemporaryDirectory() as tmp:
+        import shutil as _shutil
+        _shutil.copy(BREAKS, os.path.join(tmp, "metrics_breaktest.csv"))
+        _env = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                    TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"),
+                    TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
+        for _k in ("TWITCH_DAILY_CHANNELS", "GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET"):
+            _env.pop(_k, None)
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
+                             "--date", "2026-08-19", "--dry-run"],
+                            cwd=root, capture_output=True, text=True, env=_env)
+        _out = os.path.join(tmp, "chart_breaktest_2026-08-19.png")
+        check("daily --dry-run exits 0", _r.returncode == 0,
+              (_r.stderr or _r.stdout).strip()[-200:])
+        check("daily wrote a PNG next to the SVG", os.path.exists(_out))
+        check("the PNG is really a PNG",
+              os.path.exists(_out) and open(_out, "rb").read(4) == b"\x89PNG")
+        check("the SVG is kept too",
+              os.path.exists(os.path.join(tmp, "chart_breaktest_2026-08-19.svg")))
+        check("no .part file is left behind", not glob.glob(os.path.join(tmp, "*.part")))
+        check("--dry-run needs no Google credentials",
+              "GOOGLE_CLIENT" not in (_r.stdout + _r.stderr))
+        check("--dry-run doesn't try to authorize",
+              "drive --auth" not in (_r.stdout + _r.stderr))
+        check("the summary is the last line", "stop " in _r.stdout.strip().splitlines()[-1])
+        check("it logs to data/daily.log", os.path.exists(os.path.join(tmp, "daily.log")))
+
+        _r2 = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
+                              "nosuchchannel", "--date", "2026-08-19", "--dry-run"],
+                             cwd=root, capture_output=True, text=True, env=_env)
+        check("one bad channel makes it exit 1", _r2.returncode == 1)
+        check("the good channel still ran", "chart_breaktest" in _r2.stdout)
+        check("and the failure is named", "nosuchchannel" in _r2.stdout)
+
+# --- daily: preflight fails loudly ----------------------------------------
+section("daily preflight")
+with tempfile.TemporaryDirectory() as tmp:
+    # sys.executable is absolute, so emptying PATH hides rsvg-convert only.
+    _bare = dict(os.environ, PATH=tmp, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                 TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"))
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
+                         "--dry-run"], cwd=root, capture_output=True, text=True, env=_bare)
+    check("a missing rsvg-convert exits non-zero", _r.returncode != 0)
+    check("and says which package provides it",
+          "librsvg2-bin" in (_r.stdout + _r.stderr))
+    _empty = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                  TWITCH_DAILY_CHANNELS="",
+                  TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"))
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily"],
+                        cwd=root, capture_output=True, text=True, env=_empty)
+    check("no channels is not silent success", _r.returncode != 0)
+    check("and it suggests how to name them",
+          "TWITCH_DAILY_CHANNELS" in (_r.stdout + _r.stderr))
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "--list-channels"],
+                        cwd=root, capture_output=True, text=True, env=_empty)
+    check("--list-channels needs no converter and no token",
+          "Traceback" not in _r.stderr, _r.stderr.strip()[-200:])
+
+# --- drive query building -------------------------------------------------
+section("drive queries")
+_q = drive.folder_query("Twitch Metrics", "root")
+check("folder query excludes trashed items", "trashed = false" in _q)
+check("folder query pins the folder mime type", drive.FOLDER_MIME in _q)
+check("folder query scopes to the parent", "'root' in parents" in _q)
+check("an apostrophe in a folder name is escaped",
+      drive.folder_query("Doug's Charts", "root").count("\\'") == 1)
+check("a backslash is escaped before the quote", drive._escape("a\\'b") == "a\\\\\\'b",
+      repr(drive._escape("a\\'b")))
+check("a hostile folder name can't inject a clause",
+      drive.folder_query("x' or trashed = true or name = 'y", "root").count(" and ") == 3)
+check("the query survives URL encoding intact",
+      urllib.parse.parse_qs(drive._list_url(_q).split("?", 1)[1])["q"][0] == _q)
+check("file query does not constrain the mime type",
+      drive.FOLDER_MIME not in drive.file_query("2026-08-23.png", "abc"))
+
+# --- drive multipart body -------------------------------------------------
+section("drive multipart")
+_safe = b"\x00\x01\xff\xfe"   # no bare LF, so the CRLF check below can't lie
+_body = drive._multipart_body({"name": "2026-08-23.png", "parents": ["abc"]},
+                              _safe, "image/png", "BOUND")
+check("the body is bytes", isinstance(_body, bytes))
+check("every line ends CRLF", b"\n" not in _body.replace(b"\r\n", b""))
+check("it opens with the boundary", _body.startswith(b"--BOUND\r\n"))
+check("it closes with the terminator", _body.endswith(b"--BOUND--\r\n"))
+check("it has exactly two parts", _body.count(b"--BOUND") == 3)
+check("the metadata part declares JSON",
+      b"Content-Type: application/json; charset=UTF-8\r\n\r\n" in _body)
+check("the content part declares its own type", b"Content-Type: image/png\r\n\r\n" in _body)
+check("a blank line separates headers from each body", _body.count(b"\r\n\r\n") == 2)
+check("metadata carries the name and the parent",
+      b'"name": "2026-08-23.png"' in _body and b'"parents": ["abc"]' in _body)
+_png_bytes = b"\x89PNG\r\n\x1a\n\x00IDAT\xff\xd9"   # contains CRLF and a bare LF
+check("binary content survives verbatim",
+      _png_bytes in drive._multipart_body({}, _png_bytes, "image/png", "B"))
+check("a str payload is refused, not silently mangled",
+      raises(TypeError, drive._multipart_body, {}, "not bytes", "image/png", "B"))
+check("boundaries are unique per upload", drive._new_boundary() != drive._new_boundary())
+check("the boundary is long enough to never collide", len(drive._new_boundary()) > 30)
+
+# --- drive naming ---------------------------------------------------------
+section("drive naming")
+check("chart files are named by date", drive.remote_name(date(2026, 8, 23)) == "2026-08-23.png")
+check("the extension is honoured",
+      drive.remote_name(date(2026, 8, 23), ".svg") == "2026-08-23.svg")
+check("png gets the right content type", drive.content_type_for("a/b.PNG") == "image/png")
+check("svg gets the right content type", drive.content_type_for("x.svg") == "image/svg+xml")
+check("an unknown extension falls back to octet-stream",
+      drive.content_type_for("x.weird") == "application/octet-stream")
+check("Drive folders use the same slug as the CSVs",
+      drive.channel_folder_name("IGN") == config.channel_slug("ign"))
+check("a hostile channel can't escape its Drive folder",
+      "/" not in drive.channel_folder_name("../../etc/passwd"))
+check("the target path is folder/channel/date",
+      drive.target_path("IGN", date(2026, 8, 23), "Charts") == "Charts/ign/2026-08-23.png")
+
+# --- drive retry policy ---------------------------------------------------
+section("drive retries")
+check("rate limits are retried", drive._is_retryable(403, "rateLimitExceeded"))
+check("quota exhaustion is retried", drive._is_retryable(403, "quotaExceeded"))
+check("429 is retried", drive._is_retryable(429, ""))
+check("5xx is retried", drive._is_retryable(503, ""))
+check("a permission 403 is not retried",
+      not drive._is_retryable(403, "insufficientFilePermissions"))
+check("404 is not retried", not drive._is_retryable(404, "notFound"))
+check("400 is not retried", not drive._is_retryable(400, "badRequest"))
+_waits = [drive._retry_after(i) for i in range(drive.MAX_ATTEMPTS)]
+check("backoff grows", _waits == sorted(_waits), str(_waits))
+check("backoff stays bounded", max(_waits) < 20, str(_waits))
+check("Retry-After wins when Drive sends one", drive._retry_after(0, "7") >= 7)
+check("a nonsense Retry-After is ignored", drive._retry_after(0, "soon") < 2)
+check("a non-JSON error body doesn't explode",
+      drive._error_reason_from_bytes(b"<html>502</html>") == "")
+check("the reason is read out of a real error body",
+      drive._error_reason_from_bytes(
+          b'{"error":{"code":403,"errors":[{"reason":"rateLimitExceeded"}]}}')
+      == "rateLimitExceeded")
+check("retries wrap find-then-write, not a bare request",
+      "_with_backoff" in open(os.path.join(root, "twitchmetrics/drive.py")).read())
+
+# --- drive token storage --------------------------------------------------
+section("drive token storage")
+check("the Google token lives in data/ with the others",
+      os.path.dirname(os.path.abspath(config.GOOGLE_TOKEN_PATH))
+      == os.path.abspath(config.DATA_DIR))
+check("it is a separate file from the Twitch token",
+      config.GOOGLE_TOKEN_PATH != config.USER_TOKEN_PATH)
+check("the folder cache lives in data/ too",
+      os.path.dirname(os.path.abspath(config.DRIVE_FOLDERS_PATH))
+      == os.path.abspath(config.DATA_DIR))
+check("Google token writes are atomic (temp + rename)",
+      "os.replace" in open(os.path.join(root, "twitchmetrics/driveoauth.py")).read())
+check("Google refresh is lock-protected", hasattr(driveoauth, "_refresh_lock"))
+check("offline access is requested",
+      "\"access_type\": \"offline\"" in open(
+          os.path.join(root, "twitchmetrics/driveoauth.py")).read())
+check("re-consent still returns a refresh token",
+      "\"prompt\": \"consent\"" in open(
+          os.path.join(root, "twitchmetrics/driveoauth.py")).read())
+check("a refresh response without a refresh_token keeps the old one",
+      driveoauth._store.__doc__ and "keeping the old refresh token"
+      in driveoauth._store.__doc__)
+
+_real_token_path = config.GOOGLE_TOKEN_PATH
+with tempfile.TemporaryDirectory() as tmp:
+    config.GOOGLE_TOKEN_PATH = os.path.join(tmp, ".google_token.json")
+    driveoauth.save_token({"access_token": "x", "expires_at": 0})
+    check("the token file is written 0600",
+          stat.S_IMODE(os.stat(config.GOOGLE_TOKEN_PATH).st_mode) == 0o600)
+    check("a token round-trips through the file",
+          driveoauth.load_token()["access_token"] == "x")
+    check("no temp files are left behind",
+          not [f for f in os.listdir(tmp) if ".tmp" in f])
+    with open(config.GOOGLE_TOKEN_PATH, "w") as _h:
+        _h.write("{")
+    check("a half-written token file reads as absent", driveoauth.load_token() is None)
+config.GOOGLE_TOKEN_PATH = _real_token_path
+
+# --- drive without credentials --------------------------------------------
+section("drive without credentials")
+_real_env = config.ENV_PATH
+_saved_google = {k: os.environ.pop(k, None)
+                 for k in ("GOOGLE_CLIENT_ID", "GOOGLE_CLIENT_SECRET")}
+with tempfile.TemporaryDirectory() as tmp:
+    config.ENV_PATH = os.path.join(tmp, ".env")
+    check("missing Google credentials are not fatal when optional",
+          config.load_google_credentials(required=False) == (None, None))
+    check("requiring them exits with an actionable message",
+          raises(SystemExit, config.load_google_credentials))
+    config.update_env({"TWITCH_CLIENT_ID": "x", "TWITCH_CHANNEL": "keepme"})
+    config.update_env({"GOOGLE_CLIENT_ID": "g", "GOOGLE_CLIENT_SECRET": "s"})
+    _reloaded = config.load_env_file()
+    check("update_env keeps the keys it wasn't asked about",
+          _reloaded.get("TWITCH_CHANNEL") == "keepme" and _reloaded.get("TWITCH_CLIENT_ID") == "x",
+          str(_reloaded))
+    check("update_env adds the new ones", _reloaded.get("GOOGLE_CLIENT_ID") == "g")
+    config.update_env({"GOOGLE_CLIENT_ID": "g2"})
+    check("update_env rewrites in place rather than appending a duplicate",
+          config.load_env_file().get("GOOGLE_CLIENT_ID") == "g2"
+          and open(config.ENV_PATH).read().count("GOOGLE_CLIENT_ID") == 1)
+    check("the merged .env is still 0600",
+          stat.S_IMODE(os.stat(config.ENV_PATH).st_mode) == 0o600)
+config.ENV_PATH = _real_env
+for _k, _v in _saved_google.items():
+    if _v is not None:
+        os.environ[_k] = _v
+
+with tempfile.TemporaryDirectory() as tmp:
+    _env = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
+                TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
+    for _label, _argv in [
+        ("drive --status works with no token", ["drive", "--status"]),
+        ("drive --dry-run needs no network",
+         ["drive", "testchannel", "--file", PLAIN, "--dry-run"]),
+    ]:
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
+                            cwd=root, capture_output=True, text=True, env=_env)
+        check(_label, _r.returncode == 0, (_r.stderr or _r.stdout).strip()[-200:])
+        check(_label + " — no traceback", "Traceback" not in _r.stderr)
+    for _label, _argv in [
+        ("drive rejects a bad --date", ["drive", "x", "--date", "nonsense"]),
+        ("drive reports a missing file",
+         ["drive", "x", "--file", os.path.join(tmp, "nope.png")]),
+        ("drive upload without a token fails cleanly", ["drive", "x", "--file", PLAIN]),
+    ]:
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
+                            cwd=root, capture_output=True, text=True, env=_env)
+        check(_label, _r.returncode != 0, "expected non-zero exit")
+        check(_label + " — no traceback", "Traceback" not in _r.stderr,
+              _r.stderr.strip()[-200:])
+
+# --- drive setup ordering -------------------------------------------------
+section("drive setup")
+_setup_src = open(os.path.join(root, "twitchmetrics/commands/drive_cmd.py")).read()
+# The bug this guards: _setup withheld .env until a Drive call succeeded, but
+# that call went through connect(), which reads the credentials back out of
+# .env — so setup always failed right after a successful browser login.
+# Scoped to _setup's body: _check() uses connect() on purpose, because it
+# exists to behave exactly as the unattended service will.
+_setup_body = _setup_src.split("def _setup")[1].split("\ndef ")[0]
+check("setup doesn't verify through connect(), which would re-read .env",
+      "drive.connect(" not in _setup_body)
+check("setup builds its client from the token it already holds",
+      "drive.client_for(" in _setup_body)
+check("--check still goes through connect(), as the service does",
+      "drive.connect(" in _setup_src.split("def _check")[1])
+check("client_for needs no stored credentials",
+      "load_google_credentials" not in
+      open(os.path.join(root, "twitchmetrics/drive.py")).read().split(
+          "def client_for")[1].split("def connect")[0])
+check("setup writes .env before the folder check",
+      _setup_src.index("update_env") < _setup_src.index("Verifying against Drive"))
+check("a fresh token payload is enough to build a client",
+      drive.client_for({"access_token": "t", "email": "a@b"})["token"] == "t")
+
+# --- deploy units ---------------------------------------------------------
+section("daily units")
+_svc = open(os.path.join(root, "deploy/twitch-metrics-daily.service")).read()
+_tmr = open(os.path.join(root, "deploy/twitch-metrics-daily.timer")).read()
+check("the daily service is a oneshot", "Type=oneshot" in _svc)
+check("the daily service is not a template", "%i" not in _svc)
+# The service explains in a comment why it has no [Install], so test for the
+# directive that would actually make it boot-activated rather than the word.
+check("the timer owns activation, not the service", "WantedBy=" not in _svc)
+check("it fires at 17:00", "OnCalendar=17:00" in _tmr)
+check("catch-up runs are off on purpose", "Persistent=false" in _tmr)
+check("the timer starts the daily service",
+      "Unit=twitch-metrics-daily.service" in _tmr)
+check("the timer is installed into timers.target", "WantedBy=timers.target" in _tmr)
+check("data and charts are both writable",
+      "ReadWritePaths=" in _svc and "/data" in _svc and "/charts" in _svc)
+check("the placeholders still fail loudly", "User=twitch" in _svc)
+check("it says which package provides rsvg-convert", "librsvg2-bin" in _svc)
+check("it warns about missing fonts", "fonts-dejavu" in _svc)
+
+# --- no dependencies ------------------------------------------------------
+section("no dependencies")
+_forbidden = re.compile(
+    r"^\s*(import|from)\s+"
+    r"(google|googleapiclient|google_auth\w*|requests|httplib2|oauth2client|matplotlib)\b",
+    re.M)
+for _mod in ("driveoauth.py", "drive.py", "png.py", "commands/drive_cmd.py",
+             "commands/daily.py"):
+    _src = open(os.path.join(root, "twitchmetrics", _mod)).read()
+    check("{} imports nothing third-party".format(_mod), not _forbidden.search(_src))
 
 print("\n{} passed, {} failed".format(passed, failed))
 sys.exit(1 if failed else 0)

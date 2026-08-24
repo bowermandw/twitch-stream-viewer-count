@@ -9,14 +9,16 @@ import argparse
 import sys
 
 from . import __version__, config
-from .commands import (auth_cmd, chatters, followers, graph_cmd, poll, setup_cmd,
-                       testdata_cmd, users)
+from .commands import (auth_cmd, chatters, daily, drive_cmd, followers, graph_cmd,
+                       poll, setup_cmd, testdata_cmd, users)
 
 COMMANDS = [
     ("setup", setup_cmd, "register credentials and verify them"),
     ("auth", auth_cmd, "browser login for endpoints needing a user token"),
     ("poll", poll, "record viewers, followers and chat size on an interval"),
     ("graph", graph_cmd, "render collected samples as an SVG chart"),
+    ("daily", daily, "chart every polled channel and upload the PNGs to Drive"),
+    ("drive", drive_cmd, "upload rendered charts to your own Google Drive"),
     ("users", users, "account details for one or more logins"),
     ("followers", followers, "follower count, list, and follow checks"),
     ("chatters", chatters, "how many accounts are joined to chat"),
@@ -28,6 +30,8 @@ examples:
   {prog} setup
   {prog} poll themeparkgiant
   {prog} graph themeparkgiant --date today
+  {prog} daily --dry-run
+  {prog} drive --status
   {prog} followers themeparkgiant --recent 10
   {prog} chatters themeparkgiant
 
