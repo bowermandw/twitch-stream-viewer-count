@@ -146,7 +146,7 @@ ssh server chmod 600 /opt/twitch-metrics/data/.user_token.json
 all:
 
 ```
-python3 -m twitchmetrics poll themeparkgiant --no-chatters
+python3 -m twitchmetrics poll testchannel --no-chatters
 ```
 
 ## Run it in the background
@@ -161,16 +161,16 @@ sudo cp deploy/twitch-metrics@.service /etc/systemd/system/
 sudoedit /etc/systemd/system/twitch-metrics@.service   # set User, Group, WorkingDirectory
 sudo systemctl daemon-reload
 
-sudo systemctl enable --now twitch-metrics@themeparkgiant
+sudo systemctl enable --now twitch-metrics@testchannel
 sudo systemctl enable --now twitch-metrics@prgskidmark
 ```
 
 Both run simultaneously and independently:
 
 ```
-systemctl status twitch-metrics@themeparkgiant
+systemctl status twitch-metrics@testchannel
 journalctl -u twitch-metrics@prgskidmark -f
-systemctl restart twitch-metrics@themeparkgiant
+systemctl restart twitch-metrics@testchannel
 systemctl stop 'twitch-metrics@*'          # all of them
 systemctl list-units 'twitch-metrics@*'    # what's running
 ```
@@ -200,7 +200,7 @@ sudo cp deploy/youtube-metrics@.service /etc/systemd/system/
 sudoedit /etc/systemd/system/youtube-metrics@.service   # set User, Group, WorkingDirectory
 sudo systemctl daemon-reload
 
-sudo systemctl enable --now youtube-metrics@themeparkgiant
+sudo systemctl enable --now youtube-metrics@testchannel
 ```
 
 The name after the `@` is the YouTube handle — the `@name` in the channel URL,
@@ -226,7 +226,7 @@ than every 60 seconds.
 
 ### If it won't start
 
-`journalctl -u twitch-metrics@themeparkgiant -n 50` almost always says why. The
+`journalctl -u twitch-metrics@testchannel -n 50` almost always says why. The
 common ones, all caused by the template's placeholders not matching your
 install:
 
@@ -246,7 +246,7 @@ and nothing is ever written. `systemctl status` shows `activating
 says:
 
 ```
-systemctl show -p User -p WorkingDirectory -p ExecStart twitch-metrics@themeparkgiant
+systemctl show -p User -p WorkingDirectory -p ExecStart twitch-metrics@testchannel
 ```
 
 ### Keeping the checkout in a home directory
@@ -257,8 +257,8 @@ its CSV. Set `ProtectHome=no` and point `ReadWritePaths` at the data directory.
 
 ### Drop-ins on a template unit
 
-`systemctl edit twitch-metrics@themeparkgiant` writes to
-`twitch-metrics@themeparkgiant.service.d/`, which applies to that instance only.
+`systemctl edit twitch-metrics@testchannel` writes to
+`twitch-metrics@testchannel.service.d/`, which applies to that instance only.
 Settings meant for every channel belong in the template file itself — editing
 `/etc/systemd/system/twitch-metrics@.service` is the reliable way to change
 `User`, `WorkingDirectory` and friends for all of them.
@@ -274,7 +274,7 @@ TWITCH_INTERVAL=60
 For a single instance, add an override rather than editing the shared template:
 
 ```
-sudo systemctl edit twitch-metrics@themeparkgiant
+sudo systemctl edit twitch-metrics@testchannel
 ```
 
 ```ini
@@ -282,8 +282,8 @@ sudo systemctl edit twitch-metrics@themeparkgiant
 Environment=TWITCH_INTERVAL=60
 ```
 
-Then `sudo systemctl restart twitch-metrics@themeparkgiant`. Overrides live in
-`/etc/systemd/system/twitch-metrics@themeparkgiant.service.d/` and survive
+Then `sudo systemctl restart twitch-metrics@testchannel`. Overrides live in
+`/etc/systemd/system/twitch-metrics@testchannel.service.d/` and survive
 updates to the template.
 
 ### tmux — quickest thing that survives disconnecting
@@ -292,7 +292,7 @@ No root, no unit file. Good for trying it out before committing to a service.
 
 ```
 tmux new -s twitch
-python3 -m twitchmetrics poll themeparkgiant
+python3 -m twitchmetrics poll testchannel
 # Ctrl-B then D to detach; the poller keeps running
 ```
 
@@ -306,7 +306,7 @@ Does **not** survive a reboot. `screen -S twitch` works the same way.
 ### nohup — one command, no dependencies
 
 ```
-nohup python3 -m twitchmetrics poll themeparkgiant > /dev/null 2>&1 &
+nohup python3 -m twitchmetrics poll testchannel > /dev/null 2>&1 &
 echo $! > /tmp/twitch.pid
 ```
 
@@ -325,7 +325,7 @@ That sends SIGTERM, so it shuts down cleanly. Also does not survive a reboot.
 instead:
 
 ```
-*/5 * * * * cd /opt/twitch-metrics && /usr/bin/python3 -m twitchmetrics poll themeparkgiant --once >> data/cron.log 2>&1
+*/5 * * * * cd /opt/twitch-metrics && /usr/bin/python3 -m twitchmetrics poll testchannel --once >> data/cron.log 2>&1
 ```
 
 The trade-off: a fresh process every five minutes re-reads the token cache and
@@ -348,7 +348,7 @@ reason.
   <array>
     <string>/opt/homebrew/bin/python3</string>
     <string>-m</string><string>twitchmetrics</string>
-    <string>poll</string><string>themeparkgiant</string>
+    <string>poll</string><string>testchannel</string>
   </array>
   <key>WorkingDirectory</key><string>/Users/you/Dev/twitch-stream-viewer-count</string>
   <key>RunAtLoad</key><true/>
@@ -395,7 +395,7 @@ Nothing needs this any more — the website serves SVG, which any browser render
 ```
 apt install librsvg2-bin           # Debian/Ubuntu
 brew install librsvg               # macOS
-rsvg-convert -w 1600 charts/chart_themeparkgiant_metrics.svg -o chart.png
+rsvg-convert -w 1600 charts/chart_testchannel_metrics.svg -o chart.png
 ```
 
 A minimal server image often has no fonts, and `rsvg-convert` will cheerfully
@@ -442,7 +442,7 @@ keep alive, so nothing here needs an SSH tunnel and nothing expires after 7 days
 ### 2. One bucket per channel
 
 ```
-sudo -u twitch python3 -m twitchmetrics s3 --setup themeparkgiant
+sudo -u twitch python3 -m twitchmetrics s3 --setup testchannel
 ```
 
 Prints the website URL. Re-runnable: a channel that already has a bucket is left
@@ -453,7 +453,7 @@ bucket belongs to which channel.
 Confirm it took, publishing nothing:
 
 ```
-sudo -u twitch python3 -m twitchmetrics s3 --check themeparkgiant
+sudo -u twitch python3 -m twitchmetrics s3 --check testchannel
 sudo -u twitch python3 -m twitchmetrics s3 --list
 ```
 
@@ -494,14 +494,14 @@ report, and a channel with both is listed once. If the pollers aren't systemd-ma
 here, name them instead — in `.env`:
 
 ```
-TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+TWITCH_DAILY_CHANNELS=testchannel,prgskidmark
 ```
 
 or as a drop-in, `sudo systemctl edit twitch-metrics-daily.service`:
 
 ```ini
 [Service]
-Environment=TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+Environment=TWITCH_DAILY_CHANNELS=testchannel,prgskidmark
 ```
 
 Exit 0 means every channel was published, or skipped because that channel

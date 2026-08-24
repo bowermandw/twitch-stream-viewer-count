@@ -34,6 +34,28 @@ YOUTUBE = os.path.join(FIXTURES, "youtube_testchannel.csv")
 passed = failed = 0
 
 
+class no_env_file(object):
+    """Point config.ENV_PATH at an empty file for the block.
+
+    Every resolver falls back to .env after the environment, so a test that only
+    clears an environment variable still reads whatever the developer happens to
+    have configured. Two of these passed for months purely because .env had no
+    YOUTUBE_CHANNEL in it.
+    """
+
+    def __enter__(self):
+        self._saved = config.ENV_PATH
+        self._dir = tempfile.TemporaryDirectory()
+        config.ENV_PATH = os.path.join(self._dir.name, ".env")
+        open(config.ENV_PATH, "w").close()
+        return config.ENV_PATH
+
+    def __exit__(self, *exc):
+        config.ENV_PATH = self._saved
+        self._dir.cleanup()
+        return False
+
+
 def check(label, condition, detail=""):
     global passed, failed
     if condition:
@@ -175,7 +197,8 @@ with tempfile.TemporaryDirectory() as tmp:
 # --- interval configuration -----------------------------------------------
 section("interval")
 _saved = os.environ.pop("TWITCH_INTERVAL", None)
-check("defaults to 300", config.resolve_interval(None) == 300)
+with no_env_file():
+    check("defaults to 300", config.resolve_interval(None) == 300)
 os.environ["TWITCH_INTERVAL"] = "60"
 check("TWITCH_INTERVAL is honoured", config.resolve_interval(None) == 60)
 check("--interval beats the env var", config.resolve_interval(120) == 120)
@@ -187,7 +210,8 @@ for _bad in ("sixty", "5", "-1", "1.5"):
     except SystemExit:
         check("rejects {!r}".format(_bad), True)
 os.environ["TWITCH_INTERVAL"] = ""   # emptying a line means "unset", as for TWITCH_CHANNEL
-check("empty value falls back to the default", config.resolve_interval(None) == 300)
+with no_env_file():
+    check("empty value falls back to the default", config.resolve_interval(None) == 300)
 os.environ.pop("TWITCH_INTERVAL", None)
 if _saved is not None:
     os.environ["TWITCH_INTERVAL"] = _saved
@@ -234,9 +258,9 @@ check("graph recovers the channel name from a youtube path",
 
 # channel_filter is the whole "handle or id" decision, and it is pure.
 check("a bare handle becomes forHandle",
-      youtube.channel_filter("themeparkgiant") == {"forHandle": "@themeparkgiant"})
+      youtube.channel_filter("testchannel") == {"forHandle": "@testchannel"})
 check("a pasted @handle is the same thing",
-      youtube.channel_filter("@themeparkgiant") == {"forHandle": "@themeparkgiant"})
+      youtube.channel_filter("@testchannel") == {"forHandle": "@testchannel"})
 _uc = "UC" + "a" * 22
 check("a UC… id is used as an id", youtube.channel_filter(_uc) == {"id": _uc})
 check("a handle that merely starts with UC is still a handle",
@@ -274,8 +298,12 @@ check("hostile youtube names stay inside data/",
       == os.path.abspath(config.DATA_DIR))
 
 _saved_ch = os.environ.pop("YOUTUBE_CHANNEL", None)
-check("youtube channel falls back to the default",
-      config.resolve_youtube_channel(None) == config.DEFAULT_YOUTUBE_CHANNEL)
+with no_env_file():
+    check("youtube channel falls back to the default",
+          config.resolve_youtube_channel(None) == config.DEFAULT_YOUTUBE_CHANNEL)
+    check("the built-in default names nobody real",
+          config.DEFAULT_YOUTUBE_CHANNEL == "testchannel"
+          and config.DEFAULT_CHANNEL == "testchannel")
 os.environ["YOUTUBE_CHANNEL"] = "@somebody"
 check("YOUTUBE_CHANNEL is honoured, @ stripped",
       config.resolve_youtube_channel(None) == "somebody")
@@ -295,11 +323,13 @@ check("the default interval leaves room for a second channel",
 
 _saved_yi = os.environ.pop("YOUTUBE_INTERVAL", None)
 _saved_ti = os.environ.pop("TWITCH_INTERVAL", None)
-check("youtube defaults to 60", config.resolve_youtube_interval(None) == 60)
+with no_env_file():
+    check("youtube defaults to 60", config.resolve_youtube_interval(None) == 60)
 os.environ["TWITCH_INTERVAL"] = "300"
-check("TWITCH_INTERVAL does not leak into the youtube budget",
-      config.resolve_youtube_interval(None) == 60)
-check("twitch still reads its own", config.resolve_interval(None) == 300)
+with no_env_file():
+    check("TWITCH_INTERVAL does not leak into the youtube budget",
+          config.resolve_youtube_interval(None) == 60)
+    check("twitch still reads its own", config.resolve_interval(None) == 300)
 os.environ["YOUTUBE_INTERVAL"] = "180"
 check("YOUTUBE_INTERVAL is honoured", config.resolve_youtube_interval(None) == 180)
 check("--interval beats the env var", config.resolve_youtube_interval(600) == 600)
@@ -311,8 +341,9 @@ for _bad in ("thirty", "30", "-1", "1.5"):
     except SystemExit:
         check("youtube rejects {!r}".format(_bad), True)
 os.environ["YOUTUBE_INTERVAL"] = ""
-check("an emptied value falls back to the default",
-      config.resolve_youtube_interval(None) == 60)
+with no_env_file():
+    check("an emptied value falls back to the default",
+          config.resolve_youtube_interval(None) == 60)
 for _name, _saved in (("YOUTUBE_INTERVAL", _saved_yi), ("TWITCH_INTERVAL", _saved_ti)):
     os.environ.pop(_name, None)
     if _saved is not None:
@@ -608,7 +639,7 @@ with tempfile.TemporaryDirectory() as tmp:
 # --- s3 naming ------------------------------------------------------------
 section("s3 naming")
 check("a bucket name carries the shared prefix",
-      s3.bucket_name("themeparkgiant").startswith(config.BUCKET_PREFIX))
+      s3.bucket_name("testchannel").startswith(config.BUCKET_PREFIX))
 check("no underscore survives — a bucket name is a DNS label",
       "_" not in s3.bucket_slug("some_channel_name"))
 check("a slug can't start or end with a hyphen",
@@ -664,10 +695,10 @@ section("s3 index page")
 _days = {"2026-08-24": ["twitch", "youtube"],
          "2026-08-23": ["youtube"],
          "2026-08-22": ["twitch", "youtube"]}
-_page = s3.render_index("themeparkgiant", date(2026, 8, 24), _days)
+_page = s3.render_index("testchannel", date(2026, 8, 24), _days)
 check("the page is a whole document",
       _page.startswith("<!doctype html>") and _page.rstrip().endswith("</html>"))
-check("the channel is the heading", "<h1>themeparkgiant</h1>" in _page)
+check("the channel is the heading", "<h1>testchannel</h1>" in _page)
 check("today's charts are displayed", _page.count("<img") == 2)
 check("today's twitch chart by relative key", 'src="twitch/2026-08-24.svg"' in _page)
 check("today's youtube chart too", 'src="youtube/2026-08-24.svg"' in _page)

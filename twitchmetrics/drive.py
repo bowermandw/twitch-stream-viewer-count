@@ -264,7 +264,7 @@ def _still_usable(client, folder_id):
 
 
 def folder_path(client, parts):
-    """Resolve or create nested folders, e.g. ['Twitch Metrics', 'themeparkgiant'].
+    """Resolve or create nested folders, e.g. ['Twitch Metrics', 'testchannel'].
 
     Returns the leaf id. A cached id is verified with files.get before use, so a
     folder you moved or renamed in the Drive UI is followed rather than

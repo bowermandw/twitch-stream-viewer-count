@@ -94,7 +94,7 @@ manual.
 
    | Field | Value |
    |---|---|
-   | **Name** | Anything unique across Twitch, e.g. `themeparkgiant-viewer-log` |
+   | **Name** | Anything unique across Twitch, e.g. `testchannel-viewer-log` |
    | **OAuth Redirect URLs** | `http://localhost:3000` — required, and used only by `twitch-metrics auth` |
    | **Category** | `Analytics Tool` |
    | **Client Type** | `Confidential` |
@@ -116,11 +116,11 @@ twitch-metrics setup --client-id XXXX --client-secret YYYY
 ## Polling
 
 ```
-twitch-metrics poll themeparkgiant
+twitch-metrics poll testchannel
 ```
 
 ```
-themeparkgiant  LIVE     viewers      51  followers      751  chat     4
+testchannel  LIVE     viewers      51  followers      751  chat     4
 ```
 
 One row per tick in `data/metrics_<channel>.csv`:
@@ -134,10 +134,10 @@ people follow and bots sit in chat between streams — while `viewer_count` is
 blank. Only `is_live` marks a broadcast.
 
 ```
-twitch-metrics poll themeparkgiant --once           # one sample
-twitch-metrics poll themeparkgiant --no-chatters    # skip chat size
-twitch-metrics poll themeparkgiant --viewers-only   # viewers alone
-twitch-metrics poll themeparkgiant --interval 60    # every minute
+twitch-metrics poll testchannel --once           # one sample
+twitch-metrics poll testchannel --no-chatters    # skip chat size
+twitch-metrics poll testchannel --viewers-only   # viewers alone
+twitch-metrics poll testchannel --interval 60    # every minute
 ```
 
 ### Changing the interval
@@ -168,7 +168,7 @@ the interval. That makes it safe under a service manager.
 
 ```
 tmux new -s twitch                                    # quick: Ctrl-B D to detach
-sudo systemctl enable --now twitch-metrics@themeparkgiant   # permanent
+sudo systemctl enable --now twitch-metrics@testchannel   # permanent
 ```
 
 ### Several channels at once
@@ -178,7 +178,7 @@ interfering. The systemd unit is a template — the name after the `@` is the
 channel:
 
 ```
-sudo systemctl enable --now twitch-metrics@themeparkgiant
+sudo systemctl enable --now twitch-metrics@testchannel
 sudo systemctl enable --now twitch-metrics@prgskidmark
 ```
 
@@ -221,15 +221,15 @@ whole day.
 ## YouTube
 
 ```
-twitch-metrics youtube themeparkgiant
+twitch-metrics youtube testchannel
 ```
 
 Samples a YouTube channel's **concurrent viewers, likes and subscriber count**
 into `data/youtube_<channel>.csv`, on the same interval and in the same shape as
 the Twitch poller, so `graph` charts it with no extra flags.
 
-The channel is the `@name` from its URL — `youtube.com/@themeparkgiant` means
-`themeparkgiant` — or a raw `UC…` channel id. It is resolved from
+The channel is the `@name` from its URL — `youtube.com/@testchannel` means
+`testchannel` — or a raw `UC…` channel id. It is resolved from
 `YOUTUBE_CHANNEL` rather than `TWITCH_CHANNEL`, because a creator's handle on
 the two platforms need not match.
 
@@ -289,7 +289,7 @@ turn it into a quota one.
 To see what the playlist actually knows:
 
 ```
-twitch-metrics youtube themeparkgiant --list-recent
+twitch-metrics youtube testchannel --list-recent
 ```
 
 ```
@@ -321,7 +321,7 @@ internal number that no public API exposes. At 17k that rounding is a step of
 every week or two. Worth keeping as a slow trend, not worth charting intraday:
 
 ```
-twitch-metrics graph data/youtube_themeparkgiant.csv --only viewers
+twitch-metrics graph data/youtube_testchannel.csv --only viewers
 ```
 
 (The YouTube *Analytics* API does give exact `subscribersGained` and
@@ -331,7 +331,7 @@ channel's own Google account.)
 Charting works exactly as it does for Twitch, via the file path:
 
 ```
-twitch-metrics graph data/youtube_themeparkgiant.csv --open
+twitch-metrics graph data/youtube_testchannel.csv --open
 ```
 
 Viewers, likes and subscribers each get a panel, or name one with `--only`.
@@ -343,7 +343,7 @@ a 10,000-subscriber step is invisible on a 0–1,240,000 scale.
 ## Graphing
 
 ```
-twitch-metrics graph themeparkgiant --open
+twitch-metrics graph testchannel --open
 ```
 
 Reads `data/metrics_<channel>.csv` (falling back to `viewers_<channel>.csv`) and
@@ -394,9 +394,9 @@ twitch-metrics graph testchannel --viewers-only
 ### Charting one day
 
 ```
-twitch-metrics graph themeparkgiant --date 2026-08-22
-twitch-metrics graph themeparkgiant --date today
-twitch-metrics graph themeparkgiant --list-days
+twitch-metrics graph testchannel --date 2026-08-22
+twitch-metrics graph testchannel --date today
+twitch-metrics graph testchannel --list-days
 ```
 
 This charts a **calendar day** rather than a single broadcast: from the first
@@ -447,18 +447,18 @@ publishes each one to its own website. A systemd timer runs it at 17:00; see
 twitch-metrics daily                          # today, every polled channel
 twitch-metrics daily --dry-run                # render the charts, publish nothing
 twitch-metrics daily --date yesterday         # backfill a day
-twitch-metrics daily themeparkgiant           # just this one
+twitch-metrics daily testchannel           # just this one
 twitch-metrics daily --list-channels          # who's in, and what today looks like
 ```
 
 ```
 […] start    aws account 123456789012 as twitch-metrics
 […] start    daily report for 2026-08-24 — 2 channel(s) from the enabled systemd units
-[…] themeparkgiant  twitch   28 KB -> chart_themeparkgiant_twitch_2026-08-24.svg
-[…] themeparkgiant  youtube  11 KB -> chart_themeparkgiant_youtube_2026-08-24.svg
-[…] themeparkgiant  twitch   -> http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com/twitch/2026-08-24.svg
-[…] themeparkgiant  youtube  -> http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com/youtube/2026-08-24.svg
-[…] themeparkgiant  page rebuilt from 3 day(s): http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com
+[…] testchannel  twitch   28 KB -> chart_testchannel_twitch_2026-08-24.svg
+[…] testchannel  youtube  11 KB -> chart_testchannel_youtube_2026-08-24.svg
+[…] testchannel  twitch   -> http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com/twitch/2026-08-24.svg
+[…] testchannel  youtube  -> http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com/youtube/2026-08-24.svg
+[…] testchannel  page rebuilt from 3 day(s): http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com
 […] skip     prgskidmark twitch — offline all day, nothing to chart
 […] stop     1 published, 1 dark in 4.1s
 ```
@@ -516,14 +516,14 @@ Each channel gets an S3 bucket serving one page: today's graphs displayed,
 earlier days as links.
 
 ```
-twitch-metrics s3 --setup themeparkgiant   # create and configure the bucket
-twitch-metrics s3 --check themeparkgiant   # prove the credentials, name the bucket
+twitch-metrics s3 --setup testchannel   # create and configure the bucket
+twitch-metrics s3 --check testchannel   # prove the credentials, name the bucket
 twitch-metrics s3 --list                   # every channel that has one
-twitch-metrics s3 themeparkgiant --url     # just the URL, for scripts
+twitch-metrics s3 testchannel --url     # just the URL, for scripts
 ```
 
 ```
-http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com
+http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com
 ```
 
 The bucket holds nothing but the page and the charts:
@@ -537,9 +537,13 @@ twitch/2026-08-23.svg    …
 
 `index.html` is rebuilt from a **listing of the bucket**, not from anything kept
 locally, so a run after a fortnight's gap still produces a correct index, and a
-chart you upload by hand appears in it. The name is random because bucket names
-are global — `tm-themeparkgiant` may already belong to a stranger — so it is
-recorded in `data/.s3_buckets.json` rather than recomputed.
+chart you upload by hand appears in it.
+
+The name ends in ten random characters. Partly because bucket names are global
+and `tm-testchannel` may already belong to a stranger; mostly because the
+channel name is guessable and those characters are the only thing standing
+between a stranger and the page. They can't be recomputed, so the name is
+recorded in `data/.s3_buckets.json` — back that file up.
 
 SVG, not PNG. A browser renders it natively, sharper at any zoom and about a
 tenth the size, which also means the whole pipeline needs no `rsvg-convert` and
@@ -548,6 +552,13 @@ no font package. `png.py` is still there if you want a PNG by hand.
 > **HTTP only.** S3 website endpoints do not serve TLS. Putting CloudFront in
 > front is how you get HTTPS and a real domain; both are deliberately out of
 > scope here.
+
+> **Unlisted, not private.** The bucket is public-read — that is what makes it
+> a website — so anyone with the address can open it, and it is only the address
+> that keeps it quiet. Nothing links to it and the ten random characters in the
+> name are not worth searching, but treat the URL itself as the secret: don't
+> commit it. `docs/local/` is gitignored for exactly that. If you need real
+> access control, that is CloudFront with signed URLs, and a different design.
 
 ### Setting up AWS
 
@@ -594,7 +605,7 @@ no matter what this tool does. `--setup` checks it first and says exactly that.
 Then, per channel:
 
 ```
-twitch-metrics s3 --setup themeparkgiant
+twitch-metrics s3 --setup testchannel
 ```
 
 which creates the bucket, clears its Block Public Access, applies a public-read
@@ -623,7 +634,7 @@ then the built-in default, and accepts a login, an `@handle`, or a numeric ID.
 
 ```
 twitch-metrics users prgskidmark
-twitch-metrics users ign prgskidmark themeparkgiant   # batched, up to 100
+twitch-metrics users ign prgskidmark testchannel   # batched, up to 100
 twitch-metrics users 35616747 --by-id
 ```
 
@@ -638,10 +649,10 @@ if it meant something.
 ### Followers
 
 ```
-twitch-metrics followers themeparkgiant                 # just the count
-twitch-metrics followers themeparkgiant --recent 10     # newest, with how long ago
-twitch-metrics followers themeparkgiant --list          # everyone, paged
-twitch-metrics followers themeparkgiant --check someone # do they follow, and since when
+twitch-metrics followers testchannel                 # just the count
+twitch-metrics followers testchannel --recent 10     # newest, with how long ago
+twitch-metrics followers testchannel --list          # everyone, paged
+twitch-metrics followers testchannel --check someone # do they follow, and since when
 ```
 
 The count uses the app token and works for **any** channel:
@@ -658,12 +669,12 @@ moderator and carries `moderator:read:followers`.
 ### Chatters
 
 ```
-twitch-metrics chatters themeparkgiant
-twitch-metrics chatters themeparkgiant --list
+twitch-metrics chatters testchannel
+twitch-metrics chatters testchannel --list
 ```
 
 ```
-themeparkgiant — 3 people in chat
+testchannel — 3 people in chat
   (as moderator prgskidmark)
 ```
 
@@ -770,7 +781,7 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-393 checks over the committed fixtures — parsing, session detection, day
+394 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
 channel discovery, bucket naming, the index page, the Drive query and
 multipart builders, and the quota refusals that stop a mistyped YouTube interval

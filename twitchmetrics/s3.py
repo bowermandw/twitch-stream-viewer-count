@@ -36,7 +36,14 @@ SVG_TYPE = "image/svg+xml"
 CHART_CACHE = "public, max-age=300"
 
 MAX_BUCKET_NAME = 63   # a bucket name is a DNS label, and that is the limit
-SUFFIX_BYTES = 3       # six hex characters of global-uniqueness insurance
+
+# The suffix does two jobs, and the second sets the size. Bucket names are
+# global, so it has to avoid a collision — a couple of bytes would do. But the
+# site is public-read and its only protection is that nobody knows the URL, and
+# the channel name is guessable, so this is also the whole keyspace an outsider
+# would have to search. Ten hex characters is a trillion; six would be a
+# weekend's worth of requests.
+SUFFIX_BYTES = 5
 
 PLATFORMS = ("twitch", "youtube")
 PLATFORM_LABELS = {"twitch": "Twitch", "youtube": "YouTube"}
@@ -162,7 +169,7 @@ def bucket_name(channel):
     """A fresh globally-unique bucket name for a channel.
 
     Random-suffixed because bucket names are shared across every AWS account,
-    so "tm-themeparkgiant" may well belong to a stranger. Called once, by
+    so "tm-testchannel" may well belong to a stranger. Called once, by
     --setup; after that the name is read back out of the registry.
     """
     return "{}{}-{}".format(config.BUCKET_PREFIX, bucket_slug(channel),

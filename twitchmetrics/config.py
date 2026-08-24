@@ -27,7 +27,10 @@ GOOGLE_TOKEN_PATH = os.path.join(DATA_DIR, ".google_token.json")
 # being used instead of a second one appearing beside it.
 DRIVE_FOLDERS_PATH = os.path.join(DATA_DIR, ".drive_folders.json")
 
-DEFAULT_CHANNEL = "themeparkgiant"
+# A placeholder, not anyone's channel. The real one belongs in .env, which is
+# gitignored — this file is published, and a default here would name a real
+# channel in the repo. TWITCH_CHANNEL and YOUTUBE_CHANNEL override it.
+DEFAULT_CHANNEL = "testchannel"
 DEFAULT_INTERVAL_SECONDS = 300  # 5 minutes
 MIN_INTERVAL_SECONDS = 10
 HTTP_TIMEOUT = 20       # stops a hung socket stalling a poll loop
@@ -39,7 +42,7 @@ HELIX = "https://api.twitch.tv/helix"
 # --- YouTube --------------------------------------------------------------
 YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
 
-DEFAULT_YOUTUBE_CHANNEL = "themeparkgiant"
+DEFAULT_YOUTUBE_CHANNEL = "testchannel"   # as above: set YOUTUBE_CHANNEL in .env
 
 # YouTube bills every request against a fixed daily pool rather than a rate
 # limit, so the interval here is a budget, not a preference. One sample calls
@@ -289,7 +292,7 @@ def resolve_youtube_channel(cli_value=None):
     """Precedence: command line > YOUTUBE_CHANNEL env/.env > DEFAULT_YOUTUBE_CHANNEL.
 
     The @ of a handle is stripped, so a value copied straight out of a channel
-    URL (@themeparkgiant) resolves the same as the bare name.
+    URL (@testchannel) resolves the same as the bare name.
     """
     return (cli_value
             or os.environ.get("YOUTUBE_CHANNEL")

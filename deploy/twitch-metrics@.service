@@ -5,10 +5,10 @@
 #
 #   sudo cp deploy/twitch-metrics@.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable --now twitch-metrics@themeparkgiant
+#   sudo systemctl enable --now twitch-metrics@testchannel
 #   sudo systemctl enable --now twitch-metrics@prgskidmark
 #
-#   systemctl status twitch-metrics@themeparkgiant
+#   systemctl status twitch-metrics@testchannel
 #   journalctl -u twitch-metrics@prgskidmark -f
 #   systemctl stop 'twitch-metrics@*'
 #

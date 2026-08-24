@@ -42,7 +42,7 @@
 # channels were found. The last journal line is always the summary.
 #
 # If the pollers aren't systemd-managed on this box, name the channels instead:
-#   Environment=TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
+#   Environment=TWITCH_DAILY_CHANNELS=testchannel,prgskidmark
 #
 # Confirm what systemd resolved:
 #   systemctl show -p User -p WorkingDirectory -p ExecStart twitch-metrics-daily.service

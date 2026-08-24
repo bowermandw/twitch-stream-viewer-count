@@ -29,13 +29,13 @@ COMMANDS = [
 EPILOG = """
 examples:
   {prog} setup
-  {prog} poll themeparkgiant
-  {prog} youtube themeparkgiant --once
-  {prog} graph themeparkgiant --date today
+  {prog} poll testchannel
+  {prog} youtube testchannel --once
+  {prog} graph testchannel --date today
   {prog} daily --dry-run
-  {prog} s3 --setup themeparkgiant
-  {prog} followers themeparkgiant --recent 10
-  {prog} chatters themeparkgiant
+  {prog} s3 --setup testchannel
+  {prog} followers testchannel --recent 10
+  {prog} chatters testchannel
 
 Every command takes the channel as its first argument, falling back to
 TWITCH_CHANNEL in .env and then the built-in default — except `youtube`, which

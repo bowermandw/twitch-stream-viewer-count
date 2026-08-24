@@ -225,8 +225,8 @@ def render_svg(channel, day, args, platform, path):
 
     The CSV path is handed to graph as its `channel`, which pick_source()
     already accepts for anything ending in .csv — and already recovers the
-    channel name from, so the chart is titled 'themeparkgiant' and not
-    'youtube_themeparkgiant'.
+    channel name from, so the chart is titled 'testchannel' and not
+    'youtube_testchannel'.
     """
     out = config.chart_path(channel, "_{}_{}".format(platform, day.isoformat()))
     graph_cmd.run(graph_cmd.default_args(
