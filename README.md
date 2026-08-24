@@ -35,7 +35,7 @@ reproduce without credentials.*
 - Degrades cleanly when a metric needs permissions you don't have
 - Ships synthetic sample data so the charts work before you collect anything
 - Also polls **YouTube** live viewers, likes and subscriber count, into the same CSV-and-chart pipeline
-- Uploads a PNG per channel to your own Google Drive once a day, on a timer
+- Publishes each channel's daily graphs to its own S3 static website, on a timer
 
 ---
 
@@ -439,48 +439,46 @@ combined, since they select different things.
 
 ## Daily report
 
-One command charts every channel you are polling, converts each to PNG and
-uploads them to your own Google Drive. A systemd timer runs it at 17:00; see
+One command charts every channel you are polling — on both platforms — and
+publishes each one to its own website. A systemd timer runs it at 17:00; see
 [`deploy/`](deploy/).
 
 ```
 twitch-metrics daily                          # today, every polled channel
-twitch-metrics daily --dry-run                # render and convert, no upload
+twitch-metrics daily --dry-run                # render the charts, publish nothing
 twitch-metrics daily --date yesterday         # backfill a day
 twitch-metrics daily themeparkgiant           # just this one
 twitch-metrics daily --list-channels          # who's in, and what today looks like
 ```
 
 ```
-[…] start    daily report for 2026-08-23 — 3 channel(s) from the enabled systemd units
-[…] themeparkgiant  287 KB -> chart_themeparkgiant_2026-08-23.png
-[…] themeparkgiant  uploaded to Twitch Metrics/themeparkgiant/2026-08-23.png
-[…] skip     prgskidmark — offline all day, nothing to chart
-[…] stop     1 uploaded, 1 dark in 6.4s
+[…] start    aws account 123456789012 as twitch-metrics
+[…] start    daily report for 2026-08-24 — 2 channel(s) from the enabled systemd units
+[…] themeparkgiant  twitch   28 KB -> chart_themeparkgiant_twitch_2026-08-24.svg
+[…] themeparkgiant  youtube  11 KB -> chart_themeparkgiant_youtube_2026-08-24.svg
+[…] themeparkgiant  twitch   -> http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com/twitch/2026-08-24.svg
+[…] themeparkgiant  youtube  -> http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com/youtube/2026-08-24.svg
+[…] themeparkgiant  page rebuilt from 3 day(s): http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com
+[…] skip     prgskidmark twitch — offline all day, nothing to chart
+[…] stop     1 published, 1 dark in 4.1s
 ```
 
-Files land at `Twitch Metrics/<channel>/<YYYY-MM-DD>.png`, one folder per
-channel. Re-running the same day **replaces** that file rather than adding a
-second copy — Drive allows duplicate names, so the upload looks for the name
-first and patches the bytes if it is already there. The link stays stable and
-Drive keeps the earlier render as a revision.
-
-PNG rather than SVG because Drive previews PNG properly and mostly offers an SVG
-as a download, which is no use on a phone. Conversion is `rsvg-convert`, and the
-job **fails at startup** if it isn't installed rather than rendering everything
-first and then failing per file.
+A channel polled on both platforms gets a graph each; one polled on only Twitch
+gets one graph, and that is **not** a failure — a platform you don't stream on
+is not a broken poller.
 
 ### Which channels
 
-The list comes from the pollers you have enabled, so adding a channel to the
-report is just `systemctl enable twitch-metrics@thatchannel`. In precedence
-order:
+The list comes from the pollers you have enabled, either platform, so adding a
+channel to the report is just `systemctl enable twitch-metrics@thatchannel` or
+`youtube-metrics@thatchannel`. A channel with both is one channel, not two. In
+precedence order:
 
 | Source | |
 |---|---|
 | positional arguments, or `--channel` (repeatable) | `daily a b` |
 | `TWITCH_DAILY_CHANNELS` in the environment or `.env` | `a,b` or `a b` |
-| enabled `twitch-metrics@*` systemd instances | the normal case |
+| enabled `twitch-metrics@*` and `youtube-metrics@*` instances | the normal case |
 | `systemctl list-units` | fallback: started but not enabled |
 | nothing found | **exits 1** — a daily job going quiet is not success |
 
@@ -496,49 +494,115 @@ and "poller wasn't running" look similar in the CSV. They are told apart,
 because otherwise every day you take off turns `systemctl status` red and within
 a fortnight nobody reads it:
 
-| The CSV for that day | Means | Result |
+| That platform's CSV for that day | Means | Result |
 |---|---|---|
-| has live samples | there's a chart to draw | rendered and uploaded |
+| has live samples | there's a chart to draw | rendered and published |
 | has rows, none live | you didn't stream | **skipped, exit 0** |
-| has no rows at all | the poller wasn't running | **failure, exit 1** |
-| doesn't exist | never polled, or the wrong `TWITCH_DATA_DIR` | **failure, exit 1** |
+| has no rows at all, and the day is **today** | the poller isn't running | **failure, exit 1** |
+| has no rows at all, on an **older** date | collection started later | **skipped, exit 0** |
+| doesn't exist | you don't stream on that platform | **skipped, exit 0** |
 
-Exit codes are 0 and 1 only. A failure on one channel doesn't stop the others —
-every channel is attempted, and the last log line is always the summary.
+The last two are why backfilling a week is quiet: a CSV that simply doesn't
+reach back that far isn't a fault, and neither is a platform you have never
+polled. Only silence *today* means something is broken.
 
-## Google Drive
+Exit codes are 0 and 1 only. A failure on one channel doesn't stop the others,
+and a platform that failed is still reported even when its sibling published
+fine — every channel is attempted, and the last log line is always the summary.
+
+## The website
+
+Each channel gets an S3 bucket serving one page: today's graphs displayed,
+earlier days as links.
 
 ```
-twitch-metrics drive --setup     # register an OAuth client, verified before saving
-twitch-metrics drive --auth      # browser login, once
-twitch-metrics drive --status    # which account, which scopes, time left
-twitch-metrics drive --check     # resolve the real target folder, as the service will
-twitch-metrics drive --revoke    # revoke and delete the token
+twitch-metrics s3 --setup themeparkgiant   # create and configure the bucket
+twitch-metrics s3 --check themeparkgiant   # prove the credentials, name the bucket
+twitch-metrics s3 --list                   # every channel that has one
+twitch-metrics s3 themeparkgiant --url     # just the URL, for scripts
 ```
 
-`--setup` walks through creating a Google Cloud project, enabling the Drive API
-and making a **Desktop app** OAuth client. Uploads go to *your* My Drive and are
-owned by you; there is no service account involved.
+```
+http://tm-themeparkgiant-a3f9c1.s3-website-us-east-1.amazonaws.com
+```
 
-The scope is `drive.file` — per-file access, so this tool can see only the files
-and folders it created itself, never the rest of your Drive. That is also why
-you should let it create the `Twitch Metrics` folder rather than making one by
-hand: a folder it didn't create is invisible to it, and it would make a second
-one alongside. Renaming or moving the folder afterwards is fine — the folder id
-is remembered, so the uploads follow it.
+The bucket holds nothing but the page and the charts:
 
-> **The one trap worth knowing.** If you leave the OAuth consent screen in
-> "Testing", Google expires refresh tokens after **7 days** — the daily upload
-> works all week and then stops. Click **Publish app** so it reads "In
-> production". An app requesting only `drive.file` needs no security review; you
-> just get a one-time "Google hasn't verified this app" screen, where you click
-> Advanced and continue. `drive --status` warns as the week runs out, and the
-> failure itself says what to do.
+```
+index.html               rebuilt every run
+twitch/2026-08-24.svg
+youtube/2026-08-24.svg
+twitch/2026-08-23.svg    …
+```
 
-Authorizing from a server works the same way as `auth` — an
-[SSH tunnel](#on-a-machine-with-no-browser) or `--manual`. Both flows listen on
-port 3000, so they can't run at the same moment; `GOOGLE_REDIRECT_URI` moves one
-if you need to.
+`index.html` is rebuilt from a **listing of the bucket**, not from anything kept
+locally, so a run after a fortnight's gap still produces a correct index, and a
+chart you upload by hand appears in it. The name is random because bucket names
+are global — `tm-themeparkgiant` may already belong to a stranger — so it is
+recorded in `data/.s3_buckets.json` rather than recomputed.
+
+SVG, not PNG. A browser renders it natively, sharper at any zoom and about a
+tenth the size, which also means the whole pipeline needs no `rsvg-convert` and
+no font package. `png.py` is still there if you want a PNG by hand.
+
+> **HTTP only.** S3 website endpoints do not serve TLS. Putting CloudFront in
+> front is how you get HTTPS and a real domain; both are deliberately out of
+> scope here.
+
+### Setting up AWS
+
+`pip install boto3` — or `pip install -e '.[aws]'`. It is imported lazily, so
+the pollers and `graph` never need it and the CLI works in full without it.
+
+Two things to do once, by hand:
+
+**1. An IAM user** with programmatic access, and this policy. Scoping it to
+`tm-*` means a bug here cannot touch anything else in the account:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    { "Effect": "Allow",
+      "Action": ["s3:CreateBucket", "s3:PutBucketPolicy", "s3:PutBucketWebsite",
+                 "s3:PutBucketPublicAccessBlock", "s3:GetBucketLocation"],
+      "Resource": "arn:aws:s3:::tm-*" },
+    { "Effect": "Allow", "Action": ["s3:PutObject"], "Resource": "arn:aws:s3:::tm-*/*" },
+    { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::tm-*" }
+  ]
+}
+```
+
+Put the key in `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or leave
+them unset and let boto3 find `~/.aws/credentials` or an instance role. A machine
+that only runs `daily` needs just the last two statements.
+
+**2. Turn off account-level Block Public Access** — *S3 → Block Public Access
+(account settings) → Edit → clear all four*. This is a different setting from the
+per-bucket one `--setup` handles, and AWS applies whichever is **more
+restrictive**, so leaving it on makes the bucket policy fail with `AccessDenied`
+no matter what this tool does. `--setup` checks it first and says exactly that.
+
+Then, per channel:
+
+```
+twitch-metrics s3 --setup themeparkgiant
+```
+
+which creates the bucket, clears its Block Public Access, applies a public-read
+policy for `s3:GetObject`, turns on website hosting and prints the URL. It is
+idempotent — a channel that already has a bucket is left alone, so re-running
+after a half-finished setup doesn't strand a second one.
+
+A bucket policy rather than an ACL, because new buckets have Object Ownership
+set to *bucket owner enforced*, which disables ACLs outright.
+
+### Google Drive is retired
+
+The daily report used to upload PNGs to Google Drive. `drive.py`, `driveoauth.py`
+and `commands/drive_cmd.py` are still in the tree and still covered by the tests,
+but the `drive` subcommand is no longer registered — restoring it is one line
+back in `cli.COMMANDS`.
 
 ---
 
@@ -698,11 +762,12 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-267 checks over the committed fixtures — parsing, session detection, day
+388 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
-channel discovery, the SVG-to-PNG step, the Drive query and multipart builders,
-and the quota refusals that stop a mistyped YouTube interval costing a day's
-data. It also covers adding a column to a CSV already on disk, which is
+channel discovery, bucket naming, the index page, the Drive query and
+multipart builders, and the quota refusals that stop a mistyped YouTube interval
+costing a day's data. It proves boto3 stays optional by running the CLI against
+a `boto3.py` that refuses to import. It also covers adding a column to a CSV already on disk, which is
 silently lossy if done wrong. No network, no credentials, no tokens. It won't
 catch Twitch or YouTube changing an API contract; only regressions in this
 code.
@@ -719,6 +784,9 @@ twitchmetrics/          the package
   api.py                Helix endpoint wrappers
   youtube.py            YouTube Data API wrappers
   runloop.py            the sampling loop both pollers share
+  s3.py                 the website: buckets, uploads, the index page
+  retry.py              backoff shared by every destination
+  drive.py              Google Drive (retired, kept for reference)
   storage.py            CSV read and append
   chart.py              SVG rendering
   png.py                SVG to PNG, via rsvg-convert

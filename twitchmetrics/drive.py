@@ -1,5 +1,10 @@
 """Google Drive v3 over urllib.
 
+RETIRED. The daily report publishes to an S3 static website now — see s3.py —
+and the `drive` subcommand is no longer registered in cli.py. This module and
+driveoauth.py are kept because they still work and are still covered by the
+smoke tests; restoring the command is one line back in cli.COMMANDS.
+
 Enough of the REST API to put one PNG a day in a per-channel folder: resolve or
 create the folder, then create the file or replace the bytes of the one already
 there. Failures log a WARN and let the other channels through, the way the
@@ -10,12 +15,11 @@ import json
 import os
 import secrets
 import stat
-import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
-from . import config, driveoauth
+from . import config, driveoauth, retry
 from .logging import log
 
 FILES_URL = config.DRIVE_API + "/files"
@@ -26,7 +30,7 @@ MIME_BY_EXT = {".png": "image/png", ".svg": "image/svg+xml",
                ".csv": "text/csv", ".json": "application/json"}
 DEFAULT_MIME = "application/octet-stream"
 
-MAX_ATTEMPTS = 4
+MAX_ATTEMPTS = retry.MAX_ATTEMPTS
 # 403 means two completely different things. These reasons are "slow down";
 # anything else (insufficientFilePermissions, forbidden) is "you may not", and
 # retrying that eight times just wastes a minute.
@@ -129,42 +133,30 @@ def _error_reason_from_bytes(raw):
     return errors.get("status", "") or ""
 
 
-def _retry_after(attempt, header=None):
-    """Backoff seconds: Retry-After if Drive sent one, else 1, 2, 4, 8 with jitter."""
-    if header:
-        try:
-            return max(1.0, float(str(header).strip()))
-        except (TypeError, ValueError):
-            pass
-    # Jitter kept under half a second so the sequence stays monotonic.
-    return 2.0 ** attempt + secrets.randbelow(500) / 1000.0
+# The delay function is shared; only the "is this worth retrying" question is
+# per-service, so that is all _classify answers.
+_retry_after = retry.retry_after
+
+
+def _classify(exc):
+    """(retryable, retry_after) for a Drive error, or None for one that isn't ours."""
+    if isinstance(exc, DriveHTTPError):
+        return _is_retryable(exc.status, exc.reason), exc.retry_after
+    return None
 
 
 def _with_backoff(what, call):
-    """Retry an idempotent operation through rate limits and 5xx, then give up.
+    """Retry an idempotent Drive operation, wrapping find-then-write as a unit.
 
-    Wraps the find-then-write helpers, never a bare mutating request: a create
-    that timed out may well have succeeded server-side, and replaying its body
-    would leave a duplicate folder or a second 2026-08-23.png. Because each
-    attempt re-runs its existence check first, a partly-completed earlier
-    attempt is discovered and turned into a PATCH or a reuse.
+    Never a bare mutating request: a create that timed out may well have
+    succeeded server-side, and replaying its body would leave a duplicate folder
+    or a second 2026-08-23.png. Because each attempt re-runs its existence check
+    first, a partly-completed earlier attempt becomes a PATCH or a reuse.
     """
-    for attempt in range(MAX_ATTEMPTS):
-        try:
-            return call()
-        except DriveHTTPError as exc:
-            last = exc
-            if not _is_retryable(exc.status, exc.reason) or attempt == MAX_ATTEMPTS - 1:
-                raise
-            delay = _retry_after(attempt, exc.retry_after)
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            last = exc
-            if attempt == MAX_ATTEMPTS - 1:
-                raise
-            delay = _retry_after(attempt)
-        log("WARN     {} failed ({}), retrying in {:.0f}s".format(what, last, delay))
-        time.sleep(delay)
-    raise DriveError("{} gave up after {} attempts".format(what, MAX_ATTEMPTS))
+    try:
+        return retry.with_backoff(what, call, _classify)
+    except retry.GaveUp as exc:
+        raise DriveError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------

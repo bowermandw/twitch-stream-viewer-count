@@ -15,15 +15,16 @@ python3 --version      # 3.9+
 That's the whole Python dependency list. `requirements.txt` is intentionally
 empty and says so.
 
-**Two system packages, only if you want the [daily Drive report](#daily-report-to-google-drive):**
+**One pip package, only if you want the [daily report](#daily-report):**
 
 ```
-apt install librsvg2-bin      # rsvg-convert — the daily job exits 1 without it
-apt install fonts-dejavu-core # or the PNGs come out with no text in them
+pip install boto3             # publishing to S3; nothing else needs it
 ```
 
-Neither is a Python package, so there is still nothing for pip to do. Polling
-and `graph` need neither.
+It is imported lazily, so a box that only polls never needs it and the CLI works
+in full without it. No system packages at all: the report publishes SVG, which
+browsers render natively, so `rsvg-convert` and a font package — both PNG
+requirements — are no longer involved.
 
 ## Install
 
@@ -386,10 +387,10 @@ and rotating out from under it without truncating would leave a sparse file.
 
 The CSVs are the data and should not be rotated.
 
-## PNG conversion
+## Converting a chart to PNG by hand
 
-Charts are SVG, which any browser renders. `daily` converts them to PNG because
-Drive previews PNG properly and mostly offers an SVG as a download.
+Nothing needs this any more — the website serves SVG, which any browser renders
+— but a PNG is still easier to paste into Discord or a message:
 
 ```
 apt install librsvg2-bin           # Debian/Ubuntu
@@ -397,63 +398,66 @@ brew install librsvg               # macOS
 rsvg-convert -w 1600 charts/chart_themeparkgiant_metrics.svg -o chart.png
 ```
 
-Required by `daily`, which checks for it at startup and exits 1 with that
-install line if it is missing. Nothing else here needs it.
+A minimal server image often has no fonts, and `rsvg-convert` will cheerfully
+exit 0 having written a PNG with the text invisible. `apt install
+fonts-dejavu-core` covers it. You may also see `Fontconfig error: No writable
+cache directories` on stderr under a unit's `ProtectHome=read-only`; that is not
+a failure.
 
-**Fonts.** A minimal server image often has none, and `rsvg-convert` will
-cheerfully exit 0 having written a PNG with the text invisible or boxed. `apt
-install fonts-dejavu-core` covers it — the SVG asks for Roboto, then system-ui,
-Helvetica, Arial, sans-serif. Nothing can detect this automatically, so look at
-the first uploaded PNG once.
+## Daily report
 
-You may also see `Fontconfig error: No writable cache directories` on stderr
-under the unit's `ProtectHome=read-only`. That is not a failure — the conversion
-is judged by exit status and the PNG's magic bytes, not by stderr.
+One run charts every polled channel, both platforms, and publishes each to its
+own S3 static website. See the [README](../README.md#the-website) for what the
+page looks like.
 
-## Daily report to Google Drive
-
-One `oneshot` service plus a timer. Charts every channel you are polling,
-converts each to PNG, uploads to `Twitch Metrics/<channel>/<date>.png` in your
-own Drive.
-
-### 1. Authorize, once, interactively
-
-The service runs headless and will never prompt — it exits with an actionable
-message instead. So do the browser step first, as the **same user the service
-will run as**, since the token is 0600 in the shared `data/`:
+### 1. AWS, once
 
 ```
-python3 -m twitchmetrics drive --setup
+pip install boto3
 ```
 
-Read what it prints about **publishing the consent screen**: left in "Testing",
-Google expires refresh tokens after 7 days and the daily upload dies mid-week.
-
-On a headless box the redirect needs the same treatment as `auth` — an SSH
-tunnel from the machine with the browser:
-
-```
-ssh -L 3000:localhost:3000 user@your-server        # on your desktop, leave open
-sudo -u twitch python3 -m twitchmetrics drive --auth --no-browser
-```
-
-or no tunnel at all:
+Create an IAM user with programmatic access and the policy in the
+[README](../README.md#setting-up-aws) — scoped to `arn:aws:s3:::tm-*`, so a
+mistake here cannot reach anything else in the account. Then either put the key
+in `.env`:
 
 ```
-sudo -u twitch python3 -m twitchmetrics drive --auth --manual
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+AWS_REGION=us-east-1
 ```
 
-Both flows use port 3000, the same as `twitch-metrics auth`, so they can't run
-at the same moment. `GOOGLE_REDIRECT_URI` moves one if you need to.
+or leave those unset and let boto3 use `~/.aws/credentials` or, on EC2, an
+instance role — which is better, since there is then no long-lived key on the
+box at all.
 
-Confirm it took, without uploading anything:
+**Turn off account-level Block Public Access**: *S3 → Block Public Access
+(account settings) → Edit → clear all four*. It is a separate setting from the
+per-bucket one, AWS applies whichever is more restrictive, and leaving it on
+makes every bucket policy fail with `AccessDenied`.
+
+Unlike the Drive report this replaced, there is no browser login and no token to
+keep alive, so nothing here needs an SSH tunnel and nothing expires after 7 days.
+
+### 2. One bucket per channel
 
 ```
-python3 -m twitchmetrics drive --status
-python3 -m twitchmetrics drive --check     # non-interactive, exactly as the service runs
+sudo -u twitch python3 -m twitchmetrics s3 --setup themeparkgiant
 ```
 
-### 2. Install the units
+Prints the website URL. Re-runnable: a channel that already has a bucket is left
+alone. The name is random, because bucket names are global, and is recorded in
+`data/.s3_buckets.json` — **back that file up**, or you lose track of which
+bucket belongs to which channel.
+
+Confirm it took, publishing nothing:
+
+```
+sudo -u twitch python3 -m twitchmetrics s3 --check themeparkgiant
+sudo -u twitch python3 -m twitchmetrics s3 --list
+```
+
+### 3. Install the units
 
 ```
 sudo cp deploy/twitch-metrics-daily.service /etc/systemd/system/
@@ -465,7 +469,7 @@ sudo systemctl daemon-reload
 **Enable the timer, not the service.** The service has no `[Install]` section on
 purpose: enabling it would run the report once at every boot as well.
 
-### 3. Test it before trusting the schedule
+### 4. Test it before trusting the schedule
 
 ```
 python3 -m twitchmetrics daily --list-channels   # does discovery see your pollers?
@@ -484,8 +488,9 @@ correct — the unit adds up to two minutes of jitter.
 
 ### Channels, and what red means
 
-The channel list comes from the enabled `twitch-metrics@` instances, so a poller
-you enable is automatically in the report. If the pollers aren't systemd-managed
+The channel list comes from the enabled `twitch-metrics@` and
+`youtube-metrics@` instances, so a poller you enable is automatically in the
+report, and a channel with both is listed once. If the pollers aren't systemd-managed
 here, name them instead — in `.env`:
 
 ```
@@ -499,16 +504,17 @@ or as a drop-in, `sudo systemctl edit twitch-metrics-daily.service`:
 Environment=TWITCH_DAILY_CHANNELS=themeparkgiant,prgskidmark
 ```
 
-Exit 0 means every channel was uploaded, or skipped because that channel simply
-didn't stream. Exit 1 means something is actually wrong — a poller that stopped,
-a failed upload, no channels found at all. That distinction is the point: an
+Exit 0 means every channel was published, or skipped because that channel
+simply didn't stream — including a channel you only poll on one platform. Exit 1
+means something is actually wrong: a poller that stopped, a failed upload, no
+channels found at all. That distinction is the point: an
 alarm that goes red every time you take a day off is an alarm you stop reading.
 
 ### Missed runs
 
 The timer is deliberately **not** `Persistent=true`. A catch-up run isn't told
 which day it missed, so `--date today` after a post-midnight boot would chart the
-nearly-empty new day and upload it under the wrong name. Backfill by hand:
+nearly-empty new day and publish it under the wrong date. Backfill by hand:
 
 ```
 python3 -m twitchmetrics daily --date yesterday
@@ -519,15 +525,16 @@ python3 -m twitchmetrics daily --date yesterday
 | Journal says | Cause | Fix |
 |---|---|---|
 | `status=217/USER` | `User=twitch` doesn't exist | create it, or use an existing account |
-| `rsvg-convert is not installed` | librsvg missing | `apt install librsvg2-bin` |
-| uploads fine, but the PNG has no text | no fonts on the box | `apt install fonts-dejavu-core` |
-| `No channels to report on` | no enabled `twitch-metrics@` instances | `systemctl enable twitch-metrics@yourchannel`, or set `TWITCH_DAILY_CHANNELS` |
-| `no samples at all on <date>` | that channel's poller isn't running | `systemctl status 'twitch-metrics@*'` |
+| `needs boto3, which isn't installed` | publishing needs it; collecting doesn't | `pip install boto3` |
+| `No channels to report on` | no enabled poller instances | `systemctl enable twitch-metrics@yourchannel`, or set `TWITCH_DAILY_CHANNELS` |
+| `no samples at all today` | that platform's poller isn't running | `systemctl status 'twitch-metrics@*' 'youtube-metrics@*'` |
 | `offline all day, nothing to chart` | the channel didn't stream — not an error | nothing |
-| `No Google Drive authorization` | never authorized, or as the wrong user | `sudo -u twitch python3 -m twitchmetrics drive --auth --manual` |
-| `invalid_grant` | consent screen still in "Testing" (7-day expiry) | publish it, then `drive --auth --force` |
+| `nothing to backfill` | that CSV doesn't reach back that far — not an error | nothing |
+| `No S3 bucket for '<channel>' yet` | `--setup` never run for it | `s3 --setup <channel>` |
+| `AWS rejected these credentials` | wrong or missing key | check `.env`, or `s3 --check` |
+| `refused the public-read policy` | account-level Block Public Access is on | clear it in the S3 console |
 | the timer never fires | the *service* was enabled instead of the timer | `systemctl disable twitch-metrics-daily.service && systemctl enable --now twitch-metrics-daily.timer` |
-| `Permission denied` writing a PNG | checkout under `/home` or `/root` | `ProtectHome=no` |
+| `Permission denied` writing a chart | checkout under `/home` or `/root` | `ProtectHome=no` |
 
 ### Chart growth
 
@@ -546,8 +553,8 @@ Never rotate `data/*.csv`. That is the actual data.
 
 | Path | Contents |
 |---|---|
-| `data/` | sample CSVs (Twitch and YouTube), poll logs, `daily.log`, cached tokens |
-| `charts/` | generated SVGs, and the PNGs `daily` uploads |
+| `data/` | sample CSVs (Twitch and YouTube), poll logs, `daily.log`, cached tokens, `.s3_buckets.json` |
+| `charts/` | generated SVGs, which is what `daily` publishes |
 | `.env` | credentials, mode 0600 |
 
 `data/daily.log` is already covered by the `data/*.log` logrotate glob above.
@@ -561,6 +568,13 @@ TWITCH_DATA_DIR=/var/lib/twitch-metrics python3 -m twitchmetrics poll
 
 ## Backups
 
-`data/*.csv` is the only irreplaceable thing here — charts regenerate from it.
+`data/*.csv` is the only irreplaceable thing here — charts regenerate from it,
+and so does every page in S3.
+
+`data/.s3_buckets.json` is worth keeping too. It is not a secret, but it is the
+only record of which random bucket name belongs to which channel; lose it and
+`--setup` will make a second bucket rather than reusing the one already serving
+that channel's history.
+
 The token files are recoverable by re-authorizing, and should not be backed up
 to anywhere less private than the server itself.
