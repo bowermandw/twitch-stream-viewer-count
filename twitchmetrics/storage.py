@@ -21,9 +21,12 @@ METRICS_HEADER = [
 # The YouTube poller's shape. The first three columns match the two above so
 # read_samples() parses all three formats without branching, and there is no
 # game column because YouTube has no equivalent of a Twitch category.
+# New columns go on the END, never in the middle: _widen() can only extend a
+# file whose header is a leading slice of this one, and inserting a column
+# would shift every value in every row already on disk.
 YOUTUBE_HEADER = [
     "timestamp_utc", "is_live", "viewer_count", "subscriber_count",
-    "title", "started_at", "video_id",
+    "title", "started_at", "video_id", "like_count",
 ]
 
 
@@ -31,10 +34,33 @@ def utc_stamp(when=None):
     return (when or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _widen(path, header):
+    """Rewrite a file written with an earlier, shorter header of the same format.
+
+    Appending a wider row to a narrower file would be silently lossy: DictReader
+    takes its field names from the header already on disk, so the extra values
+    would land in the leftovers and never be read back. Rewriting once, with the
+    old rows blank in the new columns, keeps the whole file readable.
+
+    Only ever widens. A header that is not a leading slice of `header` belongs
+    to some other format and is left untouched.
+    """
+    with open(path, newline="", encoding="utf-8") as handle:
+        first = handle.readline()
+    old = next(csv.reader([first]), [])
+    if old == header or old != header[:len(old)]:
+        return
+    with open(path, newline="", encoding="utf-8") as handle:
+        rows = list(csv.reader(handle))
+    write_all(path, header, [row + [""] * (len(header) - len(row)) for row in rows[1:]])
+
+
 def append_row(path, header, row):
     """Append one row, writing the header only if the file is new or empty."""
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     need_header = not os.path.exists(path) or os.path.getsize(path) == 0
+    if not need_header:
+        _widen(path, header)
     with open(path, "a", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
         if need_header:
@@ -85,6 +111,7 @@ def read_samples(path):
                 "followers": optional("follower_count"),
                 "chatters": optional("chatter_count"),
                 "subscribers": optional("subscriber_count"),
+                "likes": optional("like_count"),
                 "title": row.get("title") or "",
                 "game": row.get("game") or "",
                 # YouTube names it video_id, and feeding it through the same key

@@ -177,19 +177,27 @@ check("video_id feeds the stream_id key",
       all(s["stream_id"] for s in _yt if s["live"]))
 check("no follower or chatter series",
       all(s["followers"] is None and s["chatters"] is None for s in _yt))
+_yt_likes = [s["likes"] for s in _yt if s["live"]]
+check("likes parse on live rows", all(v is not None for v in _yt_likes))
+check("likes only ever climb",
+      all(b >= a for a, b in zip(_yt_likes, _yt_likes[1:])))
+check("offline rows carry no like count",
+      all(s["likes"] is None for s in _yt if not s["live"]))
+check("a Twitch file has no like series",
+      all(s["likes"] is None for s in storage.read_samples(PLAIN)))
 
 _yt_sessions = chart.split_sessions(_yt)
 check("one broadcast in the youtube fixture", len(_yt_sessions) == 1,
       "got %d" % len(_yt_sessions))
 _yt_metrics = chart.available_metrics(_yt_sessions[0])
-check("viewers and subscribers detected, nothing else",
-      [m["key"] for m in _yt_metrics] == ["viewers", "subscribers"],
+check("viewers, subscribers and likes detected, nothing else",
+      [m["key"] for m in _yt_metrics] == ["viewers", "subscribers", "likes"],
       str([m["key"] for m in _yt_metrics]))
 _yt_svg = chart.render_stacked(_yt_sessions[0], "testchannel", 10, 1300)
 check("youtube svg is well-formed",
       _yt_svg.startswith("<svg") and _yt_svg.endswith("</svg>"))
-check("youtube svg names both series",
-      "Concurrent viewers" in _yt_svg and "Subscribers" in _yt_svg)
+check("youtube svg names every series",
+      all(m["label"] in _yt_svg for m in _yt_metrics))
 check("subscribers get a non-zero-based axis",
       chart.METRIC_BY_KEY["subscribers"]["zero_based"] is False)
 
@@ -219,6 +227,13 @@ check("the live one is picked out", youtube.pick_live([_soon, _live])["id"] == "
 check("two at once takes the one that started last",
       youtube.pick_live([_older, _live, _soon])["id"] == "v1")
 check("viewers parse to an int", youtube.concurrent_viewers(_live) == 2413)
+check("likes come off the statistics part",
+      youtube.likes({"statistics": {"likeCount": "482"}}) == 482)
+check("hidden likes are None, not zero", youtube.likes({"statistics": {}}) is None)
+check("likes ride along on the same call, costing nothing extra",
+      "statistics" in open(os.path.join(root, "twitchmetrics/youtube.py")).read()
+      .split("VIDEOS_URL, {")[1].split("}")[0]
+      and youtube.UNITS_PER_SAMPLE == 3)
 check("a missing viewer count is None, not zero",
       youtube.concurrent_viewers(_soon) is None)
 check("state defaults to none", youtube.broadcast_state({}) == "none")
@@ -313,6 +328,34 @@ with tempfile.TemporaryDirectory() as _tmp:
 check("youtube listed as a subcommand",
       "youtube" in subprocess.run([sys.executable, "-m", "twitchmetrics", "--help"],
                                   cwd=root, capture_output=True, text=True).stdout)
+
+# --- widening an existing CSV ---------------------------------------------
+section("adding a column to a file already on disk")
+_narrow = storage.YOUTUBE_HEADER[:-1]          # the shape before like_count
+with tempfile.TemporaryDirectory() as _tmp:
+    _path = os.path.join(_tmp, "youtube_old.csv")
+    storage.write_all(_path, _narrow,
+                      [["2026-08-24T12:00:00Z", "true", "381", "17000",
+                        "Old row", "2026-08-24T11:56:33Z", "beuPG6ZohtQ"]])
+    storage.append_row(_path, storage.YOUTUBE_HEADER,
+                       ["2026-08-24T12:01:00Z", "true", "395", "17000",
+                        "New row", "2026-08-24T11:56:33Z", "beuPG6ZohtQ", "142"])
+    _rows = storage.read_samples(_path)
+    check("the old row survives", len(_rows) == 2, "got %d" % len(_rows))
+    check("the old row keeps its values", _rows[0]["viewers"] == 381)
+    check("the old row is blank in the new column", _rows[0]["likes"] is None)
+    check("the new row's like count is readable", _rows[1]["likes"] == 142)
+    check("the header on disk was widened",
+          open(_path).readline().strip().endswith("like_count"))
+
+    # A file of a different format must not be mangled into this one.
+    _other = os.path.join(_tmp, "metrics_x.csv")
+    storage.write_all(_other, storage.METRICS_HEADER, [])
+    _before = open(_other).read()
+    storage.append_row(_other, storage.METRICS_HEADER,
+                       ["2026-08-24T12:00:00Z", "false", "", "10", "", "", "", "", ""])
+    check("a different format keeps its own header",
+          open(_other).readline() == _before.splitlines(True)[0])
 
 # --- concurrency safety ---------------------------------------------------
 section("concurrency")

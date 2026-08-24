@@ -4,9 +4,12 @@ Two numbers per sample, into data/youtube_<channel>.csv:
 
   viewers      liveStreamingDetails.concurrentViewers of whichever video is
                live right now, blank when the channel is offline.
+  likes        statistics.likeCount of that same video. Cumulative for the
+               broadcast, and exact — which the subscriber count is not.
   subscribers  channels.list statistics.subscriberCount. YouTube rounds this to
                three significant figures, so it steps (1.23M then 1.24M) rather
-               than climbing smoothly — the chart is not broken.
+               than climbing smoothly — the chart is not broken. At 17k that is
+               a step of 100, so it sits flat across a single broadcast.
 
 Chat size has no equivalent here. YouTube's totalChatCount lives on the
 liveBroadcasts resource, which needs OAuth as the channel's own Google account,
@@ -100,6 +103,7 @@ def poll_once(state):
 
     live = video is not None
     viewers = youtube.concurrent_viewers(video) if live else None
+    likes = youtube.likes(video) if live else None
     details = (video.get("liveStreamingDetails") or {}) if live else {}
     snippet = (video.get("snippet") or {}) if live else {}
 
@@ -108,7 +112,8 @@ def poll_once(state):
            subscribers if subscribers is not None else "",
            snippet.get("title", "") if live else "",
            details.get("actualStartTime", "") if live else "",
-           video.get("id", "") if live else ""]
+           video.get("id", "") if live else "",
+           likes if likes is not None else ""]
     try:
         storage.append_row(state["csv_path"], storage.YOUTUBE_HEADER, row)
     except OSError as exc:
@@ -118,8 +123,9 @@ def poll_once(state):
     def show(value):
         return "—" if value in (None, "") else "{:,}".format(int(value))
 
-    log("{}  {}  viewers {:>7}  subscribers {:>9}".format(
-        state["channel"], "LIVE   " if live else "offline", show(row[2]), show(row[3])))
+    log("{}  {}  viewers {:>7}  likes {:>6}  subscribers {:>9}".format(
+        state["channel"], "LIVE   " if live else "offline",
+        show(row[2]), show(row[7]), show(row[3])))
     return True
 
 

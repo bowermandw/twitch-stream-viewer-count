@@ -4,8 +4,8 @@ Poll a Twitch channel's **viewers, followers and chat size** on an interval into
 a CSV, then chart it in the style of the YouTube Studio "Concurrent viewers"
 graph.
 
-The same poller [also runs against YouTube](#youtube) — concurrent viewers and
-subscriber count, into the same CSVs and the same charts.
+The same poller [also runs against YouTube](#youtube) — concurrent viewers,
+likes and subscriber count, into the same CSVs and the same charts.
 
 **Python 3.9+ and nothing else.** No dependencies, no `pip install`, no
 virtualenv needed — only the standard library. `urllib` for HTTP, `csv` for
@@ -28,7 +28,7 @@ reproduce without credentials.*
 - Charts a single broadcast or a whole calendar day, one metric or all three
 - Degrades cleanly when a metric needs permissions you don't have
 - Ships synthetic sample data so the charts work before you collect anything
-- Also polls **YouTube** live viewers and subscriber count, into the same CSV-and-chart pipeline
+- Also polls **YouTube** live viewers, likes and subscriber count, into the same CSV-and-chart pipeline
 
 ---
 
@@ -217,9 +217,9 @@ whole day.
 twitch-metrics youtube themeparkgiant
 ```
 
-Samples a YouTube channel's **concurrent viewers and subscriber count** into
-`data/youtube_<channel>.csv`, on the same interval and in the same shape as the
-Twitch poller, so `graph` charts it with no extra flags.
+Samples a YouTube channel's **concurrent viewers, likes and subscriber count**
+into `data/youtube_<channel>.csv`, on the same interval and in the same shape as
+the Twitch poller, so `graph` charts it with no extra flags.
 
 The channel is the `@name` from its URL — `youtube.com/@themeparkgiant` means
 `themeparkgiant` — or a raw `UC…` channel id. It is resolved from
@@ -259,7 +259,10 @@ uploads playlist instead: a broadcast scheduled ahead of time sits there as
 |---|---|---|
 | subscriber count | `channels.list` | 1 |
 | recent uploads | `playlistItems.list` | 1 |
-| broadcast state and viewers | `videos.list` | 1 |
+| broadcast state, viewers and likes | `videos.list` | 1 |
+
+Quota is charged per *call*, not per *part*, so asking `videos.list` for
+`statistics` alongside `liveStreamingDetails` gets the like count for nothing.
 
 Three units against a daily allowance of 10,000. The default interval is **60
 seconds** — 4,320 units a day, which leaves room for a second channel but not a
@@ -295,15 +298,28 @@ lagging for this channel — `--search` switches discovery to `search.list` to
 confirm it. That mode is only usable at intervals of 864 seconds or more, and
 the command says so rather than quietly blowing the allowance.
 
-### Two numbers, two caveats
+### What each number is worth
 
-`concurrentViewers` is absent for the first moments of a broadcast and on a
-channel that hides it, so a live sample with a blank viewer count is normal.
+**`concurrentViewers`** is the good one — exact, and it moves every minute. It
+is absent for the first moments of a broadcast and on a channel that hides it,
+so a live sample with a blank viewer count is normal.
 
-`subscriberCount` is rounded to **three significant figures** by YouTube policy.
-The series therefore steps — 1,230,000 then 1,240,000 — instead of climbing
-smoothly. The chart is not broken; the number genuinely has that little
-resolution.
+**`likeCount`** is exact and cumulative for the broadcast, so it only ever
+climbs. A useful proxy for how a stream is landing, and free to collect.
+
+**`subscriberCount`** is rounded to **three significant figures** by YouTube
+policy, and there is no way around it: Studio's exact figure comes from an
+internal number that no public API exposes. At 17k that rounding is a step of
+100, so the series sits perfectly flat across a single broadcast and only moves
+every week or two. Worth keeping as a slow trend, not worth charting intraday:
+
+```
+twitch-metrics graph data/youtube_themeparkgiant.csv --only viewers
+```
+
+(The YouTube *Analytics* API does give exact `subscribersGained` and
+`subscribersLost` per day — but no absolute total, and it needs OAuth as the
+channel's own Google account.)
 
 Charting works exactly as it does for Twitch, via the file path:
 
@@ -311,9 +327,9 @@ Charting works exactly as it does for Twitch, via the file path:
 twitch-metrics graph data/youtube_themeparkgiant.csv --open
 ```
 
-Viewers and subscribers each get a panel. Subscribers share the followers axis
-treatment — not zero-based, since a 10,000-subscriber step is invisible on a
-0–1,240,000 scale.
+Viewers, likes and subscribers each get a panel, or name one with `--only`.
+Likes and subscribers share the followers axis treatment — not zero-based, since
+a 10,000-subscriber step is invisible on a 0–1,240,000 scale.
 
 ---
 
@@ -570,11 +586,12 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-116 checks over the committed fixtures — parsing, session detection, day
+129 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring, and
 the quota refusals that stop a mistyped YouTube interval costing a day's data.
-No network, no credentials, no tokens. It won't catch Twitch or YouTube changing
-an API contract; only regressions in this code.
+It also covers adding a column to a CSV already on disk, which is silently
+lossy if done wrong. No network, no credentials, no tokens. It won't catch
+Twitch or YouTube changing an API contract; only regressions in this code.
 
 ---
 

@@ -32,6 +32,7 @@ METRICS = [
     {"key": "chatters",    "label": "In chat",            "color": "#4ade80", "zero_based": True},
     {"key": "followers",   "label": "Followers",          "color": "#ffd166", "zero_based": False},
     {"key": "subscribers", "label": "Subscribers",        "color": "#ff6b6b", "zero_based": False},
+    {"key": "likes",       "label": "Likes",              "color": "#c084fc", "zero_based": False},
 ]
 METRIC_BY_KEY = {m["key"]: m for m in METRICS}
 

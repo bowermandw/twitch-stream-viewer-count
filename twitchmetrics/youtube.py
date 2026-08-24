@@ -200,7 +200,9 @@ def get_videos(ids, key):
     for start in range(0, len(ids), MAX_IDS):
         batch = ids[start:start + MAX_IDS]
         payload = get(VIDEOS_URL, {
-            "part": "snippet,liveStreamingDetails",
+            # statistics rides along for free: quota is charged per call, not
+            # per part, so likeCount costs nothing on top of the live details.
+            "part": "snippet,liveStreamingDetails,statistics",
             "id": ",".join(batch),
         }, key)
         found += payload.get("items") or []
@@ -231,6 +233,22 @@ def concurrent_viewers(video):
     not worth warning about.
     """
     raw = (video.get("liveStreamingDetails") or {}).get("concurrentViewers")
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def likes(video):
+    """likeCount as an int, or None when the creator has hidden it.
+
+    Cumulative for the broadcast rather than a rate, so it only ever climbs —
+    and unlike the subscriber count it is exact, which is the point of having
+    it. Live streams sometimes report it a beat behind the viewer count.
+    """
+    raw = (video.get("statistics") or {}).get("likeCount")
     if raw is None:
         return None
     try:
