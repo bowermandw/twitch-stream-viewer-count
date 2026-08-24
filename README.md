@@ -579,10 +579,16 @@ Two things to do once, by hand:
                  "s3:PutBucketPublicAccessBlock", "s3:GetBucketLocation"],
       "Resource": "arn:aws:s3:::tm-*" },
     { "Effect": "Allow", "Action": ["s3:PutObject"], "Resource": "arn:aws:s3:::tm-*/*" },
-    { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::tm-*" }
+    { "Effect": "Allow", "Action": ["s3:ListBucket"], "Resource": "arn:aws:s3:::tm-*" },
+    { "Effect": "Allow", "Action": ["s3:GetAccountPublicAccessBlock"], "Resource": "*" }
   ]
 }
 ```
+
+The last statement is the only one that can't be scoped to a bucket, because
+it reads an **account-wide** setting. It is read-only and is what lets `--setup`
+say "account-level Block Public Access is on" instead of reporting a bare
+`AccessDenied`. Omit it and setup still works; the diagnosis just gets worse.
 
 Put the key in `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or leave
 them unset and let boto3 find `~/.aws/credentials` or an instance role. A machine
