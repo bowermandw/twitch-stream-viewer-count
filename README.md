@@ -577,6 +577,14 @@ Put the key in `.env` as `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, or leave
 them unset and let boto3 find `~/.aws/credentials` or an instance role. A machine
 that only runs `daily` needs just the last two statements.
 
+> **If this machine can reach more than one AWS account, pin it.** Set
+> `AWS_ACCOUNT_ID` in `.env` and nothing is created or uploaded unless the
+> credentials resolve to that account. A laptop with SSO profiles for a dozen
+> accounts — several of them administrator — resolves boto3's chain to whatever
+> `AWS_PROFILE` happens to name, and this turns the wrong one into a refusal
+> instead of a bucket in someone's production account. Find the id with
+> `aws sts get-caller-identity`, or from `s3 --check`'s first log line.
+
 **2. Turn off account-level Block Public Access** — *S3 → Block Public Access
 (account settings) → Edit → clear all four*. This is a different setting from the
 per-bucket one `--setup` handles, and AWS applies whichever is **more
@@ -762,7 +770,7 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-388 checks over the committed fixtures — parsing, session detection, day
+393 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
 channel discovery, bucket naming, the index page, the Drive query and
 multipart builders, and the quota refusals that stop a mistyped YouTube interval

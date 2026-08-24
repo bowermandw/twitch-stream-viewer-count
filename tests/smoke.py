@@ -853,7 +853,7 @@ with tempfile.TemporaryDirectory() as tmp:
 section("aws configuration")
 _saved_aws = {k: os.environ.pop(k, None) for k in
               ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
-               "AWS_DEFAULT_REGION")}
+               "AWS_DEFAULT_REGION", "AWS_ACCOUNT_ID")}
 _real_env2 = config.ENV_PATH
 with tempfile.TemporaryDirectory() as tmp:
     config.ENV_PATH = os.path.join(tmp, ".env")
@@ -868,6 +868,18 @@ with tempfile.TemporaryDirectory() as tmp:
     os.environ["AWS_REGION"] = "us-west-2"
     check("AWS_REGION wins over it", config.resolve_aws_region() == "us-west-2")
     check("--region wins over both", config.resolve_aws_region("ap-south-1") == "ap-south-1")
+    check("no account pin by default", config.expected_aws_account() is None)
+    os.environ["AWS_ACCOUNT_ID"] = "123456789012"
+    check("a pinned account is read back",
+          config.expected_aws_account() == "123456789012")
+    os.environ["AWS_ACCOUNT_ID"] = "  "
+    check("a blank pin means no pin", config.expected_aws_account() is None)
+    os.environ.pop("AWS_ACCOUNT_ID", None)
+    check("the mismatch message names both accounts",
+          "{got}" in s3.WRONG_ACCOUNT and "{want}" in s3.WRONG_ACCOUNT)
+    check("preflight checks the pin before anything is created",
+          open(os.path.join(root, "twitchmetrics/s3.py")).read()
+          .split("def preflight")[1].split("def ")[0].count("WRONG_ACCOUNT") == 1)
     os.environ["AWS_ACCESS_KEY_ID"] = "AKIAEXAMPLE"
     os.environ["AWS_SECRET_ACCESS_KEY"] = "secret"
     check("keys are read from the environment",

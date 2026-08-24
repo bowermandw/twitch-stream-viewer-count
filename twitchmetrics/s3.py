@@ -64,6 +64,12 @@ NO_BOTO3 = """The daily report needs boto3, which isn't installed.
 
 Polling and `graph` still need nothing installed — only publishing does."""
 
+WRONG_ACCOUNT = """These credentials are for AWS account {got}, not {want}.
+
+AWS_ACCOUNT_ID in {env} pins the account this project may touch, and nothing
+will be created or uploaded while they disagree. Either AWS_PROFILE or the
+credential chain is pointing somewhere else, or the pin itself is stale."""
+
 ACCOUNT_BLOCKED = """S3 refused the public-read policy on {bucket}.
 
 Almost always this is account-level Block Public Access, which is separate from
@@ -309,8 +315,17 @@ def preflight(region=None):
             "AWS rejected these credentials: {}\n"
             "Check AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY in {}, or "
             "~/.aws/credentials.".format(exc, config.ENV_PATH))
+    account = str(who.get("Account") or "")
     log("start    aws account {} as {}".format(
-        who.get("Account", "?"), (who.get("Arn") or "?").rsplit("/", 1)[-1]))
+        account or "?", (who.get("Arn") or "?").rsplit("/", 1)[-1]))
+
+    # Checked before anything is created. A laptop with SSO profiles for a dozen
+    # accounts resolves the chain to whichever AWS_PROFILE names, and several of
+    # those are usually administrator; this makes the wrong one a refusal.
+    want = config.expected_aws_account()
+    if want and account != want:
+        raise SystemExit(WRONG_ACCOUNT.format(got=account or "unknown", want=want,
+                                              env=config.ENV_PATH))
     return who
 
 

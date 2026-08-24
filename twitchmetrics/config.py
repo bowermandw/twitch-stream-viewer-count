@@ -71,6 +71,21 @@ S3_BUCKETS_PATH = os.path.join(DATA_DIR, ".s3_buckets.json")
 BUCKET_PREFIX = "tm-"
 
 
+def expected_aws_account():
+    """The account id this project is allowed to touch, or None for "any".
+
+    Worth setting on any machine that can reach more than one AWS account. A
+    developer laptop often has SSO profiles for a dozen of them, several with
+    administrator access, and boto3's credential chain will cheerfully resolve
+    to whichever one AWS_PROFILE happens to name. Pinning the id turns
+    "published a stream chart into a client's production account" from a typo
+    into a refusal.
+    """
+    value = (os.environ.get("AWS_ACCOUNT_ID")
+             or load_env_file().get("AWS_ACCOUNT_ID") or "").strip()
+    return value or None
+
+
 def invocation():
     """How this program was actually started, for help text and hints.
 
