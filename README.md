@@ -530,6 +530,7 @@ The bucket holds nothing but the page and the charts:
 
 ```
 index.html               rebuilt every run
+titles.json              what each day's stream was called
 combined/2026-08-24.svg  both platforms on one axis — leads the page
 twitch/2026-08-24.svg
 youtube/2026-08-24.svg
@@ -566,6 +567,13 @@ it would trace the single platform's line exactly.
 `index.html` is rebuilt from a **listing of the bucket**, not from anything kept
 locally, so a run after a fortnight's gap still produces a correct index, and a
 chart you upload by hand appears in it.
+
+The stream's title sits under the date at the top. It is the one thing a listing
+cannot supply, so it is kept in `titles.json` beside the charts rather than
+handed in by the report — otherwise `s3 --publish-index` on its own would
+quietly produce a page with the titles missing. The two platforms almost always
+name the same broadcast differently, so **Twitch's title wins**, with YouTube as
+a fallback for a channel that only streams there.
 
 The name ends in ten random characters. Partly because bucket names are global
 and `tm-testchannel` may already belong to a stranger; mostly because the

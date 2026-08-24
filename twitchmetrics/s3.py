@@ -630,10 +630,11 @@ def render_index(channel, today, days, titles=None):
     # The platforms carry different titles for the same broadcast — Twitch's is
     # the canonical one. YouTube is the fallback rather than a second line, so
     # a channel streaming only there still gets a title.
-    headline = next((titles[key] for key in TITLE_PREFERENCE
-                     if (titles or {}).get(key)), "")
+    headline = next((str((titles or {}).get(key) or "").strip()
+                     for key in TITLE_PREFERENCE
+                     if str((titles or {}).get(key) or "").strip()), "")
     stream_titles = ('\n    <p class="stream">{}</p>'.format(
-        html.escape(headline.strip())) if headline else "")
+        html.escape(headline)) if headline else "")
 
     panels = []
     for platform in PLATFORMS:
