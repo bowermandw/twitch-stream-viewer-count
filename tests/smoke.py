@@ -16,12 +16,13 @@ from datetime import date
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from twitchmetrics import chart, config, storage  # noqa: E402
+from twitchmetrics import chart, config, storage, youtube  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 PLAIN = os.path.join(FIXTURES, "metrics_testchannel.csv")
 BREAKS = os.path.join(FIXTURES, "metrics_breaktest.csv")
 VIEWERS = os.path.join(FIXTURES, "viewers_testchannel.csv")
+YOUTUBE = os.path.join(FIXTURES, "youtube_testchannel.csv")
 
 passed = failed = 0
 
@@ -52,6 +53,8 @@ check("viewers-only fixture parses with empty extras",
       all(s["followers"] is None for s in storage.read_samples(VIEWERS)))
 check("a title containing commas survives",
       any("," in s["title"] for s in samples if s["live"]))
+check("a Twitch file has no subscriber series",
+      all(s["subscribers"] is None for s in samples))
 
 # --- session detection ----------------------------------------------------
 section("sessions")
@@ -102,8 +105,10 @@ metrics = chart.available_metrics(session)
 check("three metrics detected", len(metrics) == 3, str([m["key"] for m in metrics]))
 svg = chart.render_stacked(session, "testchannel", 30, 1300)
 check("stacked svg is well-formed", svg.startswith("<svg") and svg.endswith("</svg>"))
-check("stacked svg names all three series",
-      all(m["label"] in svg for m in chart.METRICS))
+check("stacked svg names every series it detected",
+      all(m["label"] in svg for m in metrics))
+check("stacked svg names nothing the file lacks",
+      chart.METRIC_BY_KEY["subscribers"]["label"] not in svg)
 one = chart.render_stacked(session, "t", 30, 1300, metrics=[chart.METRIC_BY_KEY["chatters"]])
 check("--only really filters", "Concurrent viewers" not in one and "In chat" in one)
 check("composite renders", chart.render_composite(session, "t", 1300, 470).endswith("</svg>"))
@@ -160,6 +165,127 @@ os.environ.pop("TWITCH_INTERVAL", None)
 if _saved is not None:
     os.environ["TWITCH_INTERVAL"] = _saved
 
+# --- youtube --------------------------------------------------------------
+section("youtube")
+_yt = storage.read_samples(YOUTUBE)
+check("reads the youtube fixture", len(_yt) == 60, "got %d" % len(_yt))
+check("subscribers parse on every row",
+      all(s["subscribers"] is not None for s in _yt))
+check("offline rows keep the subscriber count",
+      all(s["subscribers"] is not None for s in _yt if not s["live"]))
+check("video_id feeds the stream_id key",
+      all(s["stream_id"] for s in _yt if s["live"]))
+check("no follower or chatter series",
+      all(s["followers"] is None and s["chatters"] is None for s in _yt))
+
+_yt_sessions = chart.split_sessions(_yt)
+check("one broadcast in the youtube fixture", len(_yt_sessions) == 1,
+      "got %d" % len(_yt_sessions))
+_yt_metrics = chart.available_metrics(_yt_sessions[0])
+check("viewers and subscribers detected, nothing else",
+      [m["key"] for m in _yt_metrics] == ["viewers", "subscribers"],
+      str([m["key"] for m in _yt_metrics]))
+_yt_svg = chart.render_stacked(_yt_sessions[0], "testchannel", 10, 1300)
+check("youtube svg is well-formed",
+      _yt_svg.startswith("<svg") and _yt_svg.endswith("</svg>"))
+check("youtube svg names both series",
+      "Concurrent viewers" in _yt_svg and "Subscribers" in _yt_svg)
+check("subscribers get a non-zero-based axis",
+      chart.METRIC_BY_KEY["subscribers"]["zero_based"] is False)
+
+from twitchmetrics.commands import graph_cmd as _graph  # noqa: E402
+check("graph recovers the channel name from a youtube path",
+      _graph.pick_source("data/youtube_foo.csv", False)[1] == "foo")
+
+# channel_filter is the whole "handle or id" decision, and it is pure.
+check("a bare handle becomes forHandle",
+      youtube.channel_filter("themeparkgiant") == {"forHandle": "@themeparkgiant"})
+check("a pasted @handle is the same thing",
+      youtube.channel_filter("@themeparkgiant") == {"forHandle": "@themeparkgiant"})
+_uc = "UC" + "a" * 22
+check("a UC… id is used as an id", youtube.channel_filter(_uc) == {"id": _uc})
+check("a handle that merely starts with UC is still a handle",
+      youtube.channel_filter("UCsomething") == {"forHandle": "@UCsomething"})
+
+_live = {"id": "v1", "snippet": {"liveBroadcastContent": "live"},
+         "liveStreamingDetails": {"actualStartTime": "2026-08-21T18:00:00Z",
+                                  "concurrentViewers": "2413"}}
+_older = {"id": "v0", "snippet": {"liveBroadcastContent": "live"},
+          "liveStreamingDetails": {"actualStartTime": "2026-08-01T00:00:00Z"}}
+_soon = {"id": "v2", "snippet": {"liveBroadcastContent": "upcoming"},
+         "liveStreamingDetails": {"scheduledStartTime": "2026-08-30T19:00:00Z"}}
+check("scheduled broadcasts are not live", youtube.pick_live([_soon]) is None)
+check("the live one is picked out", youtube.pick_live([_soon, _live])["id"] == "v1")
+check("two at once takes the one that started last",
+      youtube.pick_live([_older, _live, _soon])["id"] == "v1")
+check("viewers parse to an int", youtube.concurrent_viewers(_live) == 2413)
+check("a missing viewer count is None, not zero",
+      youtube.concurrent_viewers(_soon) is None)
+check("state defaults to none", youtube.broadcast_state({}) == "none")
+
+check("youtube channels get separate data files",
+      config.youtube_csv("a") != config.youtube_csv("b"))
+check("a youtube file never collides with a twitch one",
+      config.youtube_csv("x") != config.metrics_csv("x"))
+check("hostile youtube names stay inside data/",
+      os.path.dirname(os.path.abspath(config.youtube_csv("../../etc/passwd")))
+      == os.path.abspath(config.DATA_DIR))
+
+_saved_ch = os.environ.pop("YOUTUBE_CHANNEL", None)
+check("youtube channel falls back to the default",
+      config.resolve_youtube_channel(None) == config.DEFAULT_YOUTUBE_CHANNEL)
+os.environ["YOUTUBE_CHANNEL"] = "@somebody"
+check("YOUTUBE_CHANNEL is honoured, @ stripped",
+      config.resolve_youtube_channel(None) == "somebody")
+check("the argument beats the env var",
+      config.resolve_youtube_channel("@other") == "other")
+os.environ.pop("YOUTUBE_CHANNEL", None)
+if _saved_ch is not None:
+    os.environ["YOUTUBE_CHANNEL"] = _saved_ch
+
+check("one sample costs three units", youtube.UNITS_PER_SAMPLE == 3)
+check("the minimum interval keeps a day inside the quota",
+      (86400 // config.MIN_YOUTUBE_INTERVAL_SECONDS) * youtube.UNITS_PER_SAMPLE
+      <= config.YOUTUBE_DAILY_QUOTA)
+check("search.list is not the default discovery route",
+      "search_live_video" not in
+      open(os.path.join(root, "twitchmetrics/youtube.py")).read().split(
+          "def search_live_video")[0].split("def find_live_video")[1])
+
+# The command's refusals, which are what keep a typo from burning the quota.
+with tempfile.TemporaryDirectory() as _tmp:
+    _empty = os.path.join(_tmp, ".env")
+    open(_empty, "w").close()
+    _env = dict(os.environ, TWITCH_DATA_DIR=_tmp, TWITCH_CHARTS_DIR=_tmp,
+                TWITCH_ENV_FILE=_empty)
+    _env.pop("YOUTUBE_API_KEY", None)
+    _env.pop("TWITCH_INTERVAL", None)
+
+    def _yt_run(argv, env=_env):
+        return subprocess.run([sys.executable, "-m", "twitchmetrics", "youtube"] + argv,
+                              cwd=root, capture_output=True, text=True, env=env)
+
+    _r = _yt_run(["--help"])
+    check("youtube --help works", _r.returncode == 0)
+    _r = _yt_run(["--once"])
+    check("a missing key is named",
+          _r.returncode != 0 and "YOUTUBE_API_KEY" in (_r.stdout + _r.stderr),
+          (_r.stdout + _r.stderr).strip()[-80:])
+    _r = _yt_run(["--interval", "30"])
+    check("an interval under the quota floor is refused",
+          _r.returncode != 0 and "60 seconds" in (_r.stdout + _r.stderr))
+    _r = _yt_run(["--interval", "300", "--search"])
+    check("--search at poll speed is refused, before the key is even read",
+          _r.returncode != 0 and "YOUTUBE_API_KEY" not in (_r.stdout + _r.stderr),
+          (_r.stdout + _r.stderr).strip()[-80:])
+    _r = _yt_run(["--interval", "900", "--search"])
+    check("--search at a survivable interval gets as far as the key",
+          "YOUTUBE_API_KEY" in (_r.stdout + _r.stderr))
+
+check("youtube listed as a subcommand",
+      "youtube" in subprocess.run([sys.executable, "-m", "twitchmetrics", "--help"],
+                                  cwd=root, capture_output=True, text=True).stdout)
+
 # --- concurrency safety ---------------------------------------------------
 section("concurrency")
 from twitchmetrics import useroauth as _uo  # noqa: E402
@@ -174,6 +300,21 @@ check("channels get separate data files",
       config.metrics_csv("a") != config.metrics_csv("b"))
 check("systemd unit is a per-channel template",
       "%i" in open(os.path.join(root, "deploy/twitch-metrics@.service")).read())
+check("the youtube unit is a per-channel template too",
+      "%i" in open(os.path.join(root, "deploy/youtube-metrics@.service")).read())
+for _mod in ("commands/poll.py", "commands/youtube_cmd.py"):
+    check("{} runs on the shared loop".format(_mod),
+          "runloop.loop" in open(os.path.join(root, "twitchmetrics", _mod)).read())
+
+# The whole project's promise is that there is nothing to install.
+import re as _re  # noqa: E402
+_forbidden = _re.compile(
+    r"^\s*(import|from)\s+"
+    r"(google|googleapiclient|google_auth\w*|requests|httplib2|oauth2client|matplotlib)\b",
+    _re.M)
+for _mod in ("youtube.py", "runloop.py", "commands/youtube_cmd.py"):
+    _src = open(os.path.join(root, "twitchmetrics", _mod)).read()
+    check("{} imports nothing third-party".format(_mod), not _forbidden.search(_src))
 
 # --- signals --------------------------------------------------------------
 section("shutdown signals")

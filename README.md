@@ -4,6 +4,9 @@ Poll a Twitch channel's **viewers, followers and chat size** on an interval into
 a CSV, then chart it in the style of the YouTube Studio "Concurrent viewers"
 graph.
 
+The same poller [also runs against YouTube](#youtube) — concurrent viewers and
+subscriber count, into the same CSVs and the same charts.
+
 **Python 3.9+ and nothing else.** No dependencies, no `pip install`, no
 virtualenv needed — only the standard library. `urllib` for HTTP, `csv` for
 storage, hand-built SVG for the charts.
@@ -25,6 +28,7 @@ reproduce without credentials.*
 - Charts a single broadcast or a whole calendar day, one metric or all three
 - Degrades cleanly when a metric needs permissions you don't have
 - Ships synthetic sample data so the charts work before you collect anything
+- Also polls **YouTube** live viewers and subscriber count, into the same CSV-and-chart pipeline
 
 ---
 
@@ -175,7 +179,10 @@ The only shared state is the cached tokens. Those are written atomically, and
 refreshes are serialised with a file lock, because Twitch rotates the refresh
 token on use.
 
-The unit and recipes for tmux, nohup, cron, launchd and logrotate are in
+`youtube-metrics@.service` is the same idea for the YouTube poller, and runs
+alongside rather than instead — it shares no files with the Twitch instances.
+
+The units and recipes for tmux, nohup, cron, launchd and logrotate are in
 [`deploy/`](deploy/).
 
 ### What each metric needs
@@ -201,6 +208,101 @@ A gap in the timestamps is therefore the only record that polling stopped.
 `graph` infers one when the interval exceeds 2.5× the median and treats the
 samples either side as separate broadcasts. `--date` ignores that and takes the
 whole day.
+
+---
+
+## YouTube
+
+```
+twitch-metrics youtube themeparkgiant
+```
+
+Samples a YouTube channel's **concurrent viewers and subscriber count** into
+`data/youtube_<channel>.csv`, on the same interval and in the same shape as the
+Twitch poller, so `graph` charts it with no extra flags.
+
+The channel is the `@name` from its URL — `youtube.com/@themeparkgiant` means
+`themeparkgiant` — or a raw `UC…` channel id. It is resolved from
+`YOUTUBE_CHANNEL` rather than `TWITCH_CHANNEL`, because a creator's handle on
+the two platforms need not match.
+
+### The key
+
+One API key, no browser login: both metrics are public, so there is nothing to
+authorize.
+
+1. Create a key at [console.cloud.google.com/apis/credentials](https://console.cloud.google.com/apis/credentials)
+2. Enable **YouTube Data API v3** for the same project
+3. Put it in `.env` as `YOUTUBE_API_KEY=…`
+
+Every Twitch command keeps working without it.
+
+### Why there is no chat size
+
+Twitch's chat-size equivalent here is `totalChatCount`, and it lives on the
+`liveBroadcasts` resource of the Live Streaming API, which requires OAuth as the
+channel's own Google account. An API key cannot reach it, so the column does not
+exist rather than being present and always blank.
+
+### Finding the live broadcast
+
+YouTube has no "is this channel live" endpoint. The concurrent viewer count
+hangs off a *video*, so the live video has to be found first — and how it is
+found matters, because every request is billed against a quota.
+
+`search.list(eventType=live)` is the direct route and is capped at **100 calls a
+day**, where a five-minute interval needs 288. So the poller walks the channel's
+uploads playlist instead: a broadcast scheduled ahead of time sits there as
+`upcoming` and flips to `live` when it starts.
+
+| Per sample | Endpoint | Units |
+|---|---|---|
+| subscriber count | `channels.list` | 1 |
+| recent uploads | `playlistItems.list` | 1 |
+| broadcast state and viewers | `videos.list` | 1 |
+
+Three units against a daily allowance of 10,000 — about 864 a day at the default
+300-second interval. The poller refuses an interval under 60 seconds for that
+reason, and logs its projected daily usage at startup.
+
+To see what the playlist actually knows:
+
+```
+twitch-metrics youtube themeparkgiant --list-recent
+```
+
+```
+Theme Park Giant  — 15 most recent upload(s)
+
+  upcoming  2026-08-30 19:00         —  Rope Drop at Magic Kingdom
+  live      2026-08-24 18:02     2,413  Every Ride at Epcot, Worst to Best
+  none      2026-08-22 18:00         —  Why Tron Broke Down Again
+```
+
+If a broadcast is genuinely live but nothing here says `live`, the playlist is
+lagging for this channel — `--search` switches discovery to `search.list` to
+confirm it. That mode is only usable at intervals of 864 seconds or more, and
+the command says so rather than quietly blowing the allowance.
+
+### Two numbers, two caveats
+
+`concurrentViewers` is absent for the first moments of a broadcast and on a
+channel that hides it, so a live sample with a blank viewer count is normal.
+
+`subscriberCount` is rounded to **three significant figures** by YouTube policy.
+The series therefore steps — 1,230,000 then 1,240,000 — instead of climbing
+smoothly. The chart is not broken; the number genuinely has that little
+resolution.
+
+Charting works exactly as it does for Twitch, via the file path:
+
+```
+twitch-metrics graph data/youtube_themeparkgiant.csv --open
+```
+
+Viewers and subscribers each get a panel. Subscribers share the followers axis
+treatment — not zero-based, since a 10,000-subscriber step is invisible on a
+0–1,240,000 scale.
 
 ---
 
@@ -457,10 +559,11 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-38 checks over the committed fixtures — parsing, session detection, day
-selection, gap handling, axis choice, path safety, rendering and CLI wiring. No
-network, no credentials, no tokens. It won't catch Twitch changing an API
-contract; only regressions in this code.
+105 checks over the committed fixtures — parsing, session detection, day
+selection, gap handling, axis choice, path safety, rendering, CLI wiring, and
+the quota refusals that stop a mistyped YouTube interval costing a day's data.
+No network, no credentials, no tokens. It won't catch Twitch or YouTube changing
+an API contract; only regressions in this code.
 
 ---
 
@@ -472,6 +575,8 @@ twitchmetrics/          the package
   auth.py               app access token
   useroauth.py          user access token (browser flow)
   api.py                Helix endpoint wrappers
+  youtube.py            YouTube Data API wrappers
+  runloop.py            the sampling loop both pollers share
   storage.py            CSV read and append
   chart.py              SVG rendering
   testdata.py           synthetic data model
@@ -481,7 +586,7 @@ data/                   samples, logs, cached tokens   (gitignored)
 charts/                 generated SVGs                 (gitignored)
 tests/fixtures/         synthetic sample data           (committed)
 docs/                   README images
-deploy/                 systemd unit and server notes
+deploy/                 systemd units and server notes
 ```
 
 `data/` and `charts/` can be redirected with `TWITCH_DATA_DIR` and
@@ -496,6 +601,8 @@ CSVs, and tokens can be re-fetched.
   about a minute. Treat it as approximate.
 - Twitch's rate limit is 800 points/minute. Polling every 5 minutes uses a
   vanishing fraction of that, so a shorter interval is fine.
+- YouTube is the opposite: a hard 10,000 units a day, resetting at midnight
+  Pacific, so the interval there is a budget rather than a preference.
 - Charts are SVG. To convert to PNG: `brew install librsvg` or
   `apt install librsvg2-bin`, then `rsvg-convert -w 1600 in.svg -o out.png`.
   Not needed for anything the project itself does.

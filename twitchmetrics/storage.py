@@ -1,6 +1,6 @@
 """Reading and appending the sample CSVs.
 
-Both pollers append and write the header only when the file is empty, so
+Every poller appends and writes the header only when the file is empty, so
 stopping and restarting continues the same file with nothing overwritten.
 """
 
@@ -16,6 +16,14 @@ VIEWERS_HEADER = [
 METRICS_HEADER = [
     "timestamp_utc", "is_live", "viewer_count", "follower_count", "chatter_count",
     "title", "game", "started_at", "stream_id",
+]
+
+# The YouTube poller's shape. The first three columns match the two above so
+# read_samples() parses all three formats without branching, and there is no
+# game column because YouTube has no equivalent of a Twitch category.
+YOUTUBE_HEADER = [
+    "timestamp_utc", "is_live", "viewer_count", "subscriber_count",
+    "title", "started_at", "video_id",
 ]
 
 
@@ -43,10 +51,11 @@ def write_all(path, header, rows):
 
 
 def read_samples(path):
-    """Parse a viewers_*.csv or metrics_*.csv, skipping unreadable rows.
+    """Parse a viewers_*, metrics_* or youtube_* CSV, skipping unreadable rows.
 
-    Returns dicts with `followers` and `chatters` set to None when the file is
-    the viewers-only format, so callers can treat both shapes alike.
+    Returns dicts with the metrics a given format doesn't carry set to None, so
+    callers can treat every shape alike: `followers` and `chatters` for the
+    viewers-only format, `subscribers` for both of the Twitch ones.
     """
     samples = []
     with open(path, newline="", encoding="utf-8") as handle:
@@ -75,9 +84,12 @@ def read_samples(path):
                 "viewers": viewers,
                 "followers": optional("follower_count"),
                 "chatters": optional("chatter_count"),
+                "subscribers": optional("subscriber_count"),
                 "title": row.get("title") or "",
                 "game": row.get("game") or "",
-                "stream_id": row.get("stream_id") or "",
+                # YouTube names it video_id, and feeding it through the same key
+                # lets chart.split_sessions() break broadcasts apart unchanged.
+                "stream_id": row.get("stream_id") or row.get("video_id") or "",
             })
     samples.sort(key=lambda s: s["when"])
     return samples

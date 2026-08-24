@@ -30,6 +30,18 @@ HTTP_TIMEOUT = 20       # stops a hung socket stalling a poll loop
 TOKEN_URL = "https://id.twitch.tv/oauth2/token"
 HELIX = "https://api.twitch.tv/helix"
 
+# --- YouTube --------------------------------------------------------------
+YOUTUBE_API = "https://www.googleapis.com/youtube/v3"
+
+DEFAULT_YOUTUBE_CHANNEL = "themeparkgiant"
+
+# YouTube bills every request against a 10,000 unit/day pool and one sample
+# costs three units (see youtube.UNITS_PER_SAMPLE), so a 10-second interval —
+# fine against Twitch — would exhaust the day's quota before lunch. 60 seconds
+# is 8,640 units/day: inside the pool, and low enough to catch a short stream.
+MIN_YOUTUBE_INTERVAL_SECONDS = 60
+YOUTUBE_DAILY_QUOTA = 10000
+
 
 def invocation():
     """How this program was actually started, for help text and hints.
@@ -88,6 +100,24 @@ def load_credentials():
     return client_id, client_secret
 
 
+def load_youtube_key(required=True):
+    """The YouTube Data API key; environment wins, .env fills the gap.
+
+    Unlike load_credentials(), absence is only fatal when `required`, so the
+    Twitch commands keep working on a machine that never set YouTube up.
+    """
+    key = (os.environ.get("YOUTUBE_API_KEY")
+           or load_env_file().get("YOUTUBE_API_KEY"))
+    if not key and required:
+        sys.exit(
+            "Missing YOUTUBE_API_KEY.\n"
+            "Create one at https://console.cloud.google.com/apis/credentials\n"
+            "(enable \"YouTube Data API v3\" for the project first), then add it to\n"
+            "{} as:\n"
+            "  YOUTUBE_API_KEY=...".format(ENV_PATH))
+    return key or None
+
+
 def write_env(client_id, client_secret):
     with open(ENV_PATH, "w", encoding="utf-8") as handle:
         handle.write("# Twitch API credentials — created by `{} setup`\n".format(invocation()))
@@ -103,6 +133,18 @@ def resolve_channel(cli_value=None):
             or os.environ.get("TWITCH_CHANNEL")
             or load_env_file().get("TWITCH_CHANNEL")
             or DEFAULT_CHANNEL).strip()
+
+
+def resolve_youtube_channel(cli_value=None):
+    """Precedence: command line > YOUTUBE_CHANNEL env/.env > DEFAULT_YOUTUBE_CHANNEL.
+
+    The @ of a handle is stripped, so a value copied straight out of a channel
+    URL (@themeparkgiant) resolves the same as the bare name.
+    """
+    return (cli_value
+            or os.environ.get("YOUTUBE_CHANNEL")
+            or load_env_file().get("YOUTUBE_CHANNEL")
+            or DEFAULT_YOUTUBE_CHANNEL).strip().lstrip("@")
 
 
 def resolve_interval(cli_value=None):
@@ -146,6 +188,10 @@ def viewers_csv(channel):
 
 def metrics_csv(channel):
     return os.path.join(DATA_DIR, "metrics_{}.csv".format(channel_slug(channel)))
+
+
+def youtube_csv(channel):
+    return os.path.join(DATA_DIR, "youtube_{}.csv".format(channel_slug(channel)))
 
 
 def log_path(channel, kind="poll"):

@@ -10,12 +10,13 @@ import sys
 
 from . import __version__, config
 from .commands import (auth_cmd, chatters, followers, graph_cmd, poll, setup_cmd,
-                       testdata_cmd, users)
+                       testdata_cmd, users, youtube_cmd)
 
 COMMANDS = [
     ("setup", setup_cmd, "register credentials and verify them"),
     ("auth", auth_cmd, "browser login for endpoints needing a user token"),
     ("poll", poll, "record viewers, followers and chat size on an interval"),
+    ("youtube", youtube_cmd, "record YouTube live viewers and subscriber count"),
     ("graph", graph_cmd, "render collected samples as an SVG chart"),
     ("users", users, "account details for one or more logins"),
     ("followers", followers, "follower count, list, and follow checks"),
@@ -27,12 +28,14 @@ EPILOG = """
 examples:
   {prog} setup
   {prog} poll themeparkgiant
+  {prog} youtube themeparkgiant --once
   {prog} graph themeparkgiant --date today
   {prog} followers themeparkgiant --recent 10
   {prog} chatters themeparkgiant
 
 Every command takes the channel as its first argument, falling back to
-TWITCH_CHANNEL in .env and then the built-in default.
+TWITCH_CHANNEL in .env and then the built-in default — except `youtube`, which
+uses YOUTUBE_CHANNEL because a YouTube handle need not match the Twitch login.
 """
 
 

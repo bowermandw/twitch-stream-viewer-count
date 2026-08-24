@@ -5,37 +5,15 @@ a channel you moderate, so it degrades rather than blocking: without one the
 column is left blank and the other two carry on.
 """
 
-import os
-import signal
 import sys
-import threading
-import time
 import urllib.error
-from datetime import datetime, timedelta
 
-from .. import api, auth, config, storage, useroauth
+from .. import api, auth, config, runloop, storage, useroauth
 from ..logging import log, use_file
 
+# The loop itself, the tick alignment and the SIGTERM handling live in runloop,
+# shared with the YouTube poller. Only the sampling below is Twitch-specific.
 CHATTER_FAILURE_LIMIT = 3  # stop asking after this many consecutive failures
-
-# Set by SIGTERM/SIGHUP so the loop can finish the current sample and exit
-# cleanly. An Event rather than a flag because it also interrupts the sleep —
-# otherwise `systemctl stop` would wait out the whole interval and then SIGKILL.
-_stop = threading.Event()
-
-
-def _install_stop_handlers():
-    """Treat a service-manager stop like Ctrl-C rather than dying mid-write."""
-    def handler(signum, _frame):
-        _stop.set()
-    for name in ("SIGTERM", "SIGHUP"):
-        sig = getattr(signal, name, None)
-        if sig is None:
-            continue
-        try:
-            signal.signal(sig, handler)
-        except (OSError, ValueError):
-            pass  # not the main thread, or unsupported on this platform
 
 
 def add_arguments(parser):
@@ -191,13 +169,6 @@ def poll_once(state):
     return True
 
 
-def seconds_until_next_tick(interval):
-    """Sleep to the next wall-clock boundary so samples don't drift."""
-    now = datetime.now()
-    secs = now.hour * 3600 + now.minute * 60 + now.second + now.microsecond / 1e6
-    return interval - (secs % interval)
-
-
 def run(args):
     config.ensure_dirs()
     interval = config.resolve_interval(args.interval)
@@ -238,34 +209,4 @@ def run(args):
         poll_once(state)
         return 0
 
-    _stop.clear()
-    _install_stop_handlers()
-
-    log("start    polling {} every {}s -> {}".format(
-        channel, interval, os.path.basename(csv_path)))
-    log("start    Ctrl-C or SIGTERM to stop")
-
-    samples = 0
-    reason = "stopped"
-    try:
-        while not _stop.is_set():
-            if poll_once(state):
-                samples += 1
-            if _stop.is_set():
-                break
-            delay = seconds_until_next_tick(interval)
-            log("sleep    next poll at {}".format(
-                (datetime.now() + timedelta(seconds=delay)).strftime("%H:%M:%S")))
-            if _stop.wait(delay):  # returns early when asked to stop
-                break
-        else:
-            reason = "stopped"
-        if _stop.is_set():
-            reason = "signalled"
-    except KeyboardInterrupt:
-        print()
-        reason = "interrupted"
-
-    log("stop     {} after {} sample(s) -> {}".format(
-        reason, samples, os.path.basename(csv_path)))
-    return 0
+    return runloop.loop(interval, lambda: poll_once(state), channel, csv_path)

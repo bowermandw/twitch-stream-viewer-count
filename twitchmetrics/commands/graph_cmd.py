@@ -44,7 +44,7 @@ def pick_source(channel, viewers_only):
         # Recover the channel name from the filename so the chart isn't titled
         # "metrics_foo.csv" and named chart_metrics_foo_metrics.svg.
         stem = os.path.basename(channel)[:-4]
-        for prefix in ("metrics_", "viewers_"):
+        for prefix in ("metrics_", "viewers_", "youtube_"):
             if stem.startswith(prefix):
                 stem = stem[len(prefix):]
                 break

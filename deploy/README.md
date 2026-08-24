@@ -179,6 +179,31 @@ picks up the other's fresh token instead of rotating again.
 current sample, writes a summary line and exits 0 — it does not die mid-write,
 and it does not sit out the rest of the polling interval first.
 
+### The YouTube poller
+
+`youtube-metrics@.service` is a second template, set up the same way and running
+alongside the Twitch one rather than instead of it:
+
+```
+sudo cp deploy/youtube-metrics@.service /etc/systemd/system/
+sudoedit /etc/systemd/system/youtube-metrics@.service   # set User, Group, WorkingDirectory
+sudo systemctl daemon-reload
+
+sudo systemctl enable --now youtube-metrics@themeparkgiant
+```
+
+The name after the `@` is the YouTube handle — the `@name` in the channel URL,
+without the `@` — which need not match the Twitch login. Instances write
+`data/youtube_<channel>.csv` and `data/youtube_<channel>.log`, so a creator can
+be polled on both platforms at once with no shared files at all: this poller
+uses only `YOUTUBE_API_KEY`, and touches none of the cached Twitch tokens.
+
+The one thing to watch is quota rather than rate limiting. Each sample costs
+three of the 10,000 YouTube API units allowed per day, so the `--interval 300`
+in the unit is a budget decision: about 864 units a day per channel. The poller
+logs its projected daily usage at startup and refuses to run faster than every
+60 seconds.
+
 ### If it won't start
 
 `journalctl -u twitch-metrics@themeparkgiant -n 50` almost always says why. The
@@ -358,7 +383,7 @@ Not required for anything the project does.
 
 | Path | Contents |
 |---|---|
-| `data/` | sample CSVs, poll logs, cached tokens |
+| `data/` | sample CSVs (Twitch and YouTube), poll logs, cached tokens |
 | `charts/` | generated SVGs |
 | `.env` | credentials, mode 0600 |
 

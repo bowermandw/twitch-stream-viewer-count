@@ -22,12 +22,16 @@ GRID = "#303030"
 DIVIDER = "#303030"
 BUCKET_LINE = "#ffd166"
 
-# Each metric gets its own colour and axis treatment. Followers are not
-# zero-based: on a 0..750 axis, a 40-follower gain is an invisible flat line.
+# Each metric gets its own colour and axis treatment. Followers and subscribers
+# are not zero-based: on a 0..750 axis, a 40-follower gain is an invisible flat
+# line, and YouTube's three-significant-figure subscriber count is worse still.
+# available_metrics() drops the ones a file has no data for, so a Twitch CSV
+# charts followers and a YouTube one charts subscribers without being asked.
 METRICS = [
-    {"key": "viewers",   "label": "Concurrent viewers", "color": "#4fb3e8", "zero_based": True},
-    {"key": "chatters",  "label": "In chat",            "color": "#4ade80", "zero_based": True},
-    {"key": "followers", "label": "Followers",          "color": "#ffd166", "zero_based": False},
+    {"key": "viewers",     "label": "Concurrent viewers", "color": "#4fb3e8", "zero_based": True},
+    {"key": "chatters",    "label": "In chat",            "color": "#4ade80", "zero_based": True},
+    {"key": "followers",   "label": "Followers",          "color": "#ffd166", "zero_based": False},
+    {"key": "subscribers", "label": "Subscribers",        "color": "#ff6b6b", "zero_based": False},
 ]
 METRIC_BY_KEY = {m["key"]: m for m in METRICS}
 

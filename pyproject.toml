@@ -5,11 +5,11 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "twitch-metrics"
 version = "1.0.0"
-description = "Poll and chart Twitch channel viewers, followers and chat size"
+description = "Poll and chart Twitch and YouTube channel metrics"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "MIT" }
-keywords = ["twitch", "helix", "metrics", "viewers", "followers", "chart"]
+keywords = ["twitch", "helix", "youtube", "metrics", "viewers", "followers", "chart"]
 
 # No runtime dependencies, by design. Everything uses the Python standard
 # library, so there is nothing to install and nothing to keep patched.
