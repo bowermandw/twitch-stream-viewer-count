@@ -457,9 +457,9 @@ twitch-metrics daily --no-trends              # skip the multi-day charts
 […] start    daily report for 2026-08-24 — 2 channel(s) from the enabled systemd units
 […] testchannel  twitch   28 KB -> chart_testchannel_twitch_2026-08-24.svg
 […] testchannel  youtube  11 KB -> chart_testchannel_youtube_2026-08-24.svg
-[…] testchannel  twitch   -> http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com/twitch/2026-08-24.svg
-[…] testchannel  youtube  -> http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com/youtube/2026-08-24.svg
-[…] testchannel  page rebuilt from 3 day(s): http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com
+[…] testchannel  twitch   -> http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com/twitch/2026-08-24.svg
+[…] testchannel  youtube  -> http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com/youtube/2026-08-24.svg
+[…] testchannel  page rebuilt from 3 day(s): http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com
 […] skip     prgskidmark twitch — offline all day, nothing to chart
 […] stop     1 published, 1 dark in 4.1s
 ```
@@ -524,8 +524,14 @@ twitch-metrics s3 testchannel --url     # just the URL, for scripts
 ```
 
 ```
-http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com
+http://tm-<channel>-<suffix>.s3-website-<region>.amazonaws.com
 ```
+
+The address is written as a template on purpose. The site is public-read — that
+is what makes it a website — so the suffix is the only thing keeping it
+unlisted, and a real one does not belong in a repo that isn't private. Ask for
+your own with `s3 --url`; it is recorded in `data/.s3_buckets.json`, which is
+gitignored.
 
 The bucket holds nothing but the page and the charts:
 
