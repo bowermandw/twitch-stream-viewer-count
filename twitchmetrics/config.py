@@ -347,6 +347,105 @@ def resolve_youtube_interval(cli_value=None):
 
 
 # --------------------------------------------------------------------------
+# the database
+# --------------------------------------------------------------------------
+#
+# The samples live in Postgres now; data/*.csv is the spool the pollers fall
+# back to while it is unreachable. Neither value below has a built-in default,
+# because "no database on this machine" is a real and supported state -- it is
+# what the project shipped with, and keeping it working is what lets the
+# migration be done one box at a time.
+
+DEFAULT_DB_TIMEZONE = "UTC"
+
+
+def resolve_database_url():
+    """The Postgres connection string, or "" when none is configured.
+
+    TWITCH_DATABASE_URL first, then a bare DATABASE_URL. The second is honoured
+    for the same reason resolve_aws_region() honours AWS_DEFAULT_REGION: it is
+    the name hosts, compose files and migration tools already set, and a machine
+    that has the value should not need a second copy under our own prefix.
+
+    Prefer host:port to a Unix socket. The shipped units set
+    ProtectSystem=strict with ReadWritePaths covering only data/ and charts/,
+    and connecting to a socket needs write access to /run/postgresql -- so a
+    postgresql:///name DSN fails there with an error that reads like an
+    authentication problem. host:port also survives the database moving.
+    """
+    from_file = load_env_file()
+    return (os.environ.get("TWITCH_DATABASE_URL")
+            or from_file.get("TWITCH_DATABASE_URL")
+            or os.environ.get("DATABASE_URL")
+            or from_file.get("DATABASE_URL")
+            or "").strip()
+
+
+def resolve_db_timezone(cli_value=None):
+    """The IANA zone the report tables call a day, e.g. Europe/London.
+
+    This has to agree with Python, and it is the likeliest source of quiet
+    wrongness in the whole migration. chart.select_day(), chart.days_present()
+    and trends._live_on() all decide what day a sample belongs to with
+    `when.astimezone().date()` -- the MACHINE's local zone. If the report tables
+    bucket in a different one, they and the charts disagree about every stream
+    that crosses midnight, and nothing anywhere raises.
+
+    So the default is discovered rather than assumed, in the order that yields a
+    name Postgres will actually accept:
+
+        TWITCH_TIME_ZONE   said explicitly, and it wins
+        TZ                 what the environment already says
+        /etc/timezone      where Debian keeps the name, and Debian is the deploy
+                           target. datetime knows the local OFFSET but often only
+                           an abbreviation ("BST") for the name, and Postgres
+                           will not take an abbreviation.
+        /etc/localtime     macOS and systemd boxes have no /etc/timezone and
+                           point this symlink into the zoneinfo tree instead.
+        UTC                a last resort, at least never ambiguous
+
+    `db --init` validates whatever comes out of this against the server, so a
+    typo fails at setup instead of shifting days silently for a month.
+    """
+    explicit = (cli_value
+                or os.environ.get("TWITCH_TIME_ZONE")
+                or load_env_file().get("TWITCH_TIME_ZONE"))
+    if explicit:
+        return explicit.strip()
+    from_env = (os.environ.get("TZ") or "").strip()
+    if from_env:
+        return from_env
+    try:
+        with open("/etc/timezone", encoding="utf-8") as handle:
+            found = handle.read().strip()
+        if found:
+            return found
+    except OSError:
+        pass
+    return _zone_from_localtime() or DEFAULT_DB_TIMEZONE
+
+
+# Everything after the zoneinfo directory is the name, however many components
+# it has. Taking a fixed two would turn America/Indiana/Indianapolis -- a real
+# zone, and this developer's own -- into Indiana/Indianapolis, which Postgres
+# rejects, so `db --init` would fail rather than quietly using the wrong day
+# boundary. Loud either way, but there is no reason to be wrong first.
+_ZONEINFO_MARKER = "zoneinfo/"
+
+
+def _zone_from_localtime(path="/etc/localtime"):
+    """The zone name /etc/localtime points at, or "" if it points nowhere useful."""
+    try:
+        target = os.path.realpath(path)
+    except OSError:
+        return ""
+    marker = target.rfind(_ZONEINFO_MARKER)
+    if marker < 0:
+        return ""
+    return target[marker + len(_ZONEINFO_MARKER):].strip("/")
+
+
+# --------------------------------------------------------------------------
 # per-channel file names
 # --------------------------------------------------------------------------
 

@@ -1,10 +1,26 @@
-# Nothing to install for polling or charting.
+# Nothing to install for collecting.
 #
-# Collecting and charting deliberately use only the Python standard library —
-# urllib for HTTP, csv for storage, and hand-built SVG for the charts. A server
-# that only runs the pollers needs nothing but Python.
+# The parts that matter deliberately use only the Python standard library —
+# urllib for HTTP, csv for the spool, and hand-built SVG for the charts. A
+# server that only runs the pollers needs nothing but Python, because a poller
+# that cannot reach the database writes to data/*.csv instead and replays later.
 #
-# Publishing the daily report to S3 is the single exception:
+# Charting a CSV by hand needs nothing either:
+#
+#     python3 -m twitchmetrics graph data/metrics_yourchannel.csv
+#
+# Charting a CHANNEL reads the database, and that needs psycopg.
+#
+# Reading and writing the sample database is one exception:
+#
+#     pip install 'psycopg[binary]'   # or: pip install -e '.[pg]'
+#
+# It is imported lazily, so a machine that only collects still needs nothing: a
+# poller whose database is unreachable appends to data/*.csv exactly as it
+# always did, and replays the gap when it comes back. Only `graph`, `daily` and
+# `db` require it.
+#
+# Publishing the daily report to S3 is the other:
 #
 #     pip install boto3            # or: pip install -e '.[aws]'
 #

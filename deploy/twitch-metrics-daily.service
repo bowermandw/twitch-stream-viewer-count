@@ -50,14 +50,21 @@
 [Unit]
 Description=Twitch and YouTube metrics daily chart and website publish
 Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
+# Requires, unlike the pollers: the report READS the samples and
+# deliberately has no CSV fallback, so without the database there is
+# nothing for it to chart and it should not start at all.
+Requires=postgresql.service
 
 [Service]
 Type=oneshot
 User=twitch
 Group=twitch
 WorkingDirectory=/opt/twitch-metrics
+# Needs psycopg (it reads the samples) and boto3 (it publishes). If those
+# live in a venv, name that Python here instead:
+#   ExecStart=/opt/twitch-metrics/.venv/bin/python -m twitchmetrics daily
 ExecStart=/usr/bin/python3 -m twitchmetrics daily
 
 # One report per day. A wedged upload should fail and be visible, not sit here

@@ -12,19 +12,60 @@ needed, nothing to keep patched. The project uses only the standard library:
 python3 --version      # 3.9+
 ```
 
-That's the whole Python dependency list. `requirements.txt` is intentionally
-empty and says so.
+That is the whole dependency list for a box that only collects, because a poller
+that cannot reach the database writes to `data/*.csv` instead and replays the gap
+later. `requirements.txt` is intentionally empty and explains itself.
 
-**One pip package, only if you want the [daily report](#daily-report):**
+**Two pip packages, each only for what it names:**
 
 ```
-pip install boto3             # publishing to S3; nothing else needs it
+pip install 'psycopg[binary]'   # reading and writing the sample database
+pip install boto3               # publishing the daily report to S3
 ```
 
-It is imported lazily, so a box that only polls never needs it and the CLI works
-in full without it. No system packages at all: the report publishes SVG, which
+Both are imported lazily, so a box that only polls needs neither and the CLI
+works in full without them. `[binary]` ships a prebuilt libpq wheel — no
+`apt install`, no compiler. No system packages at all: the report publishes SVG, which
 browsers render natively, so `rsvg-convert` and a font package — both PNG
 requirements — are no longer involved.
+
+## The database
+
+The pollers write samples to PostgreSQL and fall back to `data/*.csv` when they
+cannot reach it, replaying the gap themselves once it answers. Two things about
+that are worth knowing before you debug the wrong problem.
+
+**A CSV that has stopped growing is the healthy state.** It is a spool now. Every
+habit built on `tail -f data/metrics_x.csv` and `wc -l data/*.csv` has inverted:
+a file sitting at the same size means every sample is reaching the database. Ask
+the database instead:
+
+```
+twitch-metrics db --status
+```
+
+**Use `host:port`, never a Unix socket.** All three units here set
+`ProtectSystem=strict` with `ReadWritePaths=` covering only `data/` and
+`charts/`. Debian's socket lives in `/run/postgresql`, and connecting to a socket
+needs *write* access to that directory — so `postgresql:///twitchmetrics` fails
+with an error that reads like a `pg_hba.conf` problem and is not one. Either:
+
+```
+TWITCH_DATABASE_URL=postgresql://twitch:PASSWORD@127.0.0.1:5432/twitchmetrics
+```
+
+or add `ReadWritePaths=/run/postgresql` to each unit. The first is better: it is
+also what keeps working the day the database moves to another host.
+
+**Back it up.** `data/` used to hold the only irreplaceable thing on the machine;
+the database does now:
+
+```
+0 3 * * *  pg_dump --format=custom twitchmetrics > /var/backups/tm-$(date +\%F).dump
+```
+
+Note the escaped `%` — cron treats a bare one as a newline.
+
 
 ## Install
 
@@ -553,7 +594,8 @@ Never rotate `data/*.csv`. That is the actual data.
 
 | Path | Contents |
 |---|---|
-| `data/` | sample CSVs (Twitch and YouTube), poll logs, `daily.log`, cached tokens, `.s3_buckets.json` |
+| PostgreSQL | the samples, the broadcasts and the report tables — the irreplaceable part |
+| `data/` | the CSV spool (written only during an outage), poll logs, `daily.log`, cached tokens, `.s3_buckets.json` |
 | `charts/` | generated SVGs, which is what `daily` publishes |
 | `.env` | credentials, mode 0600 |
 
@@ -568,8 +610,15 @@ TWITCH_DATA_DIR=/var/lib/twitch-metrics python3 -m twitchmetrics poll
 
 ## Backups
 
-`data/*.csv` is the only irreplaceable thing here — charts regenerate from it,
-and so does every page in S3.
+**The database is the irreplaceable thing now.** Charts regenerate from it and so
+does every page in S3, but nothing regenerates the samples.
+
+```
+0 3 * * *  pg_dump --format=custom twitchmetrics > /var/backups/tm-$(date +\%F).dump
+```
+
+`data/*.csv` is no longer the archive — it is a spool that is empty whenever the
+database is reachable, so backing it up protects nothing. Back up the dump.
 
 `data/.s3_buckets.json` is worth keeping too. It is not a secret, but it is the
 only record of which random bucket name belongs to which channel; lose it and

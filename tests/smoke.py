@@ -21,7 +21,30 @@ from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from twitchmetrics import (chart, config, drive, driveoauth, png, retry, s3,  # noqa: E402
+# Cleared before anything imports or runs, and cleared out of os.environ itself
+# rather than out of each subprocess's env dict.
+#
+# The suite starts subprocesses two ways: some build `dict(os.environ, ...)` and
+# some inherit the environment whole. Once the pollers write to Postgres, ANY of
+# those that reaches `poll --once` would write into whatever database the
+# developer happens to have configured. Popping it here covers both kinds at
+# once and, unlike a rule about remembering to pop it, cannot be forgotten by
+# the next test somebody adds.
+#
+# The tests that write data already point TWITCH_ENV_FILE at a scratch file, so
+# the .env half of the same trap is covered. A database-backed check below opts
+# back in deliberately, through TWITCH_TEST_DATABASE_URL and never this one.
+_REAL_DB_URL = os.environ.pop("TWITCH_DATABASE_URL", None)
+os.environ.pop("DATABASE_URL", None)
+
+# The throw-away database, read once here so every section can ask for it.
+# Never TWITCH_DATABASE_URL: a separate name is what makes it impossible for a
+# test run to find real data.
+_TEST_DB_URL = os.environ.get("TWITCH_TEST_DATABASE_URL", "").strip()
+if _REAL_DB_URL and _TEST_DB_URL == _REAL_DB_URL:
+    _TEST_DB_URL = ""
+
+from twitchmetrics import (chart, config, db, drive, driveoauth, png, retry, s3,  # noqa: E402
                           storage, trends, youtube)
 from twitchmetrics.commands import daily  # noqa: E402
 
@@ -83,6 +106,22 @@ def raises(kind, function, *args, **kwargs):
     except Exception:  # noqa: BLE001
         return False
     return False
+
+
+def refusal(function, *args, **kwargs):
+    """The message a SystemExit carried, or "" if it didn't raise one.
+
+    raises() answers "did it refuse"; several things here refuse for three
+    different reasons and the useful assertion is WHICH, since each has a
+    different fix.
+    """
+    try:
+        function(*args, **kwargs)
+    except SystemExit as exc:
+        return str(exc)
+    except Exception as exc:  # noqa: BLE001
+        return "unexpected {}: {}".format(type(exc).__name__, exc)
+    return ""
 
 
 def sample(when, live):
@@ -478,10 +517,26 @@ check("-m help says 'python3 -m twitchmetrics'",
       "usage: python3 -m twitchmetrics" in result.stdout)
 check("-m help doesn't claim the console script name",
       "twitch-metrics setup" not in result.stdout)
-result = subprocess.run([sys.executable, "-m", "twitchmetrics", "graph", "no_such_channel_xyz"],
+# Against a path, because a bare channel name now reaches the database first
+# and a machine with none configured is told about that instead. Both messages
+# have to name the invocation actually used, so both are checked.
+result = subprocess.run([sys.executable, "-m", "twitchmetrics", "graph",
+                         os.path.join(tempfile.gettempdir(), "no_such_file_xyz.csv")],
                         cwd=root, capture_output=True, text=True)
 check("runtime hints use the same invocation",
-      "python3 -m twitchmetrics poll" in (result.stdout + result.stderr))
+      "python3 -m twitchmetrics poll" in (result.stdout + result.stderr),
+      (result.stdout + result.stderr).strip()[:160])
+with no_env_file() as _empty_env:
+    _r = subprocess.run(
+        [sys.executable, "-m", "twitchmetrics", "graph", "no_such_channel_xyz"],
+        cwd=root, capture_output=True, text=True,
+        env={k: v for k, v in dict(os.environ, TWITCH_ENV_FILE=_empty_env).items()
+             if k not in ("TWITCH_DATABASE_URL", "DATABASE_URL")})
+    check("and so does the no-database message",
+          "python3 -m twitchmetrics db --init" in (_r.stdout + _r.stderr),
+          (_r.stdout + _r.stderr).strip()[:160])
+    check("charting a channel with no database is a refusal, not a silent CSV read",
+          _r.returncode != 0)
 
 # --- date keywords --------------------------------------------------------
 section("date keywords")
@@ -569,41 +624,69 @@ with tempfile.TemporaryDirectory() as tmp:
         return subprocess.run([sys.executable, "-m", "twitchmetrics", "daily"] + argv,
                               cwd=root, capture_output=True, text=True, env=env)
 
+    # The report reads from Postgres and deliberately does not fall back to the
+    # CSVs, so with none configured it must refuse -- loudly, and before it
+    # renders anything. This half needs no database and always runs.
     _r = _daily(["breaktest", "--date", "2026-08-21", "--dry-run"])
-    check("daily --dry-run exits 0 when a platform has data", _r.returncode == 0,
-          (_r.stderr or _r.stdout).strip()[-200:])
-    check("it renders the YouTube day",
-          os.path.exists(os.path.join(tmp, "chart_breaktest_youtube_2026-08-21.svg")))
-    check("charts are named per platform, so the two can't overwrite each other",
-          "chart_breaktest_twitch_2026-08-21.svg"
-          != "chart_breaktest_youtube_2026-08-21.svg")
-    check("no PNG is written — the website serves SVG",
-          not glob.glob(os.path.join(tmp, "*.png")))
-    check("no .part file is left behind", not glob.glob(os.path.join(tmp, "*.part")))
-    check("--dry-run needs no AWS credentials",
-          "AWS_ACCESS_KEY_ID" not in (_r.stdout + _r.stderr))
-    check("--dry-run publishes nothing", "s3-website" not in (_r.stdout + _r.stderr))
-    check("the summary is the last line", "stop " in _r.stdout.strip().splitlines()[-1])
-    check("it logs to data/daily.log", os.path.exists(os.path.join(tmp, "daily.log")))
+    check("daily refuses when no database is configured", _r.returncode != 0)
+    check("and says which variable to set",
+          "TWITCH_DATABASE_URL" in (_r.stdout + _r.stderr))
+    check("and renders nothing first",
+          not glob.glob(os.path.join(tmp, "*.svg")),
+          "the preflight has to come before the first render")
 
-    _r = _daily(["breaktest", "--date", "2026-08-19", "--dry-run"])
-    check("the other platform's day renders too",
-          os.path.exists(os.path.join(tmp, "chart_breaktest_twitch_2026-08-19.svg")))
+    # Everything below needs somewhere to read the samples from. _env is
+    # MUTATED rather than rebound, because _daily() captured this exact dict as
+    # a default argument.
+    if not _TEST_DB_URL:
+        skipped("daily render",
+                "set TWITCH_TEST_DATABASE_URL to a throw-away database to run these")
+    else:
+        _env["TWITCH_DATABASE_URL"] = _TEST_DB_URL
+        # The fixtures, loaded exactly the way a real migration loads them.
+        for _argv in (["--init"], ["--import", "--all"]):
+            _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "db"] + _argv,
+                                cwd=root, capture_output=True, text=True, env=_env)
+            check("db {} prepares the fixtures".format(_argv[0].lstrip("-")),
+                  _r.returncode == 0, (_r.stderr or _r.stdout).strip()[-200:])
 
-    # A channel with no CSV for one platform at all: not applicable, not broken.
-    _shutil.copy(YOUTUBE, os.path.join(tmp, "youtube_ytonly.csv"))
-    _r = _daily(["ytonly", "--date", "2026-08-21", "--dry-run"])
-    check("a channel polled on one platform only still exits 0", _r.returncode == 0,
-          (_r.stderr or _r.stdout).strip()[-200:])
-    check("and says nothing at all about the platform it isn't polled on",
-          "WARN" not in _r.stdout, _r.stdout.strip()[-200:])
-    check("backfilling a day one platform has no rows for is a skip, not a fault",
-          "nothing to backfill" in _r.stdout or "WARN" not in _r.stdout)
+        _r = _daily(["breaktest", "--date", "2026-08-21", "--dry-run"])
+        check("daily --dry-run exits 0 when a platform has data", _r.returncode == 0,
+              (_r.stderr or _r.stdout).strip()[-200:])
+        check("it renders the YouTube day",
+              os.path.exists(os.path.join(tmp, "chart_breaktest_youtube_2026-08-21.svg")))
+        check("charts are named per platform, so the two can't overwrite each other",
+              "chart_breaktest_twitch_2026-08-21.svg"
+              != "chart_breaktest_youtube_2026-08-21.svg")
+        check("no PNG is written — the website serves SVG",
+              not glob.glob(os.path.join(tmp, "*.png")))
+        check("no .part file is left behind", not glob.glob(os.path.join(tmp, "*.part")))
+        check("--dry-run needs no AWS credentials",
+              "AWS_ACCESS_KEY_ID" not in (_r.stdout + _r.stderr))
+        check("--dry-run publishes nothing", "s3-website" not in (_r.stdout + _r.stderr))
+        check("the summary is the last line", "stop " in _r.stdout.strip().splitlines()[-1])
+        check("it logs to data/daily.log", os.path.exists(os.path.join(tmp, "daily.log")))
 
-    _r = _daily(["breaktest", "nosuchchannel", "--date", "2026-08-21", "--dry-run"])
-    check("one bad channel makes it exit 1", _r.returncode == 1)
-    check("the good channel still ran", "breaktest" in _r.stdout)
-    check("and the failure is named", "nosuchchannel" in _r.stdout)
+        _r = _daily(["breaktest", "--date", "2026-08-19", "--dry-run"])
+        check("the other platform's day renders too",
+              os.path.exists(os.path.join(tmp, "chart_breaktest_twitch_2026-08-19.svg")))
+
+        # A channel polled on one platform only: not applicable, not broken.
+        _shutil.copy(YOUTUBE, os.path.join(tmp, "youtube_ytonly.csv"))
+        subprocess.run([sys.executable, "-m", "twitchmetrics", "db", "--import", "--all"],
+                       cwd=root, capture_output=True, text=True, env=_env)
+        _r = _daily(["ytonly", "--date", "2026-08-21", "--dry-run"])
+        check("a channel polled on one platform only still exits 0", _r.returncode == 0,
+              (_r.stderr or _r.stdout).strip()[-200:])
+        check("and says nothing at all about the platform it isn't polled on",
+              "WARN" not in _r.stdout, _r.stdout.strip()[-200:])
+        check("backfilling a day one platform has no rows for is a skip, not a fault",
+              "nothing to backfill" in _r.stdout or "WARN" not in _r.stdout)
+
+        _r = _daily(["breaktest", "nosuchchannel", "--date", "2026-08-21", "--dry-run"])
+        check("one bad channel makes it exit 1", _r.returncode == 1)
+        check("the good channel still ran", "breaktest" in _r.stdout)
+        check("and the failure is named", "nosuchchannel" in _r.stdout)
 
 # --- daily: preflight fails loudly ----------------------------------------
 section("daily preflight")
@@ -617,12 +700,20 @@ with tempfile.TemporaryDirectory() as tmp:
                  TWITCH_ENV_FILE=os.path.join(tmp, ".env"),
                  TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"))
     _bare.pop("TWITCH_DAILY_CHANNELS", None)
-    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
-                         "--date", "2026-08-21", "--dry-run"],
-                        cwd=root, capture_output=True, text=True, env=_bare)
-    check("a missing rsvg-convert no longer matters", _r.returncode == 0,
-          (_r.stderr or _r.stdout).strip()[-200:])
-    check("and nothing mentions it", "librsvg" not in (_r.stdout + _r.stderr))
+    if not _TEST_DB_URL:
+        skipped("a missing rsvg-convert no longer matters", "needs a test database")
+    else:
+        _bare["TWITCH_DATABASE_URL"] = _TEST_DB_URL
+        subprocess.run([sys.executable, "-m", "twitchmetrics", "db", "--init"],
+                       cwd=root, capture_output=True, text=True, env=_bare)
+        subprocess.run([sys.executable, "-m", "twitchmetrics", "db", "--import", "--all"],
+                       cwd=root, capture_output=True, text=True, env=_bare)
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "daily", "breaktest",
+                             "--date", "2026-08-21", "--dry-run"],
+                            cwd=root, capture_output=True, text=True, env=_bare)
+        check("a missing rsvg-convert no longer matters", _r.returncode == 0,
+              (_r.stderr or _r.stdout).strip()[-200:])
+        check("and nothing mentions it", "librsvg" not in (_r.stdout + _r.stderr))
     _empty = dict(os.environ, TWITCH_DATA_DIR=tmp, TWITCH_CHARTS_DIR=tmp,
                   TWITCH_DAILY_CHANNELS="",
                   TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"))
@@ -1044,15 +1135,26 @@ with tempfile.TemporaryDirectory() as tmp:
                      TWITCH_SYSTEMD_WANTS_DIR=os.path.join(tmp, "none"),
                      TWITCH_CLIENT_ID="x", TWITCH_CLIENT_SECRET="y")
     _poisoned.pop("TWITCH_DAILY_CHANNELS", None)
-    for _label, _argv in [
+    _cases = [
         ("the help still works", ["--help"]),
         ("graph still works", ["graph", YOUTUBE, "--output", os.path.join(tmp, "a.svg")]),
         ("youtube --help still works", ["youtube", "--help"]),
         ("poll --once still runs", ["poll", "nochannel", "--once", "--viewers-only"]),
         ("daily --list-channels still works", ["daily", "--list-channels", "breaktest"]),
-        ("daily --dry-run still renders", ["daily", "breaktest", "--date", "2026-08-21",
-                                           "--dry-run"]),
-    ]:
+    ]
+    # Rendering reads the samples, so this one needs somewhere to read them
+    # from. The point it is making -- that boto3 is not required to render -- is
+    # unrelated to storage, but it cannot be made without a store.
+    if not _TEST_DB_URL:
+        skipped("daily --dry-run still renders", "needs a test database")
+    else:
+        _poisoned["TWITCH_DATABASE_URL"] = _TEST_DB_URL
+        for _prep in (["--init"], ["--import", "--all"]):
+            subprocess.run([sys.executable, "-m", "twitchmetrics", "db"] + _prep,
+                           cwd=root, capture_output=True, text=True, env=_poisoned)
+        _cases.append(("daily --dry-run still renders",
+                       ["daily", "breaktest", "--date", "2026-08-21", "--dry-run"]))
+    for _label, _argv in _cases:
         _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
                             cwd=root, capture_output=True, text=True, env=_poisoned)
         check("without boto3, " + _label, _r.returncode == 0,
@@ -1352,6 +1454,412 @@ check("it no longer demands rsvg-convert", "librsvg2-bin" not in _svc)
 check("nor a font package", "fonts-dejavu" not in _svc)
 check("it names what publishing does need", "boto3" in _svc)
 check("and where the AWS keys come from", "AWS_ACCESS_KEY_ID" in _svc)
+
+# --- psycopg stays optional -----------------------------------------------
+section("psycopg stays optional")
+_db_src = open(os.path.join(root, "twitchmetrics/db.py")).read()
+check("psycopg is imported inside a function, never at module scope",
+      "\nimport psycopg" not in _db_src and "    import psycopg" in _db_src)
+check("the failure names the fix", "pip install 'psycopg[binary]'" in _db_src)
+_imports_pg = re.compile(r"^\s*(import|from)\s+psycopg\b", re.M)
+check("only db.py imports it at all",
+      [m for m in ("db.py", "storage.py", "config.py", "cli.py", "chart.py",
+                   "trends.py", "commands/db_cmd.py", "commands/poll.py",
+                   "commands/youtube_cmd.py", "commands/daily.py",
+                   "commands/graph_cmd.py")
+       if _imports_pg.search(open(os.path.join(root, "twitchmetrics", m)).read())]
+      == ["db.py"])
+
+# The part no amount of reading the source can prove: that the CLI actually
+# starts on a machine where psycopg cannot be imported. cli.py imports every
+# command module at startup, so a module-scope import anywhere in the chain
+# would take `--help` down with it.
+with tempfile.TemporaryDirectory() as tmp:
+    with open(os.path.join(tmp, "psycopg.py"), "w") as _h:
+        _h.write("raise ImportError('psycopg is not installed')\n")
+    open(os.path.join(tmp, ".env"), "w").close()
+    _shutil4 = __import__("shutil")
+    _shutil4.copy(YOUTUBE, os.path.join(tmp, "youtube_breaktest.csv"))
+    _pgless = dict(os.environ, PYTHONPATH=tmp, TWITCH_DATA_DIR=tmp,
+                   TWITCH_CHARTS_DIR=tmp, TWITCH_ENV_FILE=os.path.join(tmp, ".env"))
+    for _label, _argv in [
+            ("the help still works", ["--help"]),
+            ("db --help still works", ["db", "--help"]),
+            ("graph on a .csv path still works",
+             ["graph", os.path.join(tmp, "youtube_breaktest.csv"),
+              "--output", os.path.join(tmp, "out.svg")]),
+    ]:
+        _r = subprocess.run([sys.executable, "-m", "twitchmetrics"] + _argv,
+                            cwd=root, capture_output=True, text=True, env=_pgless)
+        check(_label, _r.returncode == 0, _r.stderr.strip()[:120])
+
+    # And asking for the database says how to install it, rather than
+    # tracebacking about an import.
+    _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "db", "--init"],
+                        cwd=root, capture_output=True, text=True,
+                        env=dict(_pgless, TWITCH_DATABASE_URL="postgresql://127.0.0.1:1/x"))
+    check("db --init without psycopg says how to install it",
+          "psycopg[binary]" in (_r.stdout + _r.stderr))
+    check("and does not traceback about it",
+          "Traceback" not in _r.stderr, _r.stderr.strip()[:120])
+
+# --- the schema files ship ------------------------------------------------
+section("the schema files ship")
+# The failure mode is a file that is present in a checkout and absent from an
+# install, so the only defence is a test that opens it.
+check("db.SQL_DIR exists", os.path.isdir(db.SQL_DIR))
+_files = db.sql_files()
+check("there is at least one numbered file", len(_files) >= 1)
+check("they are numbered in order",
+      [v for v, _, _ in _files] == sorted(v for v, _, _ in _files))
+check("pyproject ships them as package data",
+      'twitchmetrics = ["sql/*.sql"]' in open(os.path.join(root, "pyproject.toml")).read())
+for _version, _name, _path in _files:
+    _sql = open(_path, encoding="utf-8").read()
+    check("{} is not empty".format(_name), _sql.strip())
+    check("{} creates things idempotently".format(_name),
+          "IF NOT EXISTS" in _sql or "OR REPLACE" in _sql)
+check("no sample table stores a local date",
+      not re.search(r"local_date[^)\n]*GENERATED", open(_files[0][2]).read()))
+
+# --- database configuration -----------------------------------------------
+section("database configuration")
+check("a password never survives redaction",
+      "hunter2" not in db.redact("postgresql://u:hunter2@h:5432/d"))
+check("but the host does, so the message is still useful",
+      "h:5432" in db.redact("postgresql://u:hunter2@h:5432/d"))
+check("a DSN with no password is left alone",
+      db.redact("postgresql://h:5432/d") == "postgresql://h:5432/d")
+with no_env_file():
+    # Inside no_env_file, because clearing the environment is only half of it:
+    # config.load_env_file() still reads the real .env, and on a machine that
+    # has been set up that file now names a live database. This check asserted
+    # "nothing is configured" and quietly started reading the developer's own
+    # connection string the day they configured one.
+    check("nothing configured redacts to something readable",
+          db.where() == "(nothing configured)", db.where())
+
+# The suite popped these at import; prove it, because the whole point is that a
+# test run cannot reach the developer's real database.
+check("the suite cleared TWITCH_DATABASE_URL from its own environment",
+      "TWITCH_DATABASE_URL" not in os.environ)
+check("and DATABASE_URL with it", "DATABASE_URL" not in os.environ)
+with no_env_file():
+    check("so nothing is configured", not db.configured())
+    os.environ["DATABASE_URL"] = "postgresql://x@127.0.0.1:5432/y"
+    check("DATABASE_URL is honoured when it is set", db.configured())
+    os.environ["TWITCH_DATABASE_URL"] = "postgresql://a@127.0.0.1:5432/b"
+    check("but TWITCH_DATABASE_URL wins over it", db.dsn().endswith("/b"))
+    for _k in ("DATABASE_URL", "TWITCH_DATABASE_URL"):
+        os.environ.pop(_k, None)
+
+check("the connect timeout fits inside the shortest poll interval",
+      db.CONNECT_TIMEOUT < config.MIN_INTERVAL_SECONDS,
+      "{}s vs {}s".format(db.CONNECT_TIMEOUT, config.MIN_INTERVAL_SECONDS))
+check("and the retry cooldown does not outlast the default interval",
+      db.RETRY_COOLDOWN <= config.DEFAULT_INTERVAL_SECONDS)
+
+# The timezone the report tables will bucket by has to agree with the zone the
+# charts already use, or every stream crossing midnight lands on the wrong date
+# and nothing raises. This is the check that catches that.
+_zone_name = config.resolve_db_timezone()
+check("a reporting timezone is discovered", bool(_zone_name))
+try:
+    from zoneinfo import ZoneInfo as _ZoneInfo
+    _zone = _ZoneInfo(_zone_name)
+except Exception as _exc:                                    # noqa: BLE001
+    check("the discovered zone is a real IANA zone", False, "{}: {}".format(_zone_name, _exc))
+else:
+    check("the discovered zone is a real IANA zone", True)
+    # A year of hourly instants covers both DST transitions in either hemisphere.
+    _disagree = [w for w in
+                 (datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(hours=h)
+                  for h in range(0, 24 * 365, 3))
+                 if w.astimezone().date() != w.astimezone(_zone).date()]
+    check("it calls a day the same day chart.py does", not _disagree,
+          "{} disagreement(s), e.g. {}".format(
+              len(_disagree), _disagree[0] if _disagree else ""))
+check("a three-part zone name survives discovery",
+      config._zone_from_localtime.__doc__ is not None)
+
+# Port 1 refuses instantly everywhere, so "configured but down" needs no server
+# and no waiting.
+with no_env_file():
+    os.environ["TWITCH_DATABASE_URL"] = "postgresql://127.0.0.1:1/nothing"
+    db.reset()
+    _ok, _why = db.probe()
+    check("an unreachable database is a failure, not a silent CSV read", not _ok)
+    check("and it says so in one line", _why and "\n" not in _why, repr(_why)[:120])
+    # The three states a reader can be in are told apart, because each has a
+    # different fix and the wrong message sends you looking in the wrong place.
+    check("an unreachable database is reported as unreachable",
+          "Cannot reach" in refusal(db.require_readable))
+    os.environ.pop("TWITCH_DATABASE_URL", None)
+    db.reset()
+    check("and no database at all is reported as not configured",
+          "No database is configured" in refusal(db.require_readable))
+
+# --- postgres round trip --------------------------------------------------
+section("postgres round trip")
+_test_dsn = os.environ.get("TWITCH_TEST_DATABASE_URL", "").strip()
+if not _test_dsn:
+    skipped("postgres round trip",
+            "set TWITCH_TEST_DATABASE_URL to a throw-away database to run these")
+elif _REAL_DB_URL and _test_dsn == _REAL_DB_URL:
+    skipped("postgres round trip",
+            "TWITCH_TEST_DATABASE_URL is the real database; refusing to touch it")
+else:
+    os.environ["TWITCH_DATABASE_URL"] = _test_dsn
+    db.close()
+    db.reset()
+    _ok, _why = db.probe()
+    if not _ok:
+        skipped("postgres round trip", _why)
+    else:
+        # "Reachable" and "usable" are different things, and saying which you
+        # have is the difference between a one-line fix and an afternoon in
+        # pg_hba.conf. Checked against the server's own maintenance database,
+        # which is certainly reachable and certainly has no tm schema — rather
+        # than by dropping this one's, which earlier sections are still using.
+        _plain = _TEST_DB_URL.rsplit("/", 1)[0] + "/postgres"
+        os.environ["TWITCH_DATABASE_URL"] = _plain
+        db.close(); db.reset()
+        _said = refusal(db.require_readable)
+        if "Cannot reach" in _said:
+            skipped("an empty database is not reported as unreachable",
+                    "no reachable database without a tm schema to test against")
+        else:
+            check("an empty database is not reported as unreachable",
+                  "has no tables yet" in _said, _said.splitlines()[0][:120])
+        os.environ["TWITCH_DATABASE_URL"] = _TEST_DB_URL
+        db.close(); db.reset()
+
+        check("the schema applies", db.apply_schema(log=lambda _m: None) >= 0)
+        check("and then it is readable", db.require_readable() is None)
+        check("applying it twice changes nothing", db.apply_schema(log=lambda _m: None) == 0)
+        check("every file is recorded as applied",
+              all(applied for _, _, applied in db.schema_state()))
+        # The invariant the site depends on, enforced by the database rather
+        # than by whoever writes the next refresh function.
+        _refused = False
+        try:
+            db.execute(
+                "INSERT INTO tm.report_daily_peak (channel_id, tz, local_date, "
+                "platform, status, peak_viewers, peak_at, sample_count, "
+                "live_sample_count, viewer_sample_count) VALUES "
+                "(-1, 'UTC', '2026-01-01', 'twitch', 'dark', 0, now(), 1, 0, 0)")
+        except db.Unreachable:
+            _refused = True
+        check("a day with no stream cannot be given a peak of zero", _refused)
+        check("the server knows the reporting timezone",
+              db.execute("SELECT now() AT TIME ZONE %s", (_zone_name,), fetch=True))
+
+        # The whole migration, on the committed fixtures: import them, then
+        # prove the database gives back exactly what read_samples() gives back.
+        # Comparing the DICTS rather than the columns is the point -- a dict is
+        # what every chart consumes, so an equal dict is a statement about
+        # charts and not merely about storage.
+        from twitchmetrics import store  # noqa: PLC0415 - needs a live database
+        for _fixture, _platform in ((PLAIN, "twitch"), (YOUTUBE, "youtube")):
+            _slug = "smoke_" + os.path.basename(_fixture)[:-4].split("_", 1)[1]
+            _rows = list(storage.read_raw(_fixture))
+            _acct = store.account_id(_slug, _platform, timezone_name=_zone_name)
+            for _fields in sorted(_rows, key=lambda r: r["timestamp_utc"]):
+                store.record(_platform, _acct, _fields, source="fixture")
+            _want = storage.read_samples(_fixture)
+            _got = store.read(_slug, _platform)
+            check("{} round-trips through Postgres".format(
+                os.path.basename(_fixture)), _want == _got,
+                "{} in, {} out".format(len(_want), len(_got)))
+            # Re-importing must be a no-op, which is what makes the outage
+            # replay safe to run with an overlapping watermark.
+            for _fields in sorted(_rows, key=lambda r: r["timestamp_utc"]):
+                store.record(_platform, _acct, _fields, source="fixture")
+            check("{} re-imports without duplicating".format(
+                os.path.basename(_fixture)), store.read(_slug, _platform) == _want)
+
+        # Two files for one account must be replayed merged, or an older file
+        # read second reopens an older broadcast and supersedes the newer one.
+        _groups = store.group_archives([PLAIN, VIEWERS])
+        check("archives for one account group together", len(_groups) == 1)
+
+        # --- the parity harness -------------------------------------------
+        # The reason any of this can be trusted. Every aggregate the Trends
+        # page draws now exists twice -- once in trends.py and once in SQL --
+        # and the only thing keeping them the same is this comparison. It runs
+        # against the fixtures, which is why they are committed.
+        _TOL = 1e-6      # both sides are decimal now; this is slack, not need
+        for _fixture, _platform in ((PLAIN, "twitch"), (YOUTUBE, "youtube")):
+            _slug = "smoke_" + os.path.basename(_fixture)[:-4].split("_", 1)[1]
+            _label = "{} {}".format(_slug, _platform)
+            _acct = store.account_id(_slug, _platform, timezone_name=_zone_name)
+            _cid = db.execute("SELECT channel_id FROM tm.platform_account "
+                              "WHERE account_id = %s", (_acct,), fetch=True)[0][0]
+            _rows = store.read(_slug, _platform)
+            _days = sorted({s["when"].astimezone().date() for s in _rows if s["live"]})
+            if not _days:
+                skipped("parity for " + os.path.basename(_fixture), "no live samples")
+                continue
+            _end = _days[-1]
+            db.execute("SELECT tm.refresh_range(%s, %s, %s, %s, 30)",
+                       (_cid, _days[0], _end, _zone_name))
+
+            # peak per day, including the days with no stream at all -- the
+            # invariant this whole migration had to preserve.
+            _want = trends.daily_peaks(_rows, _end, 10)
+            _got = db.execute("SELECT local_date, peak_viewers, peak_at "
+                              "FROM tm.daily_peaks(%s,%s,%s,10,%s)",
+                              (_cid, _platform, _end, _zone_name), fetch=True)
+            check("{}: SQL daily_peaks matches trends.daily_peaks".format(_label),
+                  len(_want) == len(_got) and all(
+                      w["day"] == g[0] and w["peak"] == g[1]
+                      and (w["peak"] is None or w["at"] == g[2])
+                      for w, g in zip(_want, _got)),
+                  "{} vs {}".format([w["peak"] for w in _want], [g[1] for g in _got]))
+            check("{}: a day with no stream is NULL and not 0".format(_label),
+                  all(g[1] is None or g[1] > 0 for g in _got))
+
+            # average viewers per half hour, slot by slot
+            _bad = []
+            for _entry in _want:
+                _wb = trends.clock_buckets(_rows, _entry["day"], 30)
+                _gb = {int(s): float(v) for s, v in db.execute(
+                    "SELECT slot, avg_viewers FROM tm.report_clock_bucket "
+                    "WHERE channel_id=%s AND platform=%s AND tz=%s "
+                    "AND bucket_minutes=30 AND local_date=%s",
+                    (_cid, _platform, _zone_name, _entry["day"]), fetch=True)}
+                if set(_wb) != set(_gb) or any(abs(_wb[k] - _gb[k]) > _TOL for k in _wb):
+                    _bad.append(_entry["day"])
+            check("{}: SQL clock buckets match trends.clock_buckets".format(_label),
+                  not _bad, str(_bad))
+
+            # and the busiest-window trim, which is the one with a self-join
+            # standing in for a windowed rolling sum
+            _slots, _per_day, _dropped = trends.compare_slots(_rows, _end, 5, 30)
+            _sql = db.execute(
+                "SELECT local_date, slot, avg_viewers, used_slots, dropped_slots "
+                "FROM tm.compare_slots(%s,%s,%s,5,30,24,%s)",
+                (_cid, _platform, _end, _zone_name), fetch=True)
+            _sql_slots = sorted({int(r[1]) for r in _sql})
+            check("{}: SQL compare_slots keeps the same slots".format(_label),
+                  sorted(_slots) == _sql_slots,
+                  "{} vs {}".format(sorted(_slots), _sql_slots))
+            check("{}: and drops the same count".format(_label),
+                  _dropped == (_sql[0][3] - len(_sql_slots) if _sql else 0)
+                  or _dropped == (_sql[0][4] if _sql else 0))
+
+        # --- per-broadcast summaries --------------------------------------
+        # The aggregate that had no Python twin, and therefore no parity check,
+        # and therefore shipped with an INSERT that named eleven columns and
+        # supplied ten. It raised on every call and nothing reached it, so the
+        # table just looked like one nobody had filled in yet. The first
+        # assertion here is simply "it inserted something", which is the one
+        # that would have caught it.
+        # Filtered by platform as well as by channel: metrics_testchannel.csv and
+        # youtube_testchannel.csv both reduce to the slug "testchannel", so
+        # without this the YouTube pass grades itself against the Twitch
+        # broadcasts and reports every metric as missing.
+        _sids = [r[0] for r in db.execute(
+            "SELECT st.stream_id FROM tm.stream st "
+            "JOIN tm.platform_account a ON a.account_id = st.account_id "
+            "JOIN tm.channel c ON c.channel_id = a.channel_id "
+            "WHERE c.slug = %s AND a.platform = %s",
+            (_slug, _platform), fetch=True)]
+        check("{}: the fixture produced a broadcast".format(_label), _sids)
+        for _sid in _sids:
+            check("{}: refresh_stream_metrics writes rows".format(_label),
+                  db.execute("SELECT tm.refresh_stream_metrics(%s)",
+                             (_sid,), fetch=True)[0][0] > 0)
+            _got = {m: (peak, low, float(avg), first, last, n) for m, peak, low, avg,
+                    first, last, n in db.execute(
+                        "SELECT metric::text, peak, low, avg, first_value, last_value, n "
+                        "FROM tm.report_stream_metric WHERE stream_id = %s",
+                        (_sid,), fetch=True)}
+            _ref = db.execute("SELECT platform_stream_id FROM tm.stream "
+                              "WHERE stream_id = %s", (_sid,), fetch=True)[0][0]
+            # Every live sample of that broadcast, which is what the SQL
+            # aggregates over. Deliberately NOT chart.split_sessions(), which
+            # also breaks on a sample gap -- one stream is not always one
+            # session, and conflating them would test the wrong thing.
+            _mine = [s for s in _rows if s["stream_id"] == _ref]
+            for _metric in ("viewers", "chatters", "followers", "subscribers", "likes"):
+                _vals = [s[_metric] for s in _mine if s.get(_metric) is not None]
+                if not _vals:
+                    check("{}: no {} row for a broadcast with no {}".format(
+                        _label, _metric, _metric), _metric not in _got)
+                    continue
+                _want = (max(_vals), min(_vals), sum(_vals) / len(_vals),
+                         _vals[0], _vals[-1], len(_vals))
+                _have = _got.get(_metric)
+                check("{}: {} summary matches the samples".format(_label, _metric),
+                      _have is not None
+                      and _have[:2] == _want[:2] and abs(_have[2] - _want[2]) <= _TOL
+                      and _have[3:] == _want[3:],
+                      "{} vs {}".format(_want, _have))
+
+        # --- the minute grid ----------------------------------------------
+        # chart.align_platforms() exists twice as well now, and this is the
+        # only thing keeping the SQL honest. Built rather than taken from a
+        # fixture, because the cases that break a carry-forward are the ones
+        # the committed data does not have: two platforms on DIFFERENT polling
+        # intervals, a poller that dies mid-day, and a second platform that
+        # starts late so the leading edge is exercised.
+        _gday = date(2026, 8, 24)
+        _gbase = datetime(2026, 8, 24, 16, 0, tzinfo=timezone.utc)
+        _gcid = db.execute("SELECT tm.upsert_channel(%s,%s,%s)",
+                           ("gridtest", "gridtest", _zone_name), fetch=True)[0][0]
+        _plans = {
+            # every 300s, with a 40-minute hole where the poller was down
+            "twitch": [(_gbase + timedelta(seconds=300 * i), 40 + i)
+                       for i in range(48) if not (12 <= i < 20)],
+            # every 60s, starting 7m23s later and stopping early
+            "youtube": [(_gbase + timedelta(seconds=443 + 60 * i), 300 + (i % 37))
+                        for i in range(180)],
+        }
+        for _plat, _pts in _plans.items():
+            _a = db.execute("SELECT tm.upsert_account(%s,%s,%s)",
+                            (_gcid, _plat, "gridtest"), fetch=True)[0][0]
+            _call = ("SELECT tm.record_youtube_sample(%s,%s,%s,%s)"
+                     if _plat == "youtube" else
+                     "SELECT tm.record_twitch_sample(%s,%s,%s,%s)")
+            for _when, _v in _pts:
+                db.execute(_call, (_a, _when, "vid1", _v))
+
+        def _gpoints(_plat):
+            return [(s["when"], s["viewers"]) for s in store.read("gridtest", _plat)
+                    if s["live"] and s["viewers"] is not None
+                    and s["when"].astimezone().date() == _gday]
+
+        _gseries = [dict(spec, points=_gpoints(spec["key"]))
+                    for spec in chart.PLATFORMS if _gpoints(spec["key"])]
+        check("the grid fixture has both platforms", len(_gseries) == 2)
+        _pg, _pv, _pc = chart.align_platforms(_gseries)
+        _sg, _sv, _sc = store.channel_minutes(
+            "gridtest", _gday, [e["key"] for e in _gseries],
+            timezone_name=_zone_name)
+        check("SQL builds the same minute axis", _pg == _sg,
+              "{} vs {}".format(len(_pg), len(_sg)))
+        for _entry in _gseries:
+            _k = _entry["key"]
+            check("SQL carries {} forward identically".format(_k),
+                  _pv[_k] == _sv.get(_k),
+                  "{} of {} differ".format(
+                      sum(1 for a, b in zip(_pv[_k], _sv.get(_k) or []) if a != b),
+                      len(_pv[_k])))
+        check("SQL combines identically, holes and all", _pc == _sc,
+              "{} of {} differ".format(
+                  sum(1 for a, b in zip(_pc, _sc) if a != b), len(_pc)))
+        # The holes are the point: if either side bridged them this would pass
+        # trivially and the chart would be lying about a dead poller.
+        check("and there are real holes to disagree about",
+              any(v is None for v in _pc) and any(v is None for v in _pv["twitch"]))
+        check("a chart drawn from the SQL grid is the same chart",
+              chart.render_platforms(_gseries, "gridtest", _gday)
+              == chart.render_platforms(_gseries, "gridtest", _gday,
+                                        aligned=(_sg, _sv, _sc)))
+    os.environ.pop("TWITCH_DATABASE_URL", None)
+    db.close()
+    db.reset()
 
 # --- no dependencies ------------------------------------------------------
 section("no dependencies")

@@ -789,7 +789,8 @@ def _runs(grid, column):
     return runs
 
 
-def render_platforms(series, channel, day, width=1300, height=430, show_combined=True):
+def render_platforms(series, channel, day, width=1300, height=430, show_combined=True,
+                     aligned=None):
     """Concurrent viewers from every platform, on one shared axis.
 
     Deliberately not normalised the way render_composite() is. There the point
@@ -801,12 +802,20 @@ def render_platforms(series, channel, day, width=1300, height=430, show_combined
     Gaps are real. A platform not streaming at a given minute is drawn at zero
     rather than bridged, so a chart of two broadcasts that only half overlap
     looks like exactly that.
+
+    `aligned` is an already-built (grid, values, combined), for a caller that
+    got the grid from somewhere other than these samples — the database builds
+    the same thing in SQL, so the site can be generated from stored rows rather
+    than by re-reading every sample. Left None, the grid is built here from
+    `series`, which is what charting a CSV still does. The two are held to being
+    the same thing by a parity check in tests/smoke.py; this parameter is what
+    lets both exist without a second copy of the drawing code.
     """
     series = [entry for entry in series if entry["points"]]
     if not series:
         return None
 
-    grid, values, combined = align_platforms(series)
+    grid, values, combined = aligned or align_platforms(series)
     if len(grid) < 2:
         return None
     # A total is only worth drawing when there is more than one thing in it;

@@ -7,7 +7,6 @@ line saying how many samples were taken. Only the sampling differs, so that is
 the one thing passed in.
 """
 
-import os
 import signal
 import threading
 from datetime import datetime, timedelta
@@ -42,17 +41,21 @@ def seconds_until_next_tick(interval):
     return interval - (secs % interval)
 
 
-def loop(interval, sample, label, csv_path):
+def loop(interval, sample, label, destination):
     """Call `sample` every `interval` seconds until stopped. Always returns 0.
 
     `sample` takes no arguments and returns True when it wrote a row, so a
     failed request is logged by the caller and simply not counted here.
+
+    `destination` is a phrase saying where the samples go, already formatted by
+    the caller. It used to be the CSV path, which this shortened to a basename;
+    now that samples go to a database with the CSV underneath it as a spool,
+    "where they go" is a sentence rather than a filename.
     """
     _stop.clear()
     install_stop_handlers()
 
-    log("start    polling {} every {}s -> {}".format(
-        label, interval, os.path.basename(csv_path)))
+    log("start    polling {} every {}s -> {}".format(label, interval, destination))
     log("start    Ctrl-C or SIGTERM to stop")
 
     samples = 0
@@ -74,6 +77,5 @@ def loop(interval, sample, label, csv_path):
         print()
         reason = "interrupted"
 
-    log("stop     {} after {} sample(s) -> {}".format(
-        reason, samples, os.path.basename(csv_path)))
+    log("stop     {} after {} sample(s) -> {}".format(reason, samples, destination))
     return 0

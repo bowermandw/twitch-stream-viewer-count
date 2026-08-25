@@ -8,7 +8,7 @@ column is left blank and the other two carry on.
 import sys
 import urllib.error
 
-from .. import api, auth, config, runloop, storage, useroauth
+from .. import api, auth, config, db, runloop, storage, store, useroauth
 from ..logging import log, use_file
 
 # The loop itself, the tick alignment and the SIGTERM handling live in runloop,
@@ -123,10 +123,7 @@ def poll_once(state):
                stream.get("game_name", "") if live else "",
                stream.get("started_at", "") if live else "",
                stream.get("id", "") if live else ""]
-        try:
-            storage.append_row(state["csv_path"], storage.VIEWERS_HEADER, row)
-        except OSError as exc:
-            log("ERROR    could not write CSV: {}".format(exc))
+        if not state["destination"].record(row, log):
             return False
         log("{}  {}{}".format(state["channel"], "LIVE   " if live else "offline",
                               "  {:>7} viewers".format(row[2]) if live else ""))
@@ -154,10 +151,7 @@ def poll_once(state):
            stream.get("game_name", "") if live else "",
            stream.get("started_at", "") if live else "",
            stream.get("id", "") if live else ""]
-    try:
-        storage.append_row(state["csv_path"], storage.METRICS_HEADER, row)
-    except OSError as exc:
-        log("ERROR    could not write CSV: {}".format(exc))
+    if not state["destination"].record(row, log):
         return False
 
     def show(value):
@@ -188,9 +182,33 @@ def run(args):
         if not broadcaster_id:
             sys.exit("No Twitch account called '{}'.".format(channel))
 
+    # Postgres, with csv_path underneath it as a spool. Both formats are still
+    # written by the same storage.append_row() when the database is unreachable,
+    # so an outage leaves a file this poller can read back and replay.
+    header = storage.VIEWERS_HEADER if args.viewers_only else storage.METRICS_HEADER
+    destination = store.Destination("twitch", channel, csv_path, header)
+
+    # Remember the broadcaster id, which Helix charged a request for above.
+    # It never changes, so storing it is what lets a future start skip the
+    # lookup -- and it is the same thing the YouTube poller does with the UC id
+    # and the uploads playlist. Best effort: a database that is down must not
+    # stop a poller that is perfectly able to spool.
+    if broadcaster_id:
+        try:
+            account = destination.account(display_name=channel)
+            db.execute(
+                "SELECT tm.upsert_account("
+                "  (SELECT channel_id FROM tm.platform_account WHERE account_id = %s),"
+                "  'twitch', %s, %s)",
+                (account, channel, str(broadcaster_id)))
+        except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+            log("start    could not store the broadcaster id -- {}".format(
+                str(exc).splitlines()[0]))
+
     state = {
         "channel": channel, "client_id": client_id, "client_secret": client_secret,
         "broadcaster_id": broadcaster_id, "csv_path": csv_path,
+        "destination": destination,
         "viewers_only": args.viewers_only,
         "chatters_enabled": False, "chatter_failures": 0,
         "moderator_id": None,
@@ -205,8 +223,14 @@ def run(args):
             log("start    chat size disabled — {}".format(str(exc).splitlines()[0]))
             log("start    (authorize with: {} auth)".format(config.invocation()))
 
+    # Before the first sample, and unconditionally: the units set
+    # Restart=on-failure, so the run that spooled during an outage is usually
+    # not the run that gets to replay it.
+    destination.startup_replay(log)
+
     if args.once:
         poll_once(state)
         return 0
 
-    return runloop.loop(interval, lambda: poll_once(state), channel, csv_path)
+    return runloop.loop(interval, lambda: poll_once(state), channel,
+                        destination.describe())

@@ -39,14 +39,19 @@
 [Unit]
 Description=YouTube metrics poller for %i
 Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
+# Wants, never Requires: a database that is down must delay this poller,
+# not stop it. The CSV spool exists for exactly that window.
+Wants=postgresql.service
 
 [Service]
 Type=simple
 User=twitch
 Group=twitch
 WorkingDirectory=/opt/twitch-metrics
+# Use the venv's Python if you installed psycopg there:
+#   ExecStart=/opt/twitch-metrics/.venv/bin/python -m twitchmetrics youtube %i
 ExecStart=/usr/bin/python3 -m twitchmetrics youtube %i
 
 # Restart on crash, backing off so a persistent failure doesn't spin.

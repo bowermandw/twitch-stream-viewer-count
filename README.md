@@ -67,6 +67,18 @@ entry point. If you'd rather not bother, `python3 -m twitchmetrics` is
 equivalent everywhere and needs nothing. This README writes the short form for
 readability; substitute whichever you use.
 
+Two optional extras do download something, and only the commands that need them
+will ever say so:
+
+```
+pip install -e '.[pg]'     # psycopg, to read and write the sample database
+pip install -e '.[aws]'    # boto3, to publish the website
+```
+
+A machine that only collects samples needs neither: it writes to the database
+when it can reach one and to a CSV when it cannot. See
+[The database](#the-database).
+
 For servers, see [`deploy/README.md`](deploy/README.md) — requirements, running
 it in the background, and how to handle the one step that needs a browser.
 
@@ -112,6 +124,75 @@ twitch-metrics setup --client-id XXXX --client-secret YYYY
 </details>
 
 ---
+
+## The database
+
+Samples live in PostgreSQL. The CSVs under `data/` are still there, but their
+job has changed: they are a **spool**, written only when the database cannot be
+reached, and drained back into it automatically as soon as it answers.
+
+```
+pip install -e '.[pg]'
+echo 'TWITCH_DATABASE_URL=postgresql://twitch:PASSWORD@127.0.0.1:5432/twitchmetrics' >> .env
+twitch-metrics db --init       # create the tables; safe to run again
+twitch-metrics db --import     # load the CSVs already in data/
+twitch-metrics db --verify     # prove the database agrees with them
+```
+
+`db --status` is the one to reach for when something is wrong. It never raises,
+and it tells the three lookalike failures apart: nothing configured, psycopg not
+installed, and a database that will not answer.
+
+### Why not just keep the CSVs
+
+Each sample repeated its whole broadcast — title, category, start time, stream
+id — on every row, so a six-hour stream stored the same title three hundred and
+fifty times. Aggregates were recomputed from scratch on every run, and the daily
+report read the same file four times over. Nothing could be asked across two
+channels without loading both into Python.
+
+Now the broadcast is stored once, in `stream`, and the samples point at it. The
+aggregates behind the Trends page are tables, filled by SQL functions that take
+the window, the bucket width and the timezone as parameters — so a new trend is
+a function call rather than new Python.
+
+### What survives an outage
+
+Only the pollers fall back to CSV, and that is deliberate:
+
+| | database unreachable |
+|---|---|
+| `poll`, `youtube` | append to `data/*.csv`, warn once, replay when it returns |
+| `graph`, `daily` | refuse, and say so |
+
+A chart quietly built from a stale spool would look complete and be wrong, which
+is worse than no chart. Nothing is lost meanwhile — the pollers replay the gap
+themselves, and `db --verify` will tell you they did.
+
+### The live-video cache
+
+`stream.ended_at IS NULL` means "live right now", which the YouTube poller reads
+before deciding how much quota to spend. Finding the live broadcast the long way
+costs two units — one to list recent uploads, one to ask which is live — and the
+answer almost never changes between samples. Asking about a remembered video id
+costs one:
+
+```
+3 units per sample  ->  2 while a broadcast is running
+4,320 a day at 60s  ->  2,880, which leaves room for a third channel
+```
+
+It also closes a real gap: the playlist walk only looks at the fifteen most
+recent uploads, so a long broadcast on a channel that uploads often could fall
+out of that window and read as though it had ended.
+
+### Timezone
+
+Every aggregate buckets by **local** date, so the database has to agree with the
+machine about where a day begins. `TWITCH_TIME_ZONE` sets it; left unset it is
+discovered from `TZ`, then `/etc/timezone`, then `/etc/localtime`. `db --init`
+checks the answer against the server, because a wrong zone does not fail — it
+quietly files every stream that crosses midnight under the wrong date.
 
 ## Polling
 
@@ -870,15 +951,36 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-423 checks over the committed fixtures — parsing, session detection, day
+490 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
 channel discovery, bucket naming, the index page, the Drive query and
 multipart builders, and the quota refusals that stop a mistyped YouTube interval
-costing a day's data. It proves boto3 stays optional by running the CLI against
-a `boto3.py` that refuses to import. It also covers adding a column to a CSV already on disk, which is
-silently lossy if done wrong. No network, no credentials, no tokens. It won't
-catch Twitch or YouTube changing an API contract; only regressions in this
-code.
+costing a day's data. It proves boto3 and psycopg both stay optional by running
+the CLI against modules that refuse to import. It also covers adding a column to
+a CSV already on disk, which is silently lossy if done wrong. No network, no
+credentials, no tokens, and no database.
+
+Point it at a throw-away database and it runs 49 more:
+
+```
+createdb twitchmetrics_test
+TWITCH_TEST_DATABASE_URL=postgresql://127.0.0.1:5432/twitchmetrics_test \
+    python3 tests/smoke.py
+```
+
+Those are the **parity harness**, and they are the reason the migration can be
+trusted. Every aggregate now exists twice — once in `trends.py` and once in SQL
+— and each pair is asserted to produce the same answer on the same fixtures,
+including the cases the committed data does not have: two platforms on different
+polling intervals, a poller that dies mid-day, and a day with no stream at all,
+which must come back as "no peak" and never as a peak of zero.
+
+It deliberately reads `TWITCH_TEST_DATABASE_URL` and never `TWITCH_DATABASE_URL`,
+and clears the latter from its own environment before it starts, so a test run
+cannot reach real data.
+
+It won't catch Twitch or YouTube changing an API contract; only regressions in
+this code.
 
 ---
 
@@ -896,6 +998,9 @@ twitchmetrics/          the package
   retry.py              backoff shared by every destination
   drive.py              Google Drive (retired, kept for reference)
   storage.py            CSV read and append
+  db.py                 the Postgres connection, and applying sql/
+  store.py              samples: the database, with the CSV as a spool
+  sql/                  the schema and the report functions, one file per step
   chart.py              SVG rendering
   png.py                SVG to PNG, via rsvg-convert
   driveoauth.py         Google access token (browser flow)
@@ -903,7 +1008,7 @@ twitchmetrics/          the package
   testdata.py           synthetic data model
   cli.py                subcommand dispatch
   commands/             one module per subcommand
-data/                   samples, logs, cached tokens   (gitignored)
+data/                   the CSV spool, logs, cached tokens  (gitignored)
 charts/                 generated SVGs                 (gitignored)
 tests/fixtures/         synthetic sample data           (committed)
 docs/                   README images
@@ -913,13 +1018,30 @@ deploy/                 systemd units and server notes
 `data/` and `charts/` can be redirected with `TWITCH_DATA_DIR` and
 `TWITCH_CHARTS_DIR`, which is useful when the data belongs on a mounted volume.
 
-`data/` holds the only irreplaceable thing here — charts regenerate from the
-CSVs, and tokens can be re-fetched.
+**The database now holds the only irreplaceable thing here.** Charts regenerate
+from the samples and tokens can be re-fetched, but the samples themselves cannot.
+Back it up:
+
+```
+pg_dump --format=custom twitchmetrics > twitchmetrics-$(date +%F).dump
+```
+
+`data/` used to be that irreplaceable thing, which is why it was worth saying so
+here. It is now a spool: a file that is not growing means the database is
+reachable and everything is going into it, which is the healthy state and looks
+alarming the first time you notice it.
 
 ## Notes
 
 - `viewer_count` is Twitch's live concurrent-viewer number and lags reality by
   about a minute. Treat it as approximate.
+- A `data/*.csv` that has stopped growing is good news, not a dead poller — it
+  is the spool, and an empty spool means every sample reached the database.
+  `db --status` says what is actually stored.
+- Use `host:port` in `TWITCH_DATABASE_URL`, not a Unix socket. The shipped units
+  set `ProtectSystem=strict`, which leaves `/run/postgresql` read-only, and a
+  socket connection needs to write to it — the failure reads like an
+  authentication problem and is not one.
 - Twitch's rate limit is 800 points/minute. Polling every 5 minutes uses a
   vanishing fraction of that, so a shorter interval is fine.
 - YouTube is the opposite: a hard 10,000 units a day, resetting at midnight
