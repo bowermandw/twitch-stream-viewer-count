@@ -5,7 +5,9 @@ list comes from the enabled pollers — twitch-metrics@ and youtube-metrics@ —
 enabling one is the only step needed to add a channel to the report.
 
 A channel polled on both platforms gets a graph each; one polled on only one
-gets one graph, which is not a failure. The SVG is published as-is, because a
+gets one graph, which is not a failure. Each platform also gets the two
+multi-day charts behind the Trends page, built from its whole CSV rather than
+today's slice of it. The SVG is published as-is, because a
 browser renders it natively — sharper and smaller than the PNG the Drive report
 used to convert, and with no binary to install.
 """
@@ -18,7 +20,7 @@ import subprocess
 import sys
 import time
 
-from .. import chart, config, storage
+from .. import chart, config, storage, trends
 from ..logging import log, use_file
 from . import graph_cmd
 
@@ -76,6 +78,14 @@ def add_arguments(parser):
                         help="minutes per block for the chart's average lines "
                              "(default 30) — nothing to do with an S3 bucket")
     parser.add_argument("--no-buckets", action="store_true", help="hide the average lines")
+    parser.add_argument("--no-trends", action="store_true",
+                        help="skip the multi-day charts and the Trends page")
+    parser.add_argument("--peak-days", type=int, default=trends.PEAK_DAYS, metavar="N",
+                        help="days on the peaks chart (default {})".format(trends.PEAK_DAYS))
+    parser.add_argument("--compare-days", type=int, default=trends.COMPARE_DAYS,
+                        metavar="N",
+                        help="days shown behind today on the half-hour chart "
+                             "(default {})".format(trends.COMPARE_DAYS))
 
 
 # --------------------------------------------------------------------------
@@ -293,6 +303,74 @@ def render_cross_platform(channel, day, live_points):
     return out
 
 
+def render_trend_charts(channel, day, args):
+    """The multi-day charts for every platform with history; [(kind, platform, path)].
+
+    Reads each platform's whole CSV rather than one day of it — that is the
+    point of them. A platform with nothing in the window contributes nothing,
+    so a channel that has only ever streamed on Twitch gets two charts and not
+    two empty ones.
+
+    Written straight to charts/ under a name with no date in it, because they
+    describe where the channel is now: each run replaces them.
+    """
+    made = []
+    for platform, source in PLATFORMS:
+        path = source(channel)
+        if not os.path.exists(path):
+            continue
+        try:
+            samples = storage.read_samples(path)
+        except OSError as exc:
+            log("WARN     {} {} — could not read {}: {}".format(
+                channel, platform, os.path.basename(path), exc))
+            continue
+        charts = trends.render_all(samples, channel, platform, day,
+                                   peak_days=args.peak_days,
+                                   compare_days=args.compare_days,
+                                   minutes=args.bucket)
+        for kind, svg in charts.items():
+            out = config.chart_path(channel, "_{}_{}".format(kind, platform))
+            os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+            with open(out, "w", encoding="utf-8") as handle:
+                handle.write(svg)
+            log("{}  {:<8} {} KB -> {}".format(channel, kind,
+                                               os.path.getsize(out) // 1024,
+                                               os.path.basename(out)))
+            made.append((kind, platform, out))
+    return made
+
+
+def _publish_trends(channel, day, charts):
+    """Upload the multi-day charts and rebuild the Trends page; True if it exists.
+
+    Failure is logged and swallowed. Today's page is what the run exists to
+    produce, and a ten-day chart that wouldn't build must neither stop it nor
+    turn a good run red.
+    """
+    from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
+
+    try:
+        if not charts:
+            # Nothing new to upload, but an earlier run's page may still be
+            # there, and the index's link to it should keep working.
+            return bool(s3.list_trends(channel))
+        for kind, platform, path in charts:
+            info = s3.upload_trend(channel, path, kind, platform)
+            log("{}  {:<8} -> {}".format(channel, kind, info["url"]))
+        page = s3.publish_trends(channel, day)
+        log("{}  trends page rebuilt from {} chart(s): {}".format(
+            channel, page["charts"], page["url"]))
+        return page["charts"] > 0
+    except SystemExit as exc:
+        log("WARN     {} — trends not published: {}".format(
+            channel, str(exc).splitlines()[0]))
+        return False
+    except Exception as exc:  # noqa: BLE001 - the day's page still has to go out
+        log("WARN     {} — trends not published: {}".format(channel, exc))
+        return False
+
+
 def day_title(channel, day, source):
     """The title that platform's stream carried, or "" if there is none.
 
@@ -365,15 +443,22 @@ def report_channel(channel, day, args):
             channel))
         return "failed"
 
+    trend_charts = [] if args.no_trends else render_trend_charts(channel, day, args)
+
     if args.no_upload:
-        log("{}  {} chart(s) rendered, not published".format(channel, len(rendered)))
+        log("{}  {} chart(s) rendered, not published".format(
+            channel, len(rendered) + len(trend_charts)))
         return "failed" if "failed" in outcomes else "rendered"
 
     try:
         for platform, svg in rendered:
             info = s3.upload_chart(channel, svg, platform, day)
             log("{}  {:<8} -> {}".format(channel, platform, info["url"]))
-        page = s3.publish_index(channel, day, titles)
+        # Ahead of the index, and swallowing its own errors: the index needs to
+        # know whether there is a Trends page to link to, and must go out either
+        # way.
+        has_trends = _publish_trends(channel, day, trend_charts)
+        page = s3.publish_index(channel, day, titles, trends=has_trends)
     except SystemExit as exc:
         log("WARN     {} — {}".format(channel, str(exc).splitlines()[0]))
         return "failed"

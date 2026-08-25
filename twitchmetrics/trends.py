@@ -1,0 +1,383 @@
+"""Charts that span days rather than living inside one.
+
+chart.py answers "what happened during this broadcast". Everything here answers
+"how does that compare", which needs a different axis: calendar days, and clock
+time rather than time since the stream started.
+
+Two charts, each rendered per platform:
+
+  * peak concurrent viewers for each of the last ten days
+  * average viewers per half hour, today against each of the five days before it
+
+The palette, the SVG primitives and the axis maths all come from chart.py, so
+these read as the same family as the per-day graphs rather than as a second
+charting library that happens to live in the same package.
+"""
+
+from datetime import time, timedelta
+
+from .chart import (BG, DIM, FG, GRID, MUTED, PAD_L, PAD_R, PLATFORMS,
+                    fmt_count, nice_axis, text)
+
+PEAK_DAYS = 10          # days on the peaks chart
+COMPARE_DAYS = 5        # days shown *behind* today on the comparison chart
+BUCKET_MINUTES = 30
+
+# Half a day of half hours. Six bars in each of 48 groups is 288 bars across a
+# 1300px chart, which is a texture rather than a reading.
+MAX_SLOTS = 24
+
+# The five earlier days, faintest first. Recency as weight, so the six days read
+# in order without needing six colours the eye then has to match to a legend.
+FADES = (0.32, 0.42, 0.53, 0.64, 0.78)
+TODAY_FADE = 1.0
+
+PLATFORM_BY_KEY = {spec["key"]: spec for spec in PLATFORMS}
+
+DASH = "—"         # what a day with no stream gets instead of a bar
+
+# --- layout ---------------------------------------------------------------
+HEAD_H = 118            # shorter than chart.HEADER_H: no in-stream tiles to fit
+FOOT_H = 62             # room for the date labels and, on the comparison, a legend
+GROUP_GAP = 0.26        # share of a group's width left empty between groups
+
+
+# --------------------------------------------------------------------------
+# data
+# --------------------------------------------------------------------------
+
+
+def window(end_day, days):
+    """The `days` calendar dates ending at `end_day`, oldest first."""
+    return [end_day - timedelta(days=n) for n in reversed(range(days))]
+
+
+def _live_on(samples, day):
+    """Live samples with a viewer count, on one local date."""
+    return [s for s in samples
+            if s["live"] and s["viewers"] is not None
+            and s["when"].astimezone().date() == day]
+
+
+def daily_peaks(samples, end_day, days=PEAK_DAYS):
+    """The highest viewer count on each of the last `days` days, oldest first.
+
+    Every day in the window gets an entry. A day with no live samples has a
+    peak of None, never 0 — the channel was not streaming, which is a different
+    statement from "nobody watched", and drawing them alike would invent a
+    catastrophic day out of a day off.
+    """
+    out = []
+    for day in window(end_day, days):
+        same_day = _live_on(samples, day)
+        if not same_day:
+            out.append({"day": day, "peak": None, "at": None})
+            continue
+        best = max(same_day, key=lambda s: s["viewers"])
+        out.append({"day": day, "peak": best["viewers"], "at": best["when"]})
+    return out
+
+
+def clock_buckets(samples, day, minutes=BUCKET_MINUTES):
+    """{slot: average viewers} for one day, keyed by slot of the local clock.
+
+    Slot 0 is local midnight, slot 1 is half past, and so on. Deliberately not
+    chart.bucket_averages(), which counts from the moment the stream started:
+    that is the right axis for reading one broadcast and the wrong one for
+    comparing days, because it would lay a stream that began at 6pm over one
+    that began at 8pm and call both blocks "the first half hour".
+    """
+    width = max(1, int(minutes))
+    totals = {}
+    for sample in _live_on(samples, day):
+        local = sample["when"].astimezone()
+        slot = (local.hour * 60 + local.minute) // width
+        seen, count = totals.get(slot, (0, 0))
+        totals[slot] = (seen + sample["viewers"], count + 1)
+    return {slot: total / count for slot, (total, count) in totals.items()}
+
+
+def _busiest_window(slots, weight, span=MAX_SLOTS):
+    """The `span` consecutive slots carrying the most viewers, as a slot list.
+
+    Contiguous rather than "the fullest slots wherever they fall": a chart of
+    the busiest twelve hours is a period, whereas a chart of scattered half
+    hours puts 9am next to 11pm and quietly hides what came between.
+    """
+    if len(slots) <= span:
+        return slots
+    first, last = slots[0], slots[-1]
+    best_start, best_weight = first, -1.0
+    for start in range(first, last - span + 2):
+        total = sum(weight.get(slot, 0.0) for slot in range(start, start + span))
+        if total > best_weight:
+            best_start, best_weight = start, total
+    return [slot for slot in slots if best_start <= slot < best_start + span]
+
+
+def compare_slots(samples, end_day, days=COMPARE_DAYS, minutes=BUCKET_MINUTES):
+    """(slots, per_day) for today and the `days` days before it.
+
+    `per_day` is [(date, {slot: average}), ...] oldest first, one entry per day
+    in the window whether or not it has data. `slots` is every slot any of them
+    used, trimmed to MAX_SLOTS around the busiest stretch; the dropped count is
+    returned so the caller can say so rather than silently showing less.
+
+    Returns (slots, per_day, dropped).
+    """
+    per_day = [(day, clock_buckets(samples, day, minutes))
+               for day in window(end_day, days + 1)]
+    used = sorted({slot for _, buckets in per_day for slot in buckets})
+    weight = {}
+    for _, buckets in per_day:
+        for slot, average in buckets.items():
+            weight[slot] = weight.get(slot, 0.0) + average
+    kept = _busiest_window(used, weight)
+    return kept, per_day, len(used) - len(kept)
+
+
+# --------------------------------------------------------------------------
+# formatting
+# --------------------------------------------------------------------------
+
+
+def fmt_day(day):
+    """'Mon 18' — enough to find a day in a ten-day window."""
+    return day.strftime("%a %-d")
+
+
+def fmt_slot(slot, minutes=BUCKET_MINUTES):
+    """The clock time a slot starts at, '7:00 pm'."""
+    total = slot * minutes
+    at = time(hour=(total // 60) % 24, minute=total % 60)
+    return at.strftime("%-I:%M %p").lower()
+
+
+def _spec(platform):
+    return PLATFORM_BY_KEY.get(platform, {"key": platform,
+                                          "label": str(platform).title(),
+                                          "color": "#4fb3e8"})
+
+
+def _open_svg(width, height, title, subtitle):
+    """The shell both charts share: background, heading and subheading."""
+    out = ['<svg xmlns="http://www.w3.org/2000/svg" width="{}" height="{}" '
+           'viewBox="0 0 {} {}" font-family="Roboto, -apple-system, '
+           'BlinkMacSystemFont, &quot;Helvetica Neue&quot;, Arial, '
+           'sans-serif">'.format(width, height, width, height),
+           '<rect width="{}" height="{}" fill="{}"/>'.format(width, height, BG),
+           text(PAD_L, 44, title, size=21, fill=FG, weight="700"),
+           text(PAD_L, 70, subtitle, size=14, fill=MUTED)]
+    return out
+
+
+def _tile(out, x, value, label, note, colour=FG):
+    """One headline figure in the top right, laid out like chart.render_platforms."""
+    out.append(text(x, 48, value, size=26, fill=colour, weight="700", anchor="end"))
+    out.append(text(x, 68, label, size=12, fill=MUTED, anchor="end"))
+    if note:
+        out.append(text(x, 85, note, size=11, fill=DIM, anchor="end"))
+
+
+def _grid_lines(out, top_value, step, left, right, y_of):
+    line = 0
+    while line <= top_value:
+        y = y_of(line)
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" '
+                   'stroke="{}" stroke-width="1"/>'.format(left, y, right, y, GRID))
+        out.append(text(right + 12, y + 4, fmt_count(line), size=12, fill=MUTED))
+        line += step
+
+
+def _bar(x, y, width, height, colour, opacity=1.0, outline=None):
+    stroke = (' stroke="{}" stroke-width="1"'.format(outline) if outline else "")
+    return ('<rect x="{:.1f}" y="{:.1f}" width="{:.1f}" height="{:.1f}" rx="2" '
+            'fill="{}" opacity="{:.2f}"{}/>'.format(
+                x, y, width, max(0.0, height), colour, opacity, stroke))
+
+
+# --------------------------------------------------------------------------
+# peaks over the last ten days
+# --------------------------------------------------------------------------
+
+
+def render_peaks(entries, channel, platform, day, width=1300, height=380):
+    """Peak concurrent viewers per day, one bar each. None if none were streamed.
+
+    Today is drawn at full strength and outlined; the earlier days sit back a
+    little, so the bar the reader came for is the one they see first.
+    """
+    streamed = [e for e in entries if e["peak"] is not None]
+    if not streamed:
+        return None
+
+    spec = _spec(platform)
+    top_value, step = nice_axis(max(e["peak"] for e in streamed))
+    left, right = PAD_L, width - PAD_R
+    top, bottom = HEAD_H, height - FOOT_H
+
+    def y_of(value):
+        return bottom - (value / top_value) * (bottom - top)
+
+    out = _open_svg(width, height,
+                    "Peak viewers, last {} days".format(len(entries)),
+                    "{} · {} · to {}".format(channel, spec["label"],
+                                             day.strftime("%a %-d %b %Y")))
+
+    best = max(streamed, key=lambda e: e["peak"])
+    average = sum(e["peak"] for e in streamed) / len(streamed)
+    tile_x = width - PAD_R + 84
+    _tile(out, tile_x, fmt_count(best["peak"]), "Best day",
+          best["day"].strftime("%a %-d %b"), colour=spec["color"])
+    _tile(out, tile_x - 175, fmt_count(average), "Average peak",
+          "over {} day(s) live".format(len(streamed)))
+
+    _grid_lines(out, top_value, step, left, right, y_of)
+
+    slot_width = (right - left) / len(entries)
+    bar_width = slot_width * (1 - GROUP_GAP)
+    for index, entry in enumerate(entries):
+        centre = left + slot_width * (index + 0.5)
+        x = centre - bar_width / 2
+        label_fill = FG if entry["day"] == day else MUTED
+        out.append(text(centre, bottom + 22, fmt_day(entry["day"]), size=12,
+                        fill=label_fill, anchor="middle"))
+        if entry["peak"] is None:
+            # A dash above the baseline, not a zero-height bar: the day is
+            # absent from the record, and 0 viewers is a thing that can happen.
+            out.append(text(centre, bottom - 10, DASH, size=13, fill=DIM,
+                            anchor="middle"))
+            continue
+        y = y_of(entry["peak"])
+        today = entry["day"] == day
+        out.append(_bar(x, y, bar_width, bottom - y, spec["color"],
+                        TODAY_FADE if today else 0.72,
+                        outline=FG if today else None))
+        out.append(text(centre, y - 9, fmt_count(entry["peak"]), size=12,
+                        fill=FG if today else MUTED, weight="600" if today else "normal",
+                        anchor="middle"))
+
+    out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+               'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
+    out.append(text(right, height - 16, "{} day(s) with a stream".format(len(streamed)),
+                    size=12, fill=DIM, anchor="end"))
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# today against the days before it
+# --------------------------------------------------------------------------
+
+
+def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTES,
+                   width=1300, height=430, dropped=0):
+    """Average viewers per half hour: today beside each earlier day, slot by slot.
+
+    Every day keeps its own bar rather than being folded into a mean, so a
+    single freak evening reads as one tall bar among five rather than dragging
+    "normal" up with it.
+    """
+    if not slots or not any(buckets for _, buckets in per_day):
+        return None
+
+    spec = _spec(platform)
+    peak = max(value for _, buckets in per_day for value in buckets.values())
+    top_value, step = nice_axis(peak)
+    left, right = PAD_L, width - PAD_R
+    top, bottom = HEAD_H, height - FOOT_H - 22
+
+    def y_of(value):
+        return bottom - (value / top_value) * (bottom - top)
+
+    earlier = len(per_day) - 1
+    note = "{} · {} · today vs the previous {} day(s)".format(
+        channel, spec["label"], earlier)
+    if dropped:
+        note += " · busiest {} hours shown".format(len(slots) * minutes // 60)
+    out = _open_svg(width, height,
+                    "{}-minute averages, today vs the last {}".format(minutes, earlier),
+                    note)
+
+    today_buckets = per_day[-1][1] if per_day else {}
+    live_days = sum(1 for _, buckets in per_day if buckets)
+    tile_x = width - PAD_R + 84
+    if today_buckets:
+        busiest = max(today_buckets, key=lambda slot: today_buckets[slot])
+        _tile(out, tile_x, fmt_count(today_buckets[busiest]), "Today's best block",
+              fmt_slot(busiest, minutes), colour=spec["color"])
+    else:
+        _tile(out, tile_x, DASH, "Today's best block", "no stream yet",
+              colour=spec["color"])
+    _tile(out, tile_x - 175, str(live_days), "Days with data",
+          "of {} in the window".format(len(per_day)))
+
+    _grid_lines(out, top_value, step, left, right, y_of)
+
+    group_width = (right - left) / len(slots)
+    bar_width = max(1.5, group_width * (1 - GROUP_GAP) / len(per_day))
+    # Above sixteen groups every label no longer fits; thinning beats overlap,
+    # and the first group is always labelled so the axis has an anchor.
+    every = 1 if len(slots) <= 16 else 2
+    for index, slot in enumerate(slots):
+        group_left = left + group_width * index + group_width * GROUP_GAP / 2
+        if index % every == 0:
+            out.append(text(group_left + group_width * (1 - GROUP_GAP) / 2,
+                            bottom + 20, fmt_slot(slot, minutes), size=11,
+                            fill=DIM, anchor="middle"))
+        for position, (bucket_day, buckets) in enumerate(per_day):
+            value = buckets.get(slot)
+            if value is None:
+                continue
+            x = group_left + bar_width * position
+            y = y_of(value)
+            today = bucket_day == day
+            opacity = TODAY_FADE if today else FADES[min(position, len(FADES) - 1)]
+            out.append(_bar(x, y, bar_width * 0.88, bottom - y, spec["color"],
+                            opacity, outline=FG if today else None))
+
+    out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+               'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
+
+    # Only the days that actually drew something. A swatch for a day off would
+    # send the reader hunting for a bar that was never there.
+    legend_x = left
+    for position, (bucket_day, buckets) in enumerate(per_day):
+        if not buckets:
+            continue
+        today = bucket_day == day
+        opacity = TODAY_FADE if today else FADES[min(position, len(FADES) - 1)]
+        out.append(_bar(legend_x, height - 30, 13, 13, spec["color"], opacity,
+                        outline=FG if today else None))
+        label = "Today" if today else fmt_day(bucket_day)
+        out.append(text(legend_x + 20, height - 19, label, size=12,
+                        fill=FG if today else MUTED))
+        legend_x += 20 + len(label) * 7.2 + 22
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# both, for one platform
+# --------------------------------------------------------------------------
+
+
+def render_all(samples, channel, platform, day, peak_days=PEAK_DAYS,
+               compare_days=COMPARE_DAYS, minutes=BUCKET_MINUTES):
+    """{"peaks": svg, "typical": svg} for one platform; either key may be absent.
+
+    A platform with nothing in the window produces an empty dict rather than an
+    error — the same rule the daily report already follows for a channel that
+    only streams on one of them.
+    """
+    minutes = max(1, int(minutes))   # keeps the labels and the buckets agreeing
+    charts = {}
+    peaks = render_peaks(daily_peaks(samples, day, peak_days), channel, platform, day)
+    if peaks:
+        charts["peaks"] = peaks
+    slots, per_day, dropped = compare_slots(samples, day, compare_days, minutes)
+    typical = render_typical(slots, per_day, channel, platform, day,
+                             minutes=minutes, dropped=dropped)
+    if typical:
+        charts["typical"] = typical
+    return charts

@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from twitchmetrics import (chart, config, drive, driveoauth, png, retry, s3,  # noqa: E402
-                          storage, youtube)
+                          storage, trends, youtube)
 from twitchmetrics.commands import daily  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
@@ -699,6 +699,90 @@ check("the page leads with the combined chart",
       _cross_page.index("combined/2026-08-24.svg") < _cross_page.index("twitch/2026-08-24.svg"))
 check("and marks it as the lead panel", 'class="panel lead"' in _cross_page)
 
+# --- multi-day charts -----------------------------------------------------
+section("trends")
+
+
+def _day_samples(day, hour, minutes, viewers):
+    """Live samples every minute from `hour` local on `day`."""
+    base = datetime.combine(day, datetime.min.time()).replace(hour=hour).astimezone()
+    return [{"when": (base + timedelta(minutes=i)).astimezone(timezone.utc),
+             "live": True, "viewers": viewers(i), "title": "", "game": "",
+             "stream_id": day.isoformat()}
+            for i in range(minutes)]
+
+
+_end = date(2026, 8, 25)
+# Streamed today and three days ago, nothing in between.
+_history = (_day_samples(_end, 19, 120, lambda i: 100 + i)
+            + _day_samples(_end - timedelta(days=3), 19, 120, lambda i: 300 + i))
+_peaks = trends.daily_peaks(_history, _end, 10)
+check("a ten-day window has ten entries", len(_peaks) == 10)
+check("oldest first, ending today",
+      _peaks[0]["day"] == _end - timedelta(days=9) and _peaks[-1]["day"] == _end)
+check("a day never streamed has no peak, not a zero",
+      _peaks[-2]["peak"] is None)
+check("a day that streamed carries its highest count",
+      _peaks[-1]["peak"] == 219 and _peaks[-4]["peak"] == 419)
+check("and when it happened", _peaks[-1]["at"] is not None)
+
+# The whole reason this isn't chart.bucket_averages(): two streams that started
+# an hour apart must still line their 8pm samples up in the same block.
+_late = _day_samples(_end, 20, 60, lambda i: 10)
+_early = _day_samples(_end - timedelta(days=1), 19, 120, lambda i: 10)
+_late_slots = trends.clock_buckets(_late, _end)
+_early_slots = trends.clock_buckets(_early, _end - timedelta(days=1))
+check("buckets are keyed to the clock, not to when the stream began",
+      set(_late_slots) == {40, 41} and {40, 41} <= set(_early_slots))
+check("a slot's value is that half hour's average",
+      _late_slots[40] == 10)
+check("and a day off has no slots at all",
+      trends.clock_buckets(_history, _end - timedelta(days=1)) == {})
+
+_slots, _per_day, _dropped = trends.compare_slots(_history, _end, 5)
+check("the comparison covers today and five days back", len(_per_day) == 6)
+check("oldest first, today last", _per_day[-1][0] == _end)
+check("every day in the window gets an entry, data or not",
+      sum(1 for _, buckets in _per_day if buckets) == 2)
+check("a short evening is not trimmed", _dropped == 0)
+
+_long = _day_samples(_end, 4, 20 * 60, lambda i: 10 + (500 if 9 * 60 < i < 14 * 60 else 0))
+_kept, _, _lost = trends.compare_slots(_long, _end, 5)
+check("a twenty-hour day is trimmed to half a day of slots",
+      len(_kept) == trends.MAX_SLOTS and _lost == 40 - trends.MAX_SLOTS)
+check("and what is kept is contiguous, not the fullest slots scattered about",
+      _kept == list(range(_kept[0], _kept[0] + len(_kept))))
+
+_peaks_svg = trends.render_peaks(_peaks, "testchannel", "twitch", _end)
+check("the peaks chart renders",
+      _peaks_svg.startswith("<svg") and _peaks_svg.endswith("</svg>"))
+check("it names the best day and its figure",
+      "Best day" in _peaks_svg and "419" in _peaks_svg)
+check("a day with no stream is drawn as absent, not as nobody watching",
+      trends.DASH in _peaks_svg)
+check("one day of history is still a chart",
+      trends.render_peaks(trends.daily_peaks(_day_samples(_end, 19, 60, lambda i: 5),
+                                             _end, 10), "t", "twitch", _end) is not None)
+check("no history at all is not a chart",
+      trends.render_peaks(trends.daily_peaks([], _end, 10), "t", "twitch", _end) is None)
+
+_typical_svg = trends.render_typical(_slots, _per_day, "testchannel", "twitch", _end)
+check("the comparison chart renders",
+      _typical_svg.startswith("<svg") and _typical_svg.endswith("</svg>"))
+check("today is called today", ">Today<" in _typical_svg)
+check("only the days that drew a bar are in the legend",
+      ">{}<".format(trends.fmt_day(_end - timedelta(days=3))) in _typical_svg
+      and ">{}<".format(trends.fmt_day(_end - timedelta(days=1))) not in _typical_svg)
+check("no data at all is not a chart",
+      trends.render_typical(*trends.compare_slots([], _end, 5)[:2],
+                            "t", "twitch", _end) is None)
+check("a platform with nothing gets no charts at all",
+      trends.render_all([], "t", "twitch", _end) == {})
+check("and one with history gets both",
+      sorted(trends.render_all(_history, "t", "twitch", _end)) == ["peaks", "typical"])
+check("the channel name is escaped into the chart",
+      "&lt;b&gt;" in trends.render_peaks(_peaks, "<b>", "twitch", _end))
+
 # --- s3 naming ------------------------------------------------------------
 section("s3 naming")
 check("a bucket name carries the shared prefix",
@@ -811,6 +895,49 @@ check("titles live in the bucket so --publish-index still renders them",
 check("an unreadable titles.json is not fatal",
       "return {}" in open(os.path.join(root, "twitchmetrics/s3.py")).read()
       .split("def load_titles")[1].split("def save_titles")[0])
+
+# --- s3 trends page -------------------------------------------------------
+section("s3 trends page")
+check("a trend chart has a fixed key, no date in it",
+      s3.trend_key("peaks", "twitch") == "trends/peaks-twitch.svg")
+check("and it parses back", s3.parse_trend_key("trends/peaks-twitch.svg")
+      == ("peaks", "twitch"))
+# The whole reason the filename is not a date: the index is built by matching
+# keys, and a trend chart mistaken for a platform would put a "trends" panel on
+# the front page and a nonsense row in Past days.
+check("the index's key matcher ignores a trend chart",
+      all(s3.parse_key(s3.trend_key(kind, platform)) is None
+          for kind in s3.TREND_KINDS for platform in ("twitch", "youtube")))
+check("and the trend matcher ignores a day's chart",
+      s3.parse_trend_key("twitch/2026-08-24.svg") is None)
+check("as it does the page itself", s3.parse_trend_key(s3.TRENDS_KEY) is None)
+
+_trends_page = s3.render_trends("testchannel", date(2026, 8, 25),
+                                [("peaks", "twitch"), ("typical", "youtube")])
+check("the trends page is a whole document",
+      _trends_page.startswith("<!doctype html>")
+      and _trends_page.rstrip().endswith("</html>"))
+check("it shows a panel per chart the bucket holds",
+      _trends_page.count("<img") == 2)
+check("by relative key", 'src="trends/peaks-twitch.svg"' in _trends_page)
+check("it never links a chart that isn't there",
+      "typical-twitch" not in _trends_page)
+check("it links back to today", 'href="index.html"' in _trends_page)
+check("it has no Past days section — every chart on it already spans days",
+      "Past days" not in _trends_page)
+check("the channel name is escaped",
+      "&lt;script&gt;" in s3.render_trends("<script>", date(2026, 8, 25), []))
+check("an empty bucket says so rather than showing broken images",
+      "<img" not in s3.render_trends("t", date(2026, 8, 25), [])
+      and "No trend charts yet" in s3.render_trends("t", date(2026, 8, 25), []))
+check("it is self-contained — no external asset",
+      "http://" not in _trends_page.replace("http://www.w3.org", ""))
+check("no script anywhere", "<script" not in _trends_page.lower())
+
+check("the front page links to it once the charts exist",
+      'href="trends.html"' in s3.render_index("t", date(2026, 8, 24), _days, trends=True))
+check("and does not, before they do",
+      "trends.html" not in s3.render_index("t", date(2026, 8, 24), _days))
 
 # --- s3 the bucket registry -----------------------------------------------
 section("s3 bucket registry")
@@ -1232,8 +1359,8 @@ _forbidden = re.compile(
     r"^\s*(import|from)\s+"
     r"(google|googleapiclient|google_auth\w*|requests|httplib2|oauth2client|matplotlib)\b",
     re.M)
-for _mod in ("driveoauth.py", "drive.py", "png.py", "commands/drive_cmd.py",
-             "commands/daily.py"):
+for _mod in ("driveoauth.py", "drive.py", "png.py", "trends.py",
+             "commands/drive_cmd.py", "commands/daily.py"):
     _src = open(os.path.join(root, "twitchmetrics", _mod)).read()
     check("{} imports nothing third-party".format(_mod), not _forbidden.search(_src))
 

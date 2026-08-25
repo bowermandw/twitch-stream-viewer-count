@@ -449,6 +449,7 @@ twitch-metrics daily --dry-run                # render the charts, publish nothi
 twitch-metrics daily --date yesterday         # backfill a day
 twitch-metrics daily testchannel           # just this one
 twitch-metrics daily --list-channels          # who's in, and what today looks like
+twitch-metrics daily --no-trends              # skip the multi-day charts
 ```
 
 ```
@@ -529,13 +530,53 @@ http://tm-testchannel-9f4c2ba710.s3-website-us-east-1.amazonaws.com
 The bucket holds nothing but the page and the charts:
 
 ```
-index.html               rebuilt every run
-titles.json              what each day's stream was called
-combined/2026-08-24.svg  both platforms on one axis — leads the page
+index.html                   today, rebuilt every run
+trends.html                  the multi-day charts
+titles.json                  what each day's stream was called
+combined/2026-08-24.svg      both platforms on one axis — leads the page
 twitch/2026-08-24.svg
 youtube/2026-08-24.svg
-twitch/2026-08-23.svg    …
+twitch/2026-08-23.svg        …
+trends/peaks-twitch.svg      no date: replaced every run
+trends/typical-youtube.svg
 ```
+
+### Trends
+
+`index.html` answers *what happened today*. Everything comparative lives on a
+second page, linked from under the date:
+
+- **Peak viewers by day**, the last ten days as one bar each, Twitch and
+  YouTube charted separately.
+- **Half-hour averages, today vs before**, one bar per day per half hour of the
+  clock — today beside each of the previous five days, oldest to newest.
+
+The second one is the reason there is a separate module rather than another
+function in `chart.py`. Every graph on the front page buckets by time *since the
+stream started*, which is the right axis for reading one broadcast and the wrong
+one for comparing days: it would lay a stream that began at 6pm over one that
+began at 8pm and call both blocks "the first half hour". The Trends charts
+bucket by the **clock**, so 8:30pm is 8:30pm on all six days.
+
+Each day keeps its own bar rather than being folded into a five-day mean. An
+average hides its own spread — one freak evening drags "normal" up and nothing
+on the chart says so — whereas five bars show you immediately whether today is
+outside the range or in the middle of it.
+
+A day you didn't stream is a gap, never a zero, for the same reason the combined
+chart leaves holes: 0 viewers is a real reading a stream that has just gone live
+genuinely has, and drawing a day off the same way would invent a catastrophe out
+of a rest. A channel that spans more than twelve hours has its busiest twelve
+shown, and the chart says so rather than quietly cropping.
+
+The charts have no date in their key and are replaced on every run — they
+describe where the channel is now, not what happened on a particular day. The
+page is still built from a **listing of the bucket**, like `index.html`, so it
+only ever links a chart that is actually there, and the front page's link only
+appears once there is something to link to.
+
+Ten days and five are `--peak-days` and `--compare-days`; the half-hour width is
+the same `--bucket` the per-day charts use.
 
 ### Both platforms on one chart
 

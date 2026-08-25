@@ -1,16 +1,19 @@
 """Publishing the daily charts to an S3 static website, one bucket per channel.
 
-Each channel gets its own bucket serving a single page: today's graph for every
-platform it is polled on, and prior days as links. The bucket holds nothing but
-that page and the charts:
+Each channel gets its own bucket serving two pages: today's graph for every
+platform it is polled on with prior days as links, and a Trends page carrying
+the multi-day charts. The bucket holds nothing but those and the SVGs:
 
     index.html
+    trends.html
     twitch/2026-08-24.svg
     youtube/2026-08-24.svg
+    trends/peaks-twitch.svg
 
-The page is rebuilt from a listing of the bucket rather than from anything kept
-locally, so a run after a week's gap still produces a correct index, and a chart
-uploaded by hand shows up in it.
+Both pages are rebuilt from a listing of the bucket rather than from anything
+kept locally, so a run after a week's gap still produces a correct index, a
+chart uploaded by hand shows up in it, and neither page ever links an image that
+isn't there.
 
 boto3 is imported lazily, inside _boto3(). cli.py imports every command module
 at startup, so a module-scope import here would take the whole CLI down on a
@@ -28,7 +31,9 @@ from . import config, retry
 from .logging import log
 
 INDEX_KEY = "index.html"
+TRENDS_KEY = "trends.html"
 TITLES_KEY = "titles.json"
+TRENDS_PREFIX = "trends/"
 SVG_TYPE = "image/svg+xml"
 
 # Not `immutable`: re-running the report for today legitimately replaces today's
@@ -56,6 +61,17 @@ PLATFORM_LABELS = {"combined": "Both platforms", "twitch": "Twitch",
 # same broadcast, so one has to win rather than both being printed.
 TITLE_PREFERENCE = ("twitch", "youtube")
 
+# The multi-day charts, in the order the Trends page shows them. They are one
+# per platform and not per day — each run overwrites them, because they describe
+# where the channel is now rather than what happened on a particular date.
+TREND_KINDS = ("peaks", "typical")
+TREND_LABELS = {
+    ("peaks", "twitch"): "Peak viewers by day · Twitch",
+    ("peaks", "youtube"): "Peak viewers by day · YouTube",
+    ("typical", "twitch"): "Half-hour averages, today vs before · Twitch",
+    ("typical", "youtube"): "Half-hour averages, today vs before · YouTube",
+}
+
 # These nine regions predate the dotted website endpoint and still answer on
 # s3-website-<region>; everything since uses s3-website.<region>. It is frozen
 # history rather than a rule, so it is a list and not an algorithm.
@@ -71,6 +87,7 @@ RETRY_CODES = ("SlowDown", "RequestTimeout", "RequestTimeoutException",
                "TooManyRequests", "RequestThrottled", "ThrottlingException")
 
 KEY_RE = re.compile(r"^([a-z]+)/(\d{4}-\d{2}-\d{2})\.svg$")
+TREND_KEY_RE = re.compile(r"^" + TRENDS_PREFIX + r"([a-z]+)-([a-z]+)\.svg$")
 
 NO_BOTO3 = """The daily report needs boto3, which isn't installed.
 
@@ -189,11 +206,31 @@ def object_key(platform, day):
     return "{}/{}.svg".format(str(platform).strip("/. "), day.isoformat())
 
 
+def trend_key(kind, platform):
+    """Where a multi-day chart lives: 'trends/peaks-twitch.svg'.
+
+    The filename is deliberately not a date. KEY_RE only matches
+    '<word>/<YYYY-MM-DD>.svg', so a trend chart can never be mistaken for a
+    platform's chart for some day — which would put a "trends" panel on the
+    index and a nonsense row in Past days. Anything added under this prefix
+    must keep that property.
+    """
+    return "{}{}-{}.svg".format(TRENDS_PREFIX, str(kind).strip("/. "),
+                                str(platform).strip("/. "))
+
+
+def parse_trend_key(key):
+    """(kind, platform) for a trend chart key, or None for anything else."""
+    match = TREND_KEY_RE.match(str(key))
+    return (match.group(1), match.group(2)) if match else None
+
+
 def parse_key(key):
     """(platform, 'YYYY-MM-DD') for a chart key, or None for anything else.
 
-    The index is built only from keys matching this, so index.html and any
-    stray upload are ignored rather than turned into a broken link.
+    The index is built only from keys matching this, so index.html, the trend
+    charts and any stray upload are ignored rather than turned into a broken
+    link.
     """
     match = KEY_RE.match(str(key))
     return (match.group(1), match.group(2)) if match else None
@@ -432,10 +469,9 @@ def create_site(channel, region=None):
 # --------------------------------------------------------------------------
 
 
-def upload_chart(channel, path, platform, day):
-    """Put one SVG at '<platform>/<date>.svg'. Returns {"bucket", "key", "url"}."""
+def _upload_svg(channel, path, key):
+    """Put one SVG at `key`. Returns {"bucket", "key", "url"}."""
     known = require_bucket(channel)
-    key = object_key(platform, day)
     with open(path, "rb") as handle:
         body = handle.read()
     s3 = _client("s3", known["region"])
@@ -448,29 +484,63 @@ def upload_chart(channel, path, platform, day):
             "url": "{}/{}".format(website_url(known["bucket"], known["region"]), key)}
 
 
-def list_days(channel):
-    """{'YYYY-MM-DD': [platform, ...]} for every chart in the bucket, newest first."""
+def upload_chart(channel, path, platform, day):
+    """Put one platform's chart for one day at '<platform>/<date>.svg'."""
+    return _upload_svg(channel, path, object_key(platform, day))
+
+
+def upload_trend(channel, path, kind, platform):
+    """Put one multi-day chart at 'trends/<kind>-<platform>.svg', replacing it."""
+    return _upload_svg(channel, path, trend_key(kind, platform))
+
+
+def _keys(channel, prefix=None):
+    """Every object key in the channel's bucket, one page at a time."""
     known = require_bucket(channel)
     s3 = _client("s3", known["region"])
-    found = {}
     token = None
     while True:
         params = {"Bucket": known["bucket"]}
+        if prefix:
+            params["Prefix"] = prefix
         if token:
             params["ContinuationToken"] = token
         page = _with_backoff("list {}".format(channel),
                              lambda p=dict(params): s3.list_objects_v2(**p))
         for item in page.get("Contents") or []:
-            parsed = parse_key(item.get("Key") or "")
-            if parsed:
-                platform, day = parsed
-                if platform not in found.setdefault(day, []):
-                    found[day].append(platform)
+            yield item.get("Key") or ""
         token = page.get("NextContinuationToken") if page.get("IsTruncated") else None
         if not token:
             break
+
+
+def list_days(channel):
+    """{'YYYY-MM-DD': [platform, ...]} for every chart in the bucket, newest first."""
+    found = {}
+    for key in _keys(channel):
+        parsed = parse_key(key)
+        if parsed:
+            platform, day = parsed
+            if platform not in found.setdefault(day, []):
+                found[day].append(platform)
     # Newest first, and dicts keep insertion order, so the page can just iterate.
     return {day: sorted(found[day]) for day in sorted(found, reverse=True)}
+
+
+def list_trends(channel):
+    """[(kind, platform), ...] for the multi-day charts the bucket holds.
+
+    Listed rather than remembered, so trends.html keeps the property index.html
+    has: it can be rebuilt correctly from the bucket alone, with no local CSVs
+    and nothing carried between runs.
+    """
+    found = set()
+    for key in _keys(channel, TRENDS_PREFIX):
+        parsed = parse_trend_key(key)
+        if parsed:
+            found.add(parsed)
+    return [(kind, platform) for kind in TREND_KINDS
+            for platform in PLATFORMS if (kind, platform) in found]
 
 
 def load_titles(channel):
@@ -500,9 +570,26 @@ def save_titles(channel, titles):
         ContentType="application/json; charset=utf-8", CacheControl="no-cache"))
 
 
-def publish_index(channel, today, titles=None):
-    """Rebuild index.html from what is actually in the bucket and upload it."""
+def _publish_page(channel, key, page):
+    """Upload one HTML page. Returns the site's URL."""
     known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    _with_backoff("publish {} for {}".format(key, channel), lambda: s3.put_object(
+        Bucket=known["bucket"], Key=key, Body=page.encode("utf-8"),
+        ContentType="text/html; charset=utf-8",
+        # no-cache, not no-store: the browser may keep it but must revalidate,
+        # or tomorrow's first visit shows today's page.
+        CacheControl="no-cache"))
+    return website_url(known["bucket"], known["region"])
+
+
+def publish_index(channel, today, titles=None, trends=None):
+    """Rebuild index.html from what is actually in the bucket and upload it.
+
+    `trends` says whether to link the Trends page. None means look, which is
+    what `s3 --publish-index` on its own needs; the daily report has just
+    published them and passes a bool rather than paying for another listing.
+    """
     days = list_days(channel)
 
     stored = load_titles(channel)
@@ -513,15 +600,25 @@ def publish_index(channel, today, titles=None):
             save_titles(channel, merged)
         stored = merged
 
-    page = render_index(channel, today, days, stored.get(today.isoformat()))
-    s3 = _client("s3", known["region"])
-    _with_backoff("publish index for {}".format(channel), lambda: s3.put_object(
-        Bucket=known["bucket"], Key=INDEX_KEY, Body=page.encode("utf-8"),
-        ContentType="text/html; charset=utf-8",
-        # no-cache, not no-store: the browser may keep it but must revalidate,
-        # or tomorrow's first visit shows today's page.
-        CacheControl="no-cache"))
-    return {"url": website_url(known["bucket"], known["region"]), "days": len(days)}
+    if trends is None:
+        trends = bool(list_trends(channel))
+
+    page = render_index(channel, today, days, stored.get(today.isoformat()),
+                        trends=trends)
+    return {"url": _publish_page(channel, INDEX_KEY, page), "days": len(days)}
+
+
+def publish_trends(channel, today):
+    """Rebuild trends.html from the trend charts in the bucket and upload it.
+
+    Uploading the charts is the caller's job — this only builds the page around
+    whatever is actually there, so a channel with Twitch charts and no YouTube
+    ones gets a page with two panels rather than two broken images.
+    """
+    charts = list_trends(channel)
+    page = render_trends(channel, today, charts)
+    return {"url": "{}/{}".format(_publish_page(channel, TRENDS_KEY, page), TRENDS_KEY),
+            "charts": len(charts)}
 
 
 # --------------------------------------------------------------------------
@@ -551,6 +648,7 @@ STYLE = """
     margin: 10px 0 0; color: #f1f1f1; font-size: 15px; line-height: 1.4;
     max-width: 74ch;
   }
+  .nav { margin: 14px 0 0; font-size: 14px; }
 
   h2 {
     margin: 0 0 14px; font-size: 13px; font-weight: 600;
@@ -585,7 +683,7 @@ HEAD = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{channel} — stream metrics</title>
+<title>{channel} — {page}</title>
 <style>"""
 
 BODY = """</style>
@@ -594,7 +692,7 @@ BODY = """</style>
 <main>
   <header>
     <h1>{channel}</h1>
-    <p class="today">{date}</p>{titles}
+    <p class="today">{date}</p>{titles}{nav}
   </header>
 {panels}
   <section class="past">
@@ -607,18 +705,44 @@ BODY = """</style>
 </html>
 """
 
+# The Trends page. Same shell, but no Past days section: every chart on it
+# already spans days, so there is nothing older to link to.
+TRENDS_BODY = """</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>{channel}</h1>
+    <p class="today">Trends · to {date}</p>
+    <p class="nav"><a href="{index}">← Today</a></p>
+  </header>
+{panels}
+  <footer>Updated {date}</footer>
+</main>
+</body>
+</html>
+"""
+
 PANEL = """  <section class="panel{css}">
     <h2>{label}</h2>
     <img src="{key}" alt="{label} concurrent viewers on {date}">
   </section>"""
 
+TREND_PANEL = """  <section class="panel">
+    <h2>{label}</h2>
+    <img src="{key}" alt="{label}">
+  </section>"""
 
-def render_index(channel, today, days, titles=None):
-    """The whole site: one HTML page, no JS, no external assets.
+
+def render_index(channel, today, days, titles=None, trends=False):
+    """The front page: one day's charts, no JS, no external assets.
 
     `days` is list_days()' mapping, newest first. Today's charts are shown;
     every earlier day is a link and nothing more, so the page stays quick to
     load however many months accumulate.
+
+    The Trends link is only drawn when `trends` says that page exists, so a
+    channel whose multi-day charts have never rendered gets no dead link.
 
     Everything interpolated goes through html.escape(): the channel name
     arrives from a command line argument, and the keys are built from it.
@@ -663,11 +787,39 @@ def render_index(channel, today, days, titles=None):
     past = ("    <ul>\n" + "\n".join(rows) + "\n    </ul>" if rows else
             '    <p class="empty">Nothing earlier yet — this is the first day.</p>')
 
-    return (HEAD.format(channel=html.escape(str(channel)))
+    nav = ('\n    <p class="nav"><a href="{}">Trends →</a></p>'.format(
+        html.escape(TRENDS_KEY)) if trends else "")
+
+    return (HEAD.format(channel=html.escape(str(channel)), page="stream metrics")
             + STYLE
             + BODY.format(channel=html.escape(str(channel)),
                           date=html.escape(pretty),
                           titles=stream_titles,
+                          nav=nav,
                           panels="\n".join(panels),
                           past=past,
                           count=len(days)))
+
+
+def render_trends(channel, today, charts):
+    """The Trends page: the multi-day charts, one panel each.
+
+    `charts` is list_trends()' [(kind, platform)], so the page is built from
+    what the bucket actually holds and never links an image that isn't there.
+    """
+    pretty = today.strftime("%a %d %b %Y")
+    panels = [TREND_PANEL.format(
+        label=html.escape(TREND_LABELS.get(
+            (kind, platform), "{} · {}".format(kind, platform))),
+        key=html.escape(trend_key(kind, platform)))
+        for kind, platform in charts]
+    if not panels:
+        panels.append('  <p class="empty">No trend charts yet — they appear once '
+                      'the daily report has run.</p>')
+
+    return (HEAD.format(channel=html.escape(str(channel)), page="trends")
+            + STYLE
+            + TRENDS_BODY.format(channel=html.escape(str(channel)),
+                                 date=html.escape(pretty),
+                                 index=html.escape(INDEX_KEY),
+                                 panels="\n".join(panels)))
