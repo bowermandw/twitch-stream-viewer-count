@@ -12,9 +12,30 @@
 #   journalctl -u twitch-metrics@prgskidmark -f
 #   systemctl stop 'twitch-metrics@*'
 #
-# Instances are independent: each writes data/metrics_<channel>.csv and its own
+# Instances are independent: each records its own channel and writes its own
 # log, and one crashing or being stopped does not affect the others. They share
 # the cached tokens, which are written atomically and refreshed under a lock.
+#
+# THE DATABASE. Samples go to PostgreSQL now, and data/*.csv is only the spool
+# written while it is unreachable. Two consequences for this unit:
+#
+#   * psycopg has to be importable by whatever Python ExecStart names. Debian's
+#     /usr/bin/python3 will not have it unless you installed it system-wide, so
+#     either use a venv (see ExecStart below) or:
+#         apt install python3-psycopg3      # or: pip install --break-system-packages
+#
+#   * TWITCH_DATABASE_URL has to be in /opt/twitch-metrics/.env, and that file
+#     has to be readable by User= below. Use 127.0.0.1 rather than a Unix
+#     socket: ProtectSystem=strict leaves /run/postgresql read-only, and a
+#     socket connection needs to write to it -- which fails with an error that
+#     reads like an authentication problem and is not one.
+#
+#         TWITCH_DATABASE_URL=postgresql://twitch:PASSWORD@127.0.0.1:5432/twitchmetrics
+#
+# A poller that cannot reach the database does not stop: it appends to
+# data/*.csv and replays the gap itself once the database answers again. So
+# data/ still has to be writable, and a CSV that is NOT growing is the healthy
+# state rather than a sign the poller has died.
 #
 # BEFORE ENABLING, edit User, Group and WorkingDirectory below to match your
 # install. The values here are placeholders and WILL fail if left as-is:
@@ -34,14 +55,19 @@
 [Unit]
 Description=Twitch metrics poller for %i
 Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
-After=network-online.target
+After=network-online.target postgresql.service
 Wants=network-online.target
+# Wants, never Requires: a database that is down must delay this poller,
+# not stop it. The CSV spool exists for exactly that window.
+Wants=postgresql.service
 
 [Service]
 Type=simple
 User=twitch
 Group=twitch
 WorkingDirectory=/opt/twitch-metrics
+# Use the venv's Python if you installed psycopg there:
+#   ExecStart=/opt/twitch-metrics/.venv/bin/python -m twitchmetrics poll %i
 ExecStart=/usr/bin/python3 -m twitchmetrics poll %i
 
 # Restart on crash, backing off so a persistent failure doesn't spin.

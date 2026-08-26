@@ -76,6 +76,23 @@ def write_all(path, header, rows):
         writer.writerows(rows)
 
 
+def read_raw(path):
+    """Every row as the CSV spells it -- field names, strings, nothing parsed.
+
+    read_samples() below is the shape the charts want, and it drops what they do
+    not use: started_at is in all three headers and has never been parsed by it.
+    The database keeps that column, so importing an archive and replaying a
+    spool both need the row as WRITTEN rather than as charted.
+
+    Deliberately a second function rather than a refactor of read_samples().
+    That one is what every chart reads through and what the smoke tests pin down
+    line by line; it has earned the right to stay exactly as it is.
+    """
+    with open(path, newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            yield row
+
+
 def read_samples(path):
     """Parse a viewers_*, metrics_* or youtube_* CSV, skipping unreadable rows.
 

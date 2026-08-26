@@ -20,7 +20,7 @@ import subprocess
 import sys
 import time
 
-from .. import chart, config, storage, trends
+from .. import chart, config, db, store, trends
 from ..logging import log, use_file
 from . import graph_cmd
 
@@ -39,8 +39,11 @@ UNIT_PREFIXES = ("twitch-metrics@", "youtube-metrics@")
 UNIT_PREFIX = UNIT_PREFIXES[0]   # kept for the systemctl glob below
 UNIT_SUFFIX = ".service"
 
-# Where each platform's samples live, in the order the page shows them.
-PLATFORMS = (("twitch", config.metrics_csv), ("youtube", config.youtube_csv))
+# The platforms a channel can be polled on, in the order the page shows them.
+# This used to pair each name with the function naming its CSV; the samples are
+# one table now, and store.locator() builds the address from the platform and
+# the channel.
+PLATFORMS = ("twitch", "youtube")
 
 # What Twitch allows in a login. systemd-escape only escapes characters outside
 # [A-Za-z0-9:_.-], so a real instance name never arrives escaped — anything
@@ -81,11 +84,20 @@ def add_arguments(parser):
     parser.add_argument("--no-trends", action="store_true",
                         help="skip the multi-day charts and the Trends page")
     parser.add_argument("--peak-days", type=int, default=trends.PEAK_DAYS, metavar="N",
-                        help="days on the peaks chart (default {})".format(trends.PEAK_DAYS))
+                        help="days with a stream on the peaks chart "
+                             "(default {})".format(trends.PEAK_DAYS))
     parser.add_argument("--compare-days", type=int, default=trends.COMPARE_DAYS,
                         metavar="N",
-                        help="days shown behind today on the half-hour chart "
-                             "(default {})".format(trends.COMPARE_DAYS))
+                        help="days with a stream shown behind today on the "
+                             "half-hour chart (default {})".format(trends.COMPARE_DAYS))
+    parser.add_argument("--calendar-days", action="store_true",
+                        help="count calendar days rather than days with a stream, "
+                             "so a day off takes a slot and draws a dash")
+    parser.add_argument("--lookback", type=int, default=trends.LOOKBACK_DAYS,
+                        metavar="N",
+                        help="how far back to hunt for a day with a stream "
+                             "(default {}); ignored with --calendar-days".format(
+                                 trends.LOOKBACK_DAYS))
 
 
 # --------------------------------------------------------------------------
@@ -207,22 +219,25 @@ def classify_day(samples, day):
     return "live" if any(s["live"] for s in same_day) else "dark"
 
 
-def read_day(channel, day, source=config.metrics_csv):
-    """(status, path) for one channel, day and platform; 'missing' when there's no CSV.
+def read_day(channel, day, platform="twitch"):
+    """(status, source) for one channel, day and platform.
 
-    `source` is the platform's path function — config.metrics_csv or
-    config.youtube_csv — so the four statuses answer per platform rather than
-    per channel.
+    'missing' used to mean "there is no CSV for this platform". With the samples
+    in one table there is no file to be absent, so it now means "this channel
+    has no samples on this platform at all" — which answers the same question a
+    store without filenames can still answer, and keeps a Twitch-only channel
+    reading as 'missing' on YouTube rather than as a fault.
+
+    A database that cannot be reached is deliberately NOT 'missing': reporting
+    an outage as "never polled here" would publish today's page as though today
+    had no data. It raises instead, and _database_preflight() has already
+    stopped the run long before this is reached.
     """
-    path = source(channel)
-    if not os.path.exists(path):
-        return "missing", path
-    try:
-        samples = storage.read_samples(path)
-    except OSError as exc:
-        log("WARN     {} — could not read {}: {}".format(channel, os.path.basename(path), exc))
-        return "missing", path
-    return classify_day(samples, day), path
+    source = store.locator(platform, channel)
+    samples = store.load(source)
+    if not samples:
+        return "missing", source
+    return classify_day(samples, day), source
 
 
 # --------------------------------------------------------------------------
@@ -230,28 +245,28 @@ def read_day(channel, day, source=config.metrics_csv):
 # --------------------------------------------------------------------------
 
 
-def render_svg(channel, day, args, platform, path):
+def render_svg(channel, day, args, platform, source):
     """Chart one platform's day exactly as `graph --date` would; returns the SVG path.
 
-    The CSV path is handed to graph as its `channel`, which pick_source()
-    already accepts for anything ending in .csv — and already recovers the
-    channel name from, so the chart is titled 'testchannel' and not
-    'youtube_testchannel'.
+    Still driven through the graph command rather than duplicating its render
+    branches. It used to be handed a CSV path as its `channel`, which
+    pick_source() accepted; now it is handed the channel and the platform, which
+    is what that hack was standing in for all along.
     """
     out = config.chart_path(channel, "_{}_{}".format(platform, day.isoformat()))
     graph_cmd.run(graph_cmd.default_args(
-        channel=path, date=day.isoformat(), output=out,
+        channel=channel, platform=platform, date=day.isoformat(), output=out,
         bucket=args.bucket, no_buckets=args.no_buckets))
     return out
 
 
-def _render_platform(channel, day, args, platform, source):
+def _render_platform(channel, day, args, platform):
     """(svg_path_or_None, outcome). None means there is nothing to publish.
 
     A platform this channel isn't polled on is 'absent', not 'failed' — a
     Twitch-only channel must not fail the run for having no YouTube data.
     """
-    status, path = read_day(channel, day, source)
+    status, source = read_day(channel, day, platform)
     if status == "missing":
         return None, "absent"
     if status == "silent":
@@ -270,7 +285,7 @@ def _render_platform(channel, day, args, platform, source):
         log("skip     {} {} — offline all day, nothing to chart".format(channel, platform))
         return None, "dark"
     try:
-        svg = render_svg(channel, day, args, platform, path)
+        svg = render_svg(channel, day, args, platform, source)
     except SystemExit as exc:
         log("WARN     {} {} — {}".format(channel, platform, str(exc).splitlines()[0]))
         return None, "failed"
@@ -287,13 +302,28 @@ def render_cross_platform(channel, day, live_points):
     """Chart every platform's viewers together, or None if fewer than two have data.
 
     Written straight to charts/ rather than through graph_cmd, because `graph`
-    reads one CSV and this is the one chart that spans them.
+    charts one platform and this is the one chart that spans them.
+
+    The minute grid comes from the database rather than from these samples. It
+    is the same grid -- tests/smoke.py holds the SQL and chart.align_platforms()
+    to producing identical output -- but building it in SQL is what makes the
+    combined chart readable from stored rows instead of by re-reading every
+    sample on both platforms. A store that cannot answer falls back to aligning
+    them here, because a chart is worth more than where its grid came from.
     """
     series = [dict(spec, points=live_points.get(spec["key"]) or [])
               for spec in chart.PLATFORMS if live_points.get(spec["key"])]
     if len(series) < 2:
         return None
-    svg = chart.render_platforms(series, channel, day)
+    aligned = None
+    try:
+        aligned = store.channel_minutes(channel, day, [e["key"] for e in series])
+    except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+        log("WARN     {} — minute grid from samples instead: {}".format(
+            channel, str(exc).splitlines()[0]))
+    if aligned and not aligned[0]:
+        aligned = None
+    svg = chart.render_platforms(series, channel, day, aligned=aligned)
     if not svg:
         return None
     out = config.chart_path(channel, "_combined_" + day.isoformat())
@@ -306,29 +336,54 @@ def render_cross_platform(channel, day, live_points):
 def render_trend_charts(channel, day, args):
     """The multi-day charts for every platform with history; [(kind, platform, path)].
 
-    Reads each platform's whole CSV rather than one day of it — that is the
-    point of them. A platform with nothing in the window contributes nothing,
-    so a channel that has only ever streamed on Twitch gets two charts and not
-    two empty ones.
+    Reads the window out of the report tables rather than re-deriving it from
+    every sample the channel has ever produced. The poller has been filling
+    tm.report_daily_peak and tm.report_clock_bucket on every sample since the
+    samples moved into Postgres; this is the first thing to read them.
+
+    A platform with nothing in the window still contributes nothing, so a
+    channel that has only ever streamed on Twitch gets two charts and not four.
+    There is deliberately no "has this platform any samples" guard any more and
+    none is needed: render_peaks() returns None when no day has a peak and
+    render_typical() returns None when no slot has a bar, so an unpolled
+    platform falls out by itself. Re-introducing the guard would mean loading
+    every sample again, which is the one thing this stopped doing.
 
     Written straight to charts/ under a name with no date in it, because they
     describe where the channel is now: each run replaces them.
     """
+    # Once per channel and ahead of the loop, because tm.refresh_range() walks
+    # every platform on the channel itself -- calling it per platform would do
+    # the whole job twice. Its failure is logged and swallowed: the reads below
+    # report their own, and today's page is worth more than the trend charts.
+    #
+    # A streamed axis reaches back as far as the lookback allows, so the tables
+    # have to hold that whole range or the older streams it wants are simply
+    # absent. ensure_reports() clamps the request to the channel's own first
+    # sample, which is what stops a young channel re-refreshing 90 days forever.
+    span = (max(1, args.peak_days, args.compare_days + 1) if args.calendar_days
+            else max(1, args.lookback))
+    try:
+        store.ensure_reports(channel, day, span, minutes=args.bucket)
+    except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+        log("WARN     {} — report tables not refreshed: {}".format(
+            channel, str(exc).splitlines()[0]))
+
     made = []
-    for platform, source in PLATFORMS:
-        path = source(channel)
-        if not os.path.exists(path):
-            continue
+    for platform in PLATFORMS:
         try:
-            samples = storage.read_samples(path)
-        except OSError as exc:
-            log("WARN     {} {} — could not read {}: {}".format(
-                channel, platform, os.path.basename(path), exc))
+            peaks = store.daily_peaks(channel, platform, day, args.peak_days,
+                                      calendar=args.calendar_days,
+                                      lookback=args.lookback)
+            slots, per_day, dropped = store.compare_slots(
+                channel, platform, day, args.compare_days, args.bucket,
+                calendar=args.calendar_days, lookback=args.lookback)
+        except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+            log("WARN     {} {} — no trend charts: {}".format(
+                channel, platform, str(exc).splitlines()[0]))
             continue
-        charts = trends.render_all(samples, channel, platform, day,
-                                   peak_days=args.peak_days,
-                                   compare_days=args.compare_days,
-                                   minutes=args.bucket)
+        charts = trends.render_from(peaks, slots, per_day, channel, platform, day,
+                                    minutes=args.bucket, dropped=dropped)
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -339,6 +394,34 @@ def render_trend_charts(channel, day, args):
                                                os.path.basename(out)))
             made.append((kind, platform, out))
     return made
+
+
+def site_line(channel):
+    """The channel's website address, or the command that would create one.
+
+    Reads the local registry only — no credentials, no network — so this is
+    safe on every path, including --list-channels and a run with no boto3.
+    """
+    from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
+
+    known = s3.bucket_for(channel)
+    if known:
+        return s3.website_url(known["bucket"], known["region"])
+    return "no bucket yet — {} s3 --setup {}".format(config.invocation(), channel)
+
+
+def warn_exit(channel, exc):
+    """Log a SystemExit in full rather than only its first line.
+
+    require_bucket() raises two lines: what is wrong, and the command that
+    fixes it. Keeping only the first threw away the actionable half, so a
+    channel that had never been through `s3 --setup` reported "No S3 bucket"
+    and never said how to get one.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()] or [""]
+    log("WARN     {} — {}".format(channel, lines[0]))
+    for line in lines[1:]:
+        log("WARN     {}   {}".format(channel, line))
 
 
 def _publish_trends(channel, day, charts):
@@ -363,42 +446,29 @@ def _publish_trends(channel, day, charts):
             channel, page["charts"], page["url"]))
         return page["charts"] > 0
     except SystemExit as exc:
-        log("WARN     {} — trends not published: {}".format(
-            channel, str(exc).splitlines()[0]))
+        warn_exit(channel, exc)
         return False
     except Exception as exc:  # noqa: BLE001 - the day's page still has to go out
         log("WARN     {} — trends not published: {}".format(channel, exc))
         return False
 
 
-def day_title(channel, day, source):
+def day_title(channel, day, platform):
     """The title that platform's stream carried, or "" if there is none.
 
     The last one seen, not the first: a title edited mid-broadcast is usually
     being corrected, so what it ended as is what the day was called.
     """
-    path = source(channel)
-    if not os.path.exists(path):
-        return ""
-    try:
-        samples = storage.read_samples(path)
-    except OSError:
-        return ""
+    samples = store.load(store.locator(platform, channel))
     titles = [s["title"] for s in samples
               if s["live"] and s["title"]
               and s["when"].astimezone().date() == day]
     return titles[-1] if titles else ""
 
 
-def day_points(channel, day, source):
+def day_points(channel, day, platform):
     """(when, viewers) for one platform's live samples on one day."""
-    path = source(channel)
-    if not os.path.exists(path):
-        return []
-    try:
-        samples = storage.read_samples(path)
-    except OSError:
-        return []
+    samples = store.load(store.locator(platform, channel))
     return [(s["when"], s["viewers"]) for s in samples
             if s["live"] and s["viewers"] is not None
             and s["when"].astimezone().date() == day]
@@ -412,17 +482,23 @@ def report_channel(channel, day, args):
     """
     from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
 
+    # First, and unconditionally. A day the channel didn't stream, a --dry-run
+    # and a failed upload all used to end without the address anywhere in the
+    # output, leaving the only copy of a random bucket suffix in a JSON file
+    # nobody thinks to open.
+    log("{}  {:<8} {}".format(channel, "site", site_line(channel)))
+
     rendered = []
     outcomes = []
     live_points = {}
     titles = {}
-    for platform, source in PLATFORMS:
-        svg, outcome = _render_platform(channel, day, args, platform, source)
+    for platform in PLATFORMS:
+        svg, outcome = _render_platform(channel, day, args, platform)
         outcomes.append(outcome)
         if svg:
             rendered.append((platform, svg))
-            live_points[platform] = day_points(channel, day, source)
-            title = day_title(channel, day, source)
+            live_points[platform] = day_points(channel, day, platform)
+            title = day_title(channel, day, platform)
             if title:
                 titles[platform] = title
 
@@ -460,7 +536,7 @@ def report_channel(channel, day, args):
         has_trends = _publish_trends(channel, day, trend_charts)
         page = s3.publish_index(channel, day, titles, trends=has_trends)
     except SystemExit as exc:
-        log("WARN     {} — {}".format(channel, str(exc).splitlines()[0]))
+        warn_exit(channel, exc)
         return "failed"
     except Exception as exc:  # noqa: BLE001 - one channel's outage isn't the run's
         log("WARN     {} — publish failed: {}".format(channel, exc))
@@ -485,6 +561,21 @@ def _publish_preflight(region):
     return True
 
 
+def _database_preflight():
+    """Prove the samples can be read before rendering anything.
+
+    Beside the AWS preflight and for the same reason: charting four channels and
+    only then discovering the store is unreachable wastes the run and reads as a
+    chart bug rather than a connectivity one.
+
+    Deliberately no CSV fallback. The pollers keep a spool so an outage loses
+    nothing, but a page quietly built from whatever happened to be spooled would
+    be worse than no page — it would look complete and be wrong.
+    """
+    db.require_readable()
+    return True
+
+
 def _list_channels(channels, source, day):
     """One line per channel per platform. Needs no credentials and no network."""
     print("{} channel(s) from {}:\n".format(len(channels), source))
@@ -492,13 +583,28 @@ def _list_channels(channels, source, day):
              "dark": "offline all day",
              "silent": "no samples on {}".format(day.isoformat()),
              "missing": "not polled here"}
+    # Probed once, and reported as a heading rather than smeared across every
+    # row. Diagnosing channel discovery on a fresh server is exactly when the
+    # database is most likely to be the thing that is wrong, so this has to keep
+    # working when it is — the same rule the module comment states for boto3 —
+    # but repeating a connection error once per channel per platform buries the
+    # list it was asked for.
+    reachable, why = db.probe()
+    if not reachable:
+        print("  The sample store is unavailable, so only the channel list "
+              "below is real:\n    {}\n".format(why))
+
     for channel in channels:
-        for platform, csv_for in PLATFORMS:
-            status, path = read_day(channel, day, csv_for)
-            print("  {:<18} {:<8} {:<34} {}".format(
-                channel, platform,
-                os.path.basename(path) if os.path.exists(path) else "(no CSV)",
-                words[status]))
+        print("  {:<18} {}".format(channel, site_line(channel)))
+        for platform in PLATFORMS:
+            if not reachable:
+                print("  {:<18} {:<8} {}".format(channel, platform, "unknown"))
+                continue
+            status, _ = read_day(channel, day, platform)
+            rows = len(store.load(store.locator(platform, channel)))
+            held = "{:,} sample(s)".format(rows) if rows else "nothing stored"
+            print("  {:<18} {:<8} {:<20} {}".format(
+                channel, platform, held, words[status]))
     print()
 
 
@@ -525,6 +631,11 @@ def run(args):
             prog=config.invocation(),
             looked=", ".join("{}{}".format(d, "" if os.path.isdir(d) else " (missing)")
                              for d in _wants_dirs())))
+
+    # The database first: it is needed whether or not anything is published, and
+    # a --dry-run that renders nothing because the store is down should say so
+    # rather than reporting every channel as having no data.
+    _database_preflight()
 
     if not args.no_upload:
         _publish_preflight(args.region)

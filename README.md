@@ -67,6 +67,18 @@ entry point. If you'd rather not bother, `python3 -m twitchmetrics` is
 equivalent everywhere and needs nothing. This README writes the short form for
 readability; substitute whichever you use.
 
+Two optional extras do download something, and only the commands that need them
+will ever say so:
+
+```
+pip install -e '.[pg]'     # psycopg, to read and write the sample database
+pip install -e '.[aws]'    # boto3, to publish the website
+```
+
+A machine that only collects samples needs neither: it writes to the database
+when it can reach one and to a CSV when it cannot. See
+[The database](#the-database).
+
 For servers, see [`deploy/README.md`](deploy/README.md) — requirements, running
 it in the background, and how to handle the one step that needs a browser.
 
@@ -113,6 +125,83 @@ twitch-metrics setup --client-id XXXX --client-secret YYYY
 
 ---
 
+## The database
+
+Samples live in PostgreSQL. The CSVs under `data/` are still there, but their
+job has changed: they are a **spool**, written only when the database cannot be
+reached, and drained back into it automatically as soon as it answers.
+
+```
+pip install -e '.[pg]'
+echo 'TWITCH_DATABASE_URL=postgresql://twitch:PASSWORD@127.0.0.1:5432/twitchmetrics' >> .env
+twitch-metrics db --init       # create the tables; safe to run again
+twitch-metrics db --import     # load the CSVs already in data/
+twitch-metrics db --verify     # prove the database agrees with them
+```
+
+`db --status` is the one to reach for when something is wrong. It never raises,
+and it tells the three lookalike failures apart: nothing configured, psycopg not
+installed, and a database that will not answer.
+
+### Why not just keep the CSVs
+
+Each sample repeated its whole broadcast — title, category, start time, stream
+id — on every row, so a six-hour stream stored the same title three hundred and
+fifty times. Aggregates were recomputed from scratch on every run, and the daily
+report read the same file four times over. Nothing could be asked across two
+channels without loading both into Python.
+
+Now the broadcast is stored once, in `stream`, and the samples point at it. The
+aggregates behind the Trends page are tables, filled by SQL functions that take
+the window, the bucket width and the timezone as parameters — so a new trend is
+a function call rather than new Python.
+
+The Trends charts read those tables. A `daily` run refreshes the window it is
+about to draw and then reads it back, so the ten-day peaks and the half-hour
+comparison never touch a raw sample — which is what puts `low_viewers`,
+`avg_viewers`, the follower and subscriber deltas, and the difference between a
+day off and a day nobody polled within reach of a chart rather than behind a
+rewrite. The day chart still reads samples, because sessions are a read-time
+computation over them and no table tries to express one.
+
+### What survives an outage
+
+Only the pollers fall back to CSV, and that is deliberate:
+
+| | database unreachable |
+|---|---|
+| `poll`, `youtube` | append to `data/*.csv`, warn once, replay when it returns |
+| `graph`, `daily` | refuse, and say so |
+
+A chart quietly built from a stale spool would look complete and be wrong, which
+is worse than no chart. Nothing is lost meanwhile — the pollers replay the gap
+themselves, and `db --verify` will tell you they did.
+
+### The live-video cache
+
+`stream.ended_at IS NULL` means "live right now", which the YouTube poller reads
+before deciding how much quota to spend. Finding the live broadcast the long way
+costs two units — one to list recent uploads, one to ask which is live — and the
+answer almost never changes between samples. Asking about a remembered video id
+costs one:
+
+```
+3 units per sample  ->  2 while a broadcast is running
+4,320 a day at 60s  ->  2,880, which leaves room for a third channel
+```
+
+It also closes a real gap: the playlist walk only looks at the fifteen most
+recent uploads, so a long broadcast on a channel that uploads often could fall
+out of that window and read as though it had ended.
+
+### Timezone
+
+Every aggregate buckets by **local** date, so the database has to agree with the
+machine about where a day begins. `TWITCH_TIME_ZONE` sets it; left unset it is
+discovered from `TZ`, then `/etc/timezone`, then `/etc/localtime`. `db --init`
+checks the answer against the server, because a wrong zone does not fail — it
+quietly files every stream that crosses midnight under the wrong date.
+
 ## Polling
 
 ```
@@ -137,7 +226,7 @@ blank. Only `is_live` marks a broadcast.
 twitch-metrics poll testchannel --once           # one sample
 twitch-metrics poll testchannel --no-chatters    # skip chat size
 twitch-metrics poll testchannel --viewers-only   # viewers alone
-twitch-metrics poll testchannel --interval 60    # every minute
+twitch-metrics poll testchannel --interval 300   # every five minutes
 ```
 
 ### Changing the interval
@@ -145,15 +234,21 @@ twitch-metrics poll testchannel --interval 60    # every minute
 No code edit needed. Either flag it per run, or set it once in `.env`:
 
 ```
-TWITCH_INTERVAL=60
+TWITCH_INTERVAL=120
 ```
 
-Precedence is **`--interval` > `TWITCH_INTERVAL` > 300 seconds**, with a minimum
+Precedence is **`--interval` > `TWITCH_INTERVAL` > 60 seconds**, with a minimum
 of 10. A value that isn't a number is reported rather than silently ignored,
 since a typo in a service file would otherwise poll at the wrong rate unnoticed.
 
 Samples land on wall-clock boundaries, so 60 gives you :00, :01, :02 and 300
 gives :00, :05, :10.
+
+A minute is a resolution decision here, not a budget one — see the rate-limit
+note below. Five minutes was the old default and it under-samples visibly: a
+raid or a clip going round moves the viewer count faster than that, and the
+chart drew the recovery as a straight line because nothing was recorded on the
+way down. YOUTUBE_INTERVAL is the opposite case and is bounded by quota.
 
 Twitch's rate limit is 800 points per minute. Polling three metrics every 60
 seconds for one channel uses 3 — even a dozen channels at that rate is nowhere
@@ -450,19 +545,27 @@ twitch-metrics daily --date yesterday         # backfill a day
 twitch-metrics daily testchannel           # just this one
 twitch-metrics daily --list-channels          # who's in, and what today looks like
 twitch-metrics daily --no-trends              # skip the multi-day charts
+twitch-metrics daily --calendar-days          # trends by date, not by stream
 ```
 
 ```
 […] start    aws account 123456789012 as twitch-metrics
 […] start    daily report for 2026-08-24 — 2 channel(s) from the enabled systemd units
+[…] testchannel  site     http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com
 […] testchannel  twitch   28 KB -> chart_testchannel_twitch_2026-08-24.svg
 […] testchannel  youtube  11 KB -> chart_testchannel_youtube_2026-08-24.svg
 […] testchannel  twitch   -> http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com/twitch/2026-08-24.svg
 […] testchannel  youtube  -> http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com/youtube/2026-08-24.svg
 […] testchannel  page rebuilt from 3 day(s): http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com
+[…] prgskidmark  site     http://tm-prgskidmark-<suffix>.s3-website-<region>.amazonaws.com
 […] skip     prgskidmark twitch — offline all day, nothing to chart
 […] stop     1 published, 1 dark in 4.1s
 ```
+
+The `site` line comes first for every channel and does not depend on the run
+succeeding, so a day the channel was dark, a `--dry-run` and a failed upload all
+still tell you the address. A channel that has never been through
+`s3 --setup` says that instead, with the command that fixes it.
 
 A channel polled on both platforms gets a graph each; one polled on only Twitch
 gets one graph, and that is **not** a failure — a platform you don't stream on
@@ -533,6 +636,12 @@ unlisted, and a real one does not belong in a repo that isn't private. Ask for
 your own with `s3 --url`; it is recorded in `data/.s3_buckets.json`, which is
 gitignored.
 
+The suffix is **random per bucket**, not per account, so it cannot be
+recomputed and it is not shared between your channels. Swapping one channel's
+name into another's address gives you a bucket that doesn't exist, and an S3
+website endpoint answers that with a 404. `s3 --list` prints the real one for
+every channel that has a bucket.
+
 The bucket holds nothing but the page and the charts:
 
 ```
@@ -552,10 +661,11 @@ trends/typical-youtube.svg
 `index.html` answers *what happened today*. Everything comparative lives on a
 second page, linked from under the date:
 
-- **Peak viewers by day**, the last ten days as one bar each, Twitch and
-  YouTube charted separately.
+- **Peak viewers by day**, the last ten days *that streamed* as one bar each,
+  Twitch and YouTube charted separately.
 - **Half-hour averages, today vs before**, one bar per day per half hour of the
-  clock — today beside each of the previous five days, oldest to newest.
+  clock — today beside each of the previous five days that streamed, oldest to
+  newest.
 
 The second one is the reason there is a separate module rather than another
 function in `chart.py`. Every graph on the front page buckets by time *since the
@@ -569,8 +679,19 @@ average hides its own spread — one freak evening drags "normal" up and nothing
 on the chart says so — whereas five bars show you immediately whether today is
 outside the range or in the middle of it.
 
-A day you didn't stream is a gap, never a zero, for the same reason the combined
-chart leaves holes: 0 viewers is a real reading a stream that has just gone live
+**The axis counts streams, not dates.** Ten bars mean ten broadcasts, whenever
+they happened. A channel streaming twice a week used to get three bars and seven
+dashes out of a ten-day window — a chart mostly about the days it was resting.
+Now the days off are simply not on it, and because the axis can then span months
+the labels carry the month and the chart names its own date range.
+
+The axis reaches back at most `--lookback` days, 90 by default, so a channel
+quiet since last year does not drag the whole of its history into every run.
+Finding fewer than ten is not a failure; the chart just has fewer bars.
+
+`--calendar-days` restores the old view, dashes and all. A day you didn't stream
+is still a gap there and never a zero, for the same reason the combined chart
+leaves holes: 0 viewers is a real reading a stream that has just gone live
 genuinely has, and drawing a day off the same way would invent a catastrophe out
 of a rest. A channel that spans more than twelve hours has its busiest twelve
 shown, and the chart says so rather than quietly cropping.
@@ -581,8 +702,8 @@ page is still built from a **listing of the bucket**, like `index.html`, so it
 only ever links a chart that is actually there, and the front page's link only
 appears once there is something to link to.
 
-Ten days and five are `--peak-days` and `--compare-days`; the half-hour width is
-the same `--bucket` the per-day charts use.
+Ten and five are `--peak-days` and `--compare-days`, counted in days that
+streamed; the half-hour width is the same `--bucket` the per-day charts use.
 
 ### Both platforms on one chart
 
@@ -870,15 +991,40 @@ gives identical data.
 python3 tests/smoke.py
 ```
 
-423 checks over the committed fixtures — parsing, session detection, day
+490 checks over the committed fixtures — parsing, session detection, day
 selection, gap handling, axis choice, path safety, rendering, CLI wiring,
 channel discovery, bucket naming, the index page, the Drive query and
 multipart builders, and the quota refusals that stop a mistyped YouTube interval
-costing a day's data. It proves boto3 stays optional by running the CLI against
-a `boto3.py` that refuses to import. It also covers adding a column to a CSV already on disk, which is
-silently lossy if done wrong. No network, no credentials, no tokens. It won't
-catch Twitch or YouTube changing an API contract; only regressions in this
-code.
+costing a day's data. It proves boto3 and psycopg both stay optional by running
+the CLI against modules that refuse to import. It also covers adding a column to
+a CSV already on disk, which is silently lossy if done wrong. No network, no
+credentials, no tokens, and no database.
+
+Point it at a throw-away database and it runs 49 more:
+
+```
+createdb twitchmetrics_test
+TWITCH_TEST_DATABASE_URL=postgresql://127.0.0.1:5432/twitchmetrics_test \
+    python3 tests/smoke.py
+```
+
+Those are the **parity harness**, and they are the reason the migration can be
+trusted. Every aggregate exists twice — once in `trends.py` and once in SQL —
+and each pair is asserted to produce the same answer on the same fixtures,
+including the cases the committed data does not have: two platforms on different
+polling intervals, a poller that dies mid-day, and a day with no stream at all,
+which must come back as "no peak" and never as a peak of zero.
+
+Python is no longer the path the site takes, but it stays as the definition of
+the right answer — and the strongest assertion in the harness is not that the
+numbers agree, it is that both paths render **byte-identical SVG**.
+
+It deliberately reads `TWITCH_TEST_DATABASE_URL` and never `TWITCH_DATABASE_URL`,
+and clears the latter from its own environment before it starts, so a test run
+cannot reach real data.
+
+It won't catch Twitch or YouTube changing an API contract; only regressions in
+this code.
 
 ---
 
@@ -896,6 +1042,9 @@ twitchmetrics/          the package
   retry.py              backoff shared by every destination
   drive.py              Google Drive (retired, kept for reference)
   storage.py            CSV read and append
+  db.py                 the Postgres connection, and applying sql/
+  store.py              samples: the database, with the CSV as a spool
+  sql/                  the schema and the report functions, one file per step
   chart.py              SVG rendering
   png.py                SVG to PNG, via rsvg-convert
   driveoauth.py         Google access token (browser flow)
@@ -903,7 +1052,7 @@ twitchmetrics/          the package
   testdata.py           synthetic data model
   cli.py                subcommand dispatch
   commands/             one module per subcommand
-data/                   samples, logs, cached tokens   (gitignored)
+data/                   the CSV spool, logs, cached tokens  (gitignored)
 charts/                 generated SVGs                 (gitignored)
 tests/fixtures/         synthetic sample data           (committed)
 docs/                   README images
@@ -913,13 +1062,30 @@ deploy/                 systemd units and server notes
 `data/` and `charts/` can be redirected with `TWITCH_DATA_DIR` and
 `TWITCH_CHARTS_DIR`, which is useful when the data belongs on a mounted volume.
 
-`data/` holds the only irreplaceable thing here — charts regenerate from the
-CSVs, and tokens can be re-fetched.
+**The database now holds the only irreplaceable thing here.** Charts regenerate
+from the samples and tokens can be re-fetched, but the samples themselves cannot.
+Back it up:
+
+```
+pg_dump --format=custom twitchmetrics > twitchmetrics-$(date +%F).dump
+```
+
+`data/` used to be that irreplaceable thing, which is why it was worth saying so
+here. It is now a spool: a file that is not growing means the database is
+reachable and everything is going into it, which is the healthy state and looks
+alarming the first time you notice it.
 
 ## Notes
 
 - `viewer_count` is Twitch's live concurrent-viewer number and lags reality by
   about a minute. Treat it as approximate.
+- A `data/*.csv` that has stopped growing is good news, not a dead poller — it
+  is the spool, and an empty spool means every sample reached the database.
+  `db --status` says what is actually stored.
+- Use `host:port` in `TWITCH_DATABASE_URL`, not a Unix socket. The shipped units
+  set `ProtectSystem=strict`, which leaves `/run/postgresql` read-only, and a
+  socket connection needs to write to it — the failure reads like an
+  authentication problem and is not one.
 - Twitch's rate limit is 800 points/minute. Polling every 5 minutes uses a
   vanishing fraction of that, so a shorter interval is fine.
 - YouTube is the opposite: a hard 10,000 units a day, resetting at midnight

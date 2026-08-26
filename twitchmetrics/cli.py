@@ -9,8 +9,8 @@ import argparse
 import sys
 
 from . import __version__, config
-from .commands import (auth_cmd, chatters, daily, followers, graph_cmd, poll,
-                       s3_cmd, setup_cmd, testdata_cmd, users, youtube_cmd)
+from .commands import (auth_cmd, chatters, daily, db_cmd, followers, graph_cmd,
+                       poll, s3_cmd, setup_cmd, testdata_cmd, users, youtube_cmd)
 
 COMMANDS = [
     ("setup", setup_cmd, "register credentials and verify them"),
@@ -24,6 +24,7 @@ COMMANDS = [
     ("followers", followers, "follower count, list, and follow checks"),
     ("chatters", chatters, "how many accounts are joined to chat"),
     ("testdata", testdata_cmd, "write synthetic samples for working on charts"),
+    ("db", db_cmd, "create the sample database and report on it"),
 ]
 
 EPILOG = """
@@ -34,6 +35,7 @@ examples:
   {prog} graph testchannel --date today
   {prog} daily --dry-run
   {prog} s3 --setup testchannel
+  {prog} db --status
   {prog} followers testchannel --recent 10
   {prog} chatters testchannel
 

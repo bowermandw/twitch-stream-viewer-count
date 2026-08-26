@@ -22,6 +22,14 @@ dependencies = []
 # polls never needs it, and the CLI still works in full without it.
 aws = ["boto3>=1.34"]
 
+# The samples live in Postgres now, and psycopg is how you talk to it. An extra
+# rather than a dependency for the same reason boto3 is: a poller whose database
+# is briefly unreachable spools to CSV and replays, and `graph` on a .csv path
+# needs no database at all, so a box that only collects still installs nothing.
+# [binary] ships the libpq wheel, so there is no apt install and no compiler --
+# which is the whole point on a machine chosen for having nothing on it.
+pg = ["psycopg[binary]>=3.1"]
+
 # Kept empty. SVG-to-PNG needs the `rsvg-convert` BINARY (apt install
 # librsvg2-bin), not a Python package, so there is nothing pip can do about it.
 # Nothing requires it any more: the website publishes SVG, which browsers render
@@ -33,3 +41,13 @@ twitch-metrics = "twitchmetrics.cli:main"
 
 [tool.setuptools]
 packages = ["twitchmetrics", "twitchmetrics.commands"]
+
+# The schema lives in .sql files rather than in Python strings, so it can be
+# read, diffed and run through psql by hand. That means it has to be declared:
+# without this the files are present in a checkout and silently ABSENT from a
+# `pip install .`, and the only symptom is `db --init` creating nothing at all.
+# db.sql_files() refuses loudly rather than returning an empty list, and
+# tests/smoke.py opens one, because a missing file's only defence is a test
+# that reads it.
+[tool.setuptools.package-data]
+twitchmetrics = ["sql/*.sql"]

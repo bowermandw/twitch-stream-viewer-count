@@ -23,6 +23,13 @@ PEAK_DAYS = 10          # days on the peaks chart
 COMPARE_DAYS = 5        # days shown *behind* today on the comparison chart
 BUCKET_MINUTES = 30
 
+# How far back to hunt for a day that streamed. The charts compare streams, not
+# dates, so the axis has to be allowed to reach past a quiet fortnight -- but
+# not past everything: a channel dormant since last year would otherwise make
+# every run rebuild its whole history to find ten bars. Coming up short is fine
+# and says something true; the chart simply has fewer bars.
+LOOKBACK_DAYS = 90
+
 # Half a day of half hours. Six bars in each of 48 groups is 288 bars across a
 # 1300px chart, which is a texture rather than a reading.
 MAX_SLOTS = 24
@@ -52,6 +59,38 @@ def window(end_day, days):
     return [end_day - timedelta(days=n) for n in reversed(range(days))]
 
 
+def streamed_window(samples, end_day, days, lookback=LOOKBACK_DAYS):
+    """The last `days` dates on or before end_day that streamed, oldest first.
+
+    The axis the trend charts use by default. window() answers "which dates
+    ended here", which for a channel streaming twice a week is mostly days off
+    -- eight dashes and two bars in a ten-day chart. This answers "which
+    streams ended here", so ten bars mean ten streams whenever they happened.
+
+    "Streamed" is exactly the test _live_on() applies, a live sample carrying a
+    viewer count, so every date this returns has a bar to draw. Fewer than
+    `days` of them is not a failure; it is the channel's whole record.
+    """
+    if days <= 0:
+        return []
+    earliest = end_day - timedelta(days=max(1, int(lookback)) - 1)
+    live = {s["when"].astimezone().date() for s in samples
+            if s["live"] and s["viewers"] is not None}
+    return sorted(d for d in live if earliest <= d <= end_day)[-days:]
+
+
+def bucket_width(minutes):
+    """A slot width both sides will agree on.
+
+    refresh_clock_buckets() clamps its own argument to
+    `greatest(1, least(1440, p_bucket_minutes))`, and a width Python accepted
+    but the database rounded would put the labels and the bars on different
+    grids. Clamping identically here is what lets `daily --bucket` be passed
+    straight through to SQL.
+    """
+    return min(1440, max(1, int(minutes)))
+
+
 def _live_on(samples, day):
     """Live samples with a viewer count, on one local date."""
     return [s for s in samples
@@ -59,16 +98,24 @@ def _live_on(samples, day):
             and s["when"].astimezone().date() == day]
 
 
-def daily_peaks(samples, end_day, days=PEAK_DAYS):
+def daily_peaks(samples, end_day, days=PEAK_DAYS, calendar=False,
+                lookback=LOOKBACK_DAYS):
     """The highest viewer count on each of the last `days` days, oldest first.
 
-    Every day in the window gets an entry. A day with no live samples has a
-    peak of None, never 0 — the channel was not streaming, which is a different
+    `calendar` picks the axis: the last `days` DATES, or the last `days` dates
+    that streamed. On a streamed axis no entry can have a peak of None, because
+    a date only gets on to that axis by having one -- so the rule below still
+    holds, it simply stops arising.
+
+    Every day on the axis gets an entry. A day with no live samples has a peak
+    of None, never 0 — the channel was not streaming, which is a different
     statement from "nobody watched", and drawing them alike would invent a
     catastrophic day out of a day off.
     """
+    axis = (window(end_day, days) if calendar
+            else streamed_window(samples, end_day, days, lookback))
     out = []
-    for day in window(end_day, days):
+    for day in axis:
         same_day = _live_on(samples, day)
         if not same_day:
             out.append({"day": day, "peak": None, "at": None})
@@ -87,7 +134,7 @@ def clock_buckets(samples, day, minutes=BUCKET_MINUTES):
     comparing days, because it would lay a stream that began at 6pm over one
     that began at 8pm and call both blocks "the first half hour".
     """
-    width = max(1, int(minutes))
+    width = bucket_width(minutes)
     totals = {}
     for sample in _live_on(samples, day):
         local = sample["when"].astimezone()
@@ -115,18 +162,23 @@ def _busiest_window(slots, weight, span=MAX_SLOTS):
     return [slot for slot in slots if best_start <= slot < best_start + span]
 
 
-def compare_slots(samples, end_day, days=COMPARE_DAYS, minutes=BUCKET_MINUTES):
+def compare_slots(samples, end_day, days=COMPARE_DAYS, minutes=BUCKET_MINUTES,
+                  calendar=False, lookback=LOOKBACK_DAYS):
     """(slots, per_day) for today and the `days` days before it.
 
-    `per_day` is [(date, {slot: average}), ...] oldest first, one entry per day
-    in the window whether or not it has data. `slots` is every slot any of them
-    used, trimmed to MAX_SLOTS around the busiest stretch; the dropped count is
-    returned so the caller can say so rather than silently showing less.
+    `per_day` is [(date, {slot: average}), ...] oldest first. On a calendar axis
+    that is one entry per DATE whether or not it has data; on the streamed axis
+    it is one entry per stream, and every one of them has data.
+
+    `slots` is every slot any of them used, trimmed to MAX_SLOTS around the
+    busiest stretch; the dropped count is returned so the caller can say so
+    rather than silently showing less.
 
     Returns (slots, per_day, dropped).
     """
-    per_day = [(day, clock_buckets(samples, day, minutes))
-               for day in window(end_day, days + 1)]
+    axis = (window(end_day, days + 1) if calendar
+            else streamed_window(samples, end_day, days + 1, lookback))
+    per_day = [(day, clock_buckets(samples, day, minutes)) for day in axis]
     used = sorted({slot for _, buckets in per_day for slot in buckets})
     weight = {}
     for _, buckets in per_day:
@@ -141,9 +193,31 @@ def compare_slots(samples, end_day, days=COMPARE_DAYS, minutes=BUCKET_MINUTES):
 # --------------------------------------------------------------------------
 
 
-def fmt_day(day):
-    """'Mon 18' — enough to find a day in a ten-day window."""
-    return day.strftime("%a %-d")
+def fmt_day(day, with_month=False):
+    """'Mon 18' — enough to find a day in a ten-day window.
+
+    Not enough for a streamed axis, which can span months and would print
+    "Mon 18" twice with six weeks between them. The renderers ask for the month
+    when their own axis crosses one, so the short form survives the common case.
+    """
+    return day.strftime("%a %-d %b" if with_month else "%a %-d")
+
+
+def spans_months(days):
+    """True when a list of dates crosses a month, so labels need the month."""
+    kept = [d for d in days if d]
+    return bool(kept) and (kept[0].year, kept[0].month) != (kept[-1].year, kept[-1].month)
+
+
+def fmt_span(days):
+    """'Sat 2 Aug – Sat 23 Aug' for an axis, or '' when there is nothing on it."""
+    kept = [d for d in days if d]
+    if not kept:
+        return ""
+    if kept[0] == kept[-1]:
+        return kept[0].strftime("%a %-d %b")
+    return "{} – {}".format(kept[0].strftime("%a %-d %b"),
+                            kept[-1].strftime("%a %-d %b"))
 
 
 def fmt_slot(slot, minutes=BUCKET_MINUTES):
@@ -219,8 +293,14 @@ def render_peaks(entries, channel, platform, day, width=1300, height=380):
     def y_of(value):
         return bottom - (value / top_value) * (bottom - top)
 
+    # len(streamed), not len(entries): true on either axis. A calendar axis of
+    # ten dates holding two streams is "2 day(s) with a stream" and so is a
+    # streamed axis of two -- whereas "last 10 days" would be a lie about a
+    # streamed axis spanning six weeks.
+    dated = [e["day"] for e in entries]
+    with_month = spans_months(dated)
     out = _open_svg(width, height,
-                    "Peak viewers, last {} days".format(len(entries)),
+                    "Peak viewers, last {} day(s) with a stream".format(len(streamed)),
                     "{} · {} · to {}".format(channel, spec["label"],
                                              day.strftime("%a %-d %b %Y")))
 
@@ -229,6 +309,8 @@ def render_peaks(entries, channel, platform, day, width=1300, height=380):
     tile_x = width - PAD_R + 84
     _tile(out, tile_x, fmt_count(best["peak"]), "Best day",
           best["day"].strftime("%a %-d %b"), colour=spec["color"])
+    # The span, because a streamed axis is not contiguous and the reader cannot
+    # infer it from the labels the way ten consecutive dates let them.
     _tile(out, tile_x - 175, fmt_count(average), "Average peak",
           "over {} day(s) live".format(len(streamed)))
 
@@ -240,8 +322,8 @@ def render_peaks(entries, channel, platform, day, width=1300, height=380):
         centre = left + slot_width * (index + 0.5)
         x = centre - bar_width / 2
         label_fill = FG if entry["day"] == day else MUTED
-        out.append(text(centre, bottom + 22, fmt_day(entry["day"]), size=12,
-                        fill=label_fill, anchor="middle"))
+        out.append(text(centre, bottom + 22, fmt_day(entry["day"], with_month),
+                        size=12, fill=label_fill, anchor="middle"))
         if entry["peak"] is None:
             # A dash above the baseline, not a zero-height bar: the day is
             # absent from the record, and 0 viewers is a thing that can happen.
@@ -259,7 +341,9 @@ def render_peaks(entries, channel, platform, day, width=1300, height=380):
 
     out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
-    out.append(text(right, height - 16, "{} day(s) with a stream".format(len(streamed)),
+    # Was a repeat of the title's count. The span says the thing the axis no
+    # longer can: how long these streams took to happen.
+    out.append(text(right, height - 16, fmt_span(dated),
                     size=12, fill=DIM, anchor="end"))
     out.append("</svg>")
     return "\n".join(out)
@@ -290,17 +374,28 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
     def y_of(value):
         return bottom - (value / top_value) * (bottom - top)
 
-    earlier = len(per_day) - 1
-    note = "{} · {} · today vs the previous {} day(s)".format(
+    # By date, not by position. per_day[-1] is the newest entry on the axis,
+    # which is only `day` when the channel streamed today -- and on the platform
+    # it did NOT stream today, the positional read made this tile quote a real
+    # figure while no bar anywhere got the outline that says "today".
+    today_buckets = next((b for d, b in per_day if d == day), {})
+    dated = [d for d, _ in per_day]
+    with_month = spans_months(dated)
+    live_days = sum(1 for _, buckets in per_day if buckets)
+    # Days that streamed and are not today. On a streamed axis that is all of
+    # them but today; on a calendar axis it skips the days off -- either way it
+    # counts what the reader can actually see a bar for.
+    earlier = live_days - (1 if today_buckets else 0)
+
+    note = "{} · {} · today vs the previous {} day(s) with a stream".format(
         channel, spec["label"], earlier)
     if dropped:
         note += " · busiest {} hours shown".format(len(slots) * minutes // 60)
     out = _open_svg(width, height,
-                    "{}-minute averages, today vs the last {}".format(minutes, earlier),
+                    "{}-minute averages, today vs the last {} that streamed".format(
+                        minutes, earlier),
                     note)
 
-    today_buckets = per_day[-1][1] if per_day else {}
-    live_days = sum(1 for _, buckets in per_day if buckets)
     tile_x = width - PAD_R + 84
     if today_buckets:
         busiest = max(today_buckets, key=lambda slot: today_buckets[slot])
@@ -309,8 +404,9 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
     else:
         _tile(out, tile_x, DASH, "Today's best block", "no stream yet",
               colour=spec["color"])
-    _tile(out, tile_x - 175, str(live_days), "Days with data",
-          "of {} in the window".format(len(per_day)))
+    # The span rather than "of N in the window": on a streamed axis that read
+    # N of N every time, which told the reader nothing they could not count.
+    _tile(out, tile_x - 175, str(live_days), "Days compared", fmt_span(dated))
 
     _grid_lines(out, top_value, step, left, right, y_of)
 
@@ -349,7 +445,7 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
         opacity = TODAY_FADE if today else FADES[min(position, len(FADES) - 1)]
         out.append(_bar(legend_x, height - 30, 13, 13, spec["color"], opacity,
                         outline=FG if today else None))
-        label = "Today" if today else fmt_day(bucket_day)
+        label = "Today" if today else fmt_day(bucket_day, with_month)
         out.append(text(legend_x + 20, height - 19, label, size=12,
                         fill=FG if today else MUTED))
         legend_x += 20 + len(label) * 7.2 + 22
@@ -363,21 +459,41 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
 
 
 def render_all(samples, channel, platform, day, peak_days=PEAK_DAYS,
-               compare_days=COMPARE_DAYS, minutes=BUCKET_MINUTES):
+               compare_days=COMPARE_DAYS, minutes=BUCKET_MINUTES, calendar=False,
+               lookback=LOOKBACK_DAYS):
     """{"peaks": svg, "typical": svg} for one platform; either key may be absent.
 
     A platform with nothing in the window produces an empty dict rather than an
     error — the same rule the daily report already follows for a channel that
     only streams on one of them.
     """
-    minutes = max(1, int(minutes))   # keeps the labels and the buckets agreeing
+    minutes = bucket_width(minutes)   # keeps the labels and the buckets agreeing
+    slots, per_day, dropped = compare_slots(samples, day, compare_days, minutes,
+                                            calendar=calendar, lookback=lookback)
+    return render_from(daily_peaks(samples, day, peak_days, calendar=calendar,
+                                   lookback=lookback),
+                       slots, per_day, channel, platform, day,
+                       minutes=minutes, dropped=dropped)
+
+
+def render_from(peaks, slots, per_day, channel, platform, day,
+                minutes=BUCKET_MINUTES, dropped=0):
+    """The same charts, from aggregates somebody else worked out.
+
+    Everything render_all() does except the arithmetic, so the daily report can
+    hand over what the report tables already hold instead of re-deriving it
+    from every sample the channel has ever produced. The arguments are exactly
+    daily_peaks()' return value and compare_slots()' three, whichever side of
+    the database they were computed on -- which is what makes the two paths
+    comparable in a test rather than merely alike.
+    """
+    minutes = bucket_width(minutes)
     charts = {}
-    peaks = render_peaks(daily_peaks(samples, day, peak_days), channel, platform, day)
-    if peaks:
-        charts["peaks"] = peaks
-    slots, per_day, dropped = compare_slots(samples, day, compare_days, minutes)
-    typical = render_typical(slots, per_day, channel, platform, day,
-                             minutes=minutes, dropped=dropped)
-    if typical:
-        charts["typical"] = typical
+    drawn = render_peaks(peaks, channel, platform, day)
+    if drawn:
+        charts["peaks"] = drawn
+    drawn = render_typical(slots, per_day, channel, platform, day,
+                           minutes=minutes, dropped=dropped)
+    if drawn:
+        charts["typical"] = drawn
     return charts

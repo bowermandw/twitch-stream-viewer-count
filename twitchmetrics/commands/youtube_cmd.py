@@ -19,7 +19,7 @@ so an API key cannot reach it and the column does not exist.
 import sys
 import urllib.error
 
-from .. import config, runloop, storage, youtube
+from .. import config, db, runloop, storage, store, youtube
 from ..logging import log, use_file
 
 
@@ -81,9 +81,55 @@ def _guarded(what, call, reported):
     return None, False
 
 
+def _cached_live_video(state):
+    """The live video, fetched straight from the id the database remembers.
+
+    This is the whole reason the stream table doubles as a cache. Finding the
+    live broadcast normally costs two units -- playlistItems.list to see what is
+    recent, then videos.list to ask which of them is live -- and the answer
+    almost never changes between one sample and the next. Asking videos.list
+    about a known id costs one, taking a sample from three units to two: 2,880
+    a day at a 60-second interval instead of 4,320, which is the difference
+    between two channels fitting in the quota and three.
+
+    It also fixes a real gap in the playlist walk. find_live_video() only looks
+    at the fifteen most recent uploads, so a long broadcast on a channel that
+    uploads often can drop out of that window and read as though it had ended.
+
+    Returns (video, True) when the cache answered, (None, False) when there was
+    nothing cached or what it named is no longer live -- in which case the
+    caller falls back to the full lookup.
+    """
+    cached = db.execute("SELECT platform_stream_id FROM tm.live_stream(%s)",
+                        (state["account"],), fetch=True)
+    if not cached:
+        return None, False
+    video_id = cached[0][0]
+    videos = youtube.get_videos([video_id], state["key"])
+    live = youtube.pick_live(videos)
+    if live is not None:
+        return live, True
+    # It answered, and the answer is "not live any more". Reported so the miss
+    # streak advances and the cache is dropped after the second one; the caller
+    # still does the full walk, because a channel that just ended one broadcast
+    # may already have started the next.
+    return None, False
+
+
 def _find_live(state):
+    """The channel's live video, spending as little quota as the cache allows."""
     if state["search"]:
         return youtube.search_live_video(state["channel_id"], state["key"])
+    if state["account"] is not None:
+        try:
+            video, hit = _cached_live_video(state)
+        except (db.Unreachable, db.NotConfigured, SystemExit):
+            # The cache is an optimisation, never a source of truth. A database
+            # that is down costs a quota unit, not a sample.
+            pass
+        else:
+            if hit:
+                return video
     return youtube.find_live_video(state["uploads"], state["key"], state["recent"])
 
 
@@ -114,10 +160,7 @@ def poll_once(state):
            details.get("actualStartTime", "") if live else "",
            video.get("id", "") if live else "",
            likes if likes is not None else ""]
-    try:
-        storage.append_row(state["csv_path"], storage.YOUTUBE_HEADER, row)
-    except OSError as exc:
-        log("ERROR    could not write CSV: {}".format(exc))
+    if not state["destination"].record(row, log):
         return False
 
     def show(value):
@@ -219,21 +262,55 @@ def run(args):
     if args.list_recent:
         return list_recent(found, key, args.recent)
 
+    destination = store.Destination("youtube", channel, csv_path,
+                                    storage.YOUTUBE_HEADER)
+
+    # Resolved once, and it is what makes the live-video cache reachable. A
+    # database that is down must not stop the poller starting, so this degrades
+    # to None and the sampling falls back to the two-unit playlist walk.
+    account = None
+    try:
+        account = destination.account(display_name=found["title"])
+        # The ids YouTube made us pay a unit for at startup, remembered so the
+        # next run does not have to. resolve_channel() stays for now -- it is
+        # also how the handle is validated -- but the values are no longer lost
+        # when the process exits.
+        db.execute("SELECT tm.upsert_account("
+                   "  (SELECT channel_id FROM tm.platform_account WHERE account_id = %s),"
+                   "  'youtube', %s, %s, %s, %s)",
+                   (account, channel, found["id"], found["uploads"], found["title"]))
+    except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+        log("start    database unavailable, sampling without the live-video "
+            "cache -- {}".format(str(exc).splitlines()[0]))
+
     state = {
         "channel": channel, "key": key, "channel_id": found["id"],
         "uploads": found["uploads"], "csv_path": csv_path,
+        "destination": destination, "account": account,
         "recent": args.recent, "search": args.search,
         "reported": set(),
     }
 
+    destination.startup_replay(log)
+
     log("start    {} ({})".format(found["title"], found["id"]))
     if not args.once:
-        log("start    {} units per sample, about {:,} of {:,} quota units a day".format(
-            youtube.UNITS_PER_SAMPLE,
-            samples_per_day * youtube.UNITS_PER_SAMPLE, config.YOUTUBE_DAILY_QUOTA))
+        # Two figures rather than one, because which applies depends on whether
+        # the channel is live: while a broadcast is running the cache answers
+        # and the playlist walk is skipped, and while it is offline there is
+        # nothing to cache and the walk is unavoidable.
+        cached = (youtube.UNITS_PER_SAMPLE - 1 if account is not None
+                  else youtube.UNITS_PER_SAMPLE)
+        log("start    {} units per sample while live, {} while offline -- about "
+            "{:,}-{:,} of {:,} quota units a day".format(
+                cached, youtube.UNITS_PER_SAMPLE,
+                samples_per_day * cached,
+                samples_per_day * youtube.UNITS_PER_SAMPLE,
+                config.YOUTUBE_DAILY_QUOTA))
 
     if args.once:
         poll_once(state)
         return 0
 
-    return runloop.loop(interval, lambda: poll_once(state), channel, csv_path)
+    return runloop.loop(interval, lambda: poll_once(state), channel,
+                        destination.describe())
