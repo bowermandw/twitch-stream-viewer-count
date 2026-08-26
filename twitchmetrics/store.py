@@ -15,7 +15,12 @@ underneath chart.py and trends.py without either of them noticing.
 import os
 from datetime import datetime, timedelta, timezone
 
-from . import config, db, storage
+from . import config, db, storage, trends
+
+# trends is imported for its day axis, its slot width and its constants --
+# never for its arithmetic. Python stays the definition of what a window is
+# and the database stays the thing that fills one. No cycle: trends imports
+# chart, chart imports config, and neither imports this module.
 
 # Which poller a data/ filename belongs to. metrics_ is listed before viewers_
 # because it is the superset; the merging upsert in record_twitch_sample() makes
@@ -651,3 +656,248 @@ def channel_minutes(channel, day, keys, tolerance=2.5, timezone_name=None):
     values = {key: [by_platform.get(key, {}).get(when) for when in grid]
               for key in keys if key in by_platform}
     return grid, values, [combined[when] for when in grid]
+
+
+# --------------------------------------------------------------------------
+# the report tables
+# --------------------------------------------------------------------------
+#
+# The trend charts' aggregates, read from tm.report_daily_peak and
+# tm.report_clock_bucket rather than recomputed from every sample the channel
+# has ever produced. Each returns EXACTLY what its namesake in trends.py
+# returns, which is what lets the two be compared row for row in a test rather
+# than merely inspected for looking similar.
+#
+# Every one of them takes the reporting zone explicitly and never leans on the
+# SQL's own DEFAULT NULL. The tables key on tz, so a refresh written under one
+# zone is invisible to a read under another -- and passing the same resolved
+# value everywhere is the whole of what keeps those two agreeing.
+
+
+DAILY_PEAKS_SQL = """
+SELECT local_date, peak_viewers, peak_at
+  FROM tm.daily_peaks(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
+      -- ::integer for the reason MINUTES_SQL casts its numeric: psycopg sends a
+      -- small Python int as int2, and overload resolution will not widen it.
+      %s::integer, %s)
+ ORDER BY local_date
+"""
+
+
+def _peak_rows(channel, platform, day, days, zone):
+    """(local_date, peak_viewers, peak_at) for a calendar window, oldest first."""
+    return db.execute(DAILY_PEAKS_SQL,
+                      (config.channel_slug(channel), platform, day, max(1, int(days)),
+                       zone), fetch=True)
+
+
+def _peak_entry(local_date, peak, at):
+    """One row as trends.daily_peaks() would have built it.
+
+    Normalised the way channel_minutes() normalises: the session zone is pinned
+    to UTC and trends.daily_peaks() carries sample timestamps that are UTC-aware,
+    so the two stay comparable in the parity check.
+    """
+    return {"day": local_date, "peak": peak,
+            "at": at.astimezone(timezone.utc) if (at and peak is not None) else None}
+
+
+def streamed_days(channel, platform, day, count, lookback=trends.LOOKBACK_DAYS,
+                  timezone_name=None):
+    """The last `count` dates on or before `day` that streamed, oldest first.
+
+    trends.streamed_window()'s answer, read from the report table instead of
+    from samples. A date qualifies by having a peak, which is the same test
+    _live_on() applies -- and NOT by status = 'live', which also admits a day
+    that was live but never returned a viewer count. Such a day has no bar to
+    draw, and admitting it here would put an empty column on the chart and break
+    parity with the Python path.
+    """
+    if count <= 0:
+        return []
+    rows = _peak_rows(channel, platform, day, max(1, int(lookback)),
+                      timezone_name or config.resolve_db_timezone())
+    return [row[0] for row in rows if row[1] is not None][-count:]
+
+
+def daily_peaks(channel, platform, day, days=trends.PEAK_DAYS, calendar=False,
+                lookback=trends.LOOKBACK_DAYS, timezone_name=None):
+    """[{"day", "peak", "at"}, ...] oldest first -- trends.daily_peaks()' shape.
+
+    `calendar` picks the axis, exactly as it does in trends.daily_peaks(): the
+    last `days` dates, or the last `days` dates that streamed.
+
+    On a calendar axis the days are built here rather than taken from the rows.
+    tm.daily_peaks() generates its own and normally returns one row per day, but
+    it returns NONE at all for a slug the channel table doesn't have -- so a
+    short list would not fail, it would quietly relabel the chart. Filling a
+    Python axis makes that impossible. On a streamed axis the rows ARE the axis,
+    because a date only reaches it by having a row.
+
+    A day with no live samples gets peak None and never 0, the same distinction
+    trends.daily_peaks() draws and the same one report_daily_peak_dark_is_null
+    enforces in the table. `status` is deliberately not consulted: the two CHECK
+    constraints already guarantee a non-live day carries no peak, so reading it
+    would add a branch that cannot be exercised.
+    """
+    if days <= 0:
+        # Python's window() is empty here and the SQL's
+        # generate_series(0, greatest(p_days,1)-1) is one row, so this guard is
+        # what keeps `--peak-days 0` from drawing a one-bar chart on one path
+        # and nothing on the other.
+        return []
+    zone = timezone_name or config.resolve_db_timezone()
+
+    if not calendar:
+        rows = [row for row in _peak_rows(channel, platform, day, lookback, zone)
+                if row[1] is not None][-days:]
+        return [_peak_entry(*row) for row in rows]
+
+    found = {row[0]: row for row in _peak_rows(channel, platform, day, days, zone)}
+    out = []
+    for local_date in trends.window(day, days):
+        row = found.get(local_date)
+        out.append(_peak_entry(local_date, row[1] if row else None,
+                               row[2] if row else None))
+    return out
+
+
+COMPARE_SLOTS_SQL = """
+SELECT local_date, slot, avg_viewers, dropped_slots
+  FROM tm.compare_slots(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
+      %s::integer, %s::integer, %s::integer, %s)
+ ORDER BY local_date, slot
+"""
+
+
+def compare_slots(channel, platform, day, days=trends.COMPARE_DAYS,
+                  minutes=trends.BUCKET_MINUTES, calendar=False,
+                  lookback=trends.LOOKBACK_DAYS, timezone_name=None):
+    """(slots, per_day, dropped) -- trends.compare_slots()' three, from the table.
+
+    On a CALENDAR axis `days` is passed through unchanged: the SQL filters
+    `local_date > p_end_day - p_days - 1`, which is p_days + 1 days inclusive,
+    exactly the window(end_day, days + 1) Python uses. per_day is then filled
+    from a Python axis, because report_clock_bucket is SPARSE -- a day the
+    channel didn't stream has no rows at all -- while render_typical() indexes
+    its fade opacities by POSITION in per_day and sizes its bar groups by
+    len(per_day). A missing empty day would not leave a gap in the chart; it
+    would shift every colour after it and retitle the comparison.
+
+    On a STREAMED axis the dates are looked up first and `p_days` is then set to
+    span exactly them: the filter above is `local_date >= p_end_day - p_days`,
+    so p_days = (day - oldest).days bounds the window at the oldest date wanted.
+    Because those are the MOST RECENT dates that streamed, the oldest of them is
+    the boundary and no other streamed date can fall inside -- which matters for
+    more than the axis, since the busiest-window trim weights whatever the
+    window holds. It weights exactly the days being drawn.
+    """
+    width = trends.bucket_width(minutes)
+    zone = timezone_name or config.resolve_db_timezone()
+    if calendar:
+        axis, span = trends.window(day, days + 1), days
+    else:
+        axis = streamed_days(channel, platform, day, days + 1, lookback, zone)
+        if not axis:
+            return [], [], 0
+        span = (day - axis[0]).days
+    rows = db.execute(COMPARE_SLOTS_SQL,
+                      (config.channel_slug(channel), platform, day, span, width,
+                       trends.MAX_SLOTS, zone), fetch=True)
+    by_day = {}
+    for local_date, slot, average, _dropped in rows:
+        # float, not Decimal: numeric arrives as Decimal, chart.nice_axis()
+        # divides by 4.0 and render_typical() divides by the top value, and
+        # Decimal / float raises rather than coercing.
+        by_day.setdefault(local_date, {})[int(slot)] = float(average)
+    # The function already worked the count out and repeats it on every row;
+    # no rows means nothing was dropped, which is what Python's
+    # len(used) - len(kept) says about an empty window too.
+    dropped = int(rows[0][3]) if rows else 0
+    return (sorted({int(row[1]) for row in rows}),
+            [(local_date, by_day.get(local_date, {})) for local_date in axis],
+            dropped)
+
+
+COVERAGE_SQL = """
+SELECT c.channel_id,
+       (SELECT count(DISTINCT p.local_date)
+          FROM tm.report_daily_peak p
+         WHERE p.channel_id = c.channel_id AND p.tz = %s
+           AND p.local_date BETWEEN %s AND %s),
+       (SELECT count(*)
+          FROM tm.report_clock_bucket b
+         WHERE b.channel_id = c.channel_id AND b.tz = %s
+           AND b.bucket_minutes = %s::smallint
+           AND b.local_date BETWEEN %s AND %s),
+       (SELECT count(*)
+          FROM tm.report_clock_bucket b
+         WHERE b.channel_id = c.channel_id AND b.tz = %s
+           AND b.local_date BETWEEN %s AND %s),
+       -- The channel's own first day, so a window reaching back further than
+       -- the channel has existed is not forever judged incomplete. Same
+       -- expression db_cmd._rebuild_reports() spans a channel with.
+       (SELECT min(s.sampled_at AT TIME ZONE %s)::date
+          FROM tm.sample_all s WHERE s.channel_id = c.channel_id)
+  FROM tm.channel c
+ WHERE c.slug = %s
+"""
+
+
+def ensure_reports(channel, day, days, minutes=trends.BUCKET_MINUTES,
+                   timezone_name=None):
+    """Bring one channel's report tables up to date for a window. True if asked.
+
+    The charts read stored rows, so something has to be responsible for the rows
+    existing. The poller refreshes two days on every sample and `db --import`
+    rebuilds everything it loaded, which between them cover the steady state --
+    but not a channel set up today, not a window nobody has streamed in since
+    the tables were built, and not a --bucket width nothing has ever written.
+
+    So: probe what the window actually holds, then refresh either the whole span
+    or just its tail. False means there is no such channel, which is not a
+    failure -- a slug with no row in tm.channel has no samples either, and the
+    reads that follow will draw nothing, which is right.
+    """
+    zone = timezone_name or config.resolve_db_timezone()
+    width = trends.bucket_width(minutes)
+    span = max(1, int(days))
+    first = day - timedelta(days=span - 1)
+
+    rows = db.execute(COVERAGE_SQL,
+                      (zone, first, day,
+                       zone, width, first, day,
+                       zone, first, day,
+                       zone,
+                       config.channel_slug(channel)), fetch=True)
+    if not rows:
+        return False
+    channel_id, dated, at_width, any_width, began = rows[0]
+
+    # Never ask for report rows older than the channel's first sample. Without
+    # this, a lookback of 90 days over a channel with 30 days of history is
+    # short on EVERY run and refreshes all 90 forever -- the counts can never
+    # reach a span that has nothing to fill it.
+    if began and began > first:
+        first = min(day, began)
+    span = (day - first).days + 1
+
+    # Two conditions, and the second is why the width is probed twice. A window
+    # missing days needs building. A window that holds buckets at SOME width but
+    # none at this one is `daily --bucket 45` asking for a width nothing has
+    # written -- whereas a channel that has simply never streamed holds none at
+    # any width, and must not be re-refreshed on every run for the rest of time.
+    short = dated < span or (any_width and not at_width)
+
+    # Two days even when the window looks complete. refresh_reports() swallows
+    # its own failures on purpose -- the sample is the irreplaceable thing and a
+    # report row can always be rebuilt -- so a poller whose refresh failed
+    # leaves today's row STALE rather than missing, and no count of dates can
+    # see that. Two days is exactly what refresh_after_sample() already does on
+    # every sample, so the steady-state cost here is one more poll's worth.
+    since = first if short else day - timedelta(days=1)
+    db.execute("SELECT tm.refresh_range(%s, %s, %s, %s, %s::integer)",
+               (channel_id, since, day, zone, width))
+    return True

@@ -156,6 +156,14 @@ aggregates behind the Trends page are tables, filled by SQL functions that take
 the window, the bucket width and the timezone as parameters — so a new trend is
 a function call rather than new Python.
 
+The Trends charts read those tables. A `daily` run refreshes the window it is
+about to draw and then reads it back, so the ten-day peaks and the half-hour
+comparison never touch a raw sample — which is what puts `low_viewers`,
+`avg_viewers`, the follower and subscriber deltas, and the difference between a
+day off and a day nobody polled within reach of a chart rather than behind a
+rewrite. The day chart still reads samples, because sessions are a read-time
+computation over them and no table tries to express one.
+
 ### What survives an outage
 
 Only the pollers fall back to CSV, and that is deliberate:
@@ -537,19 +545,27 @@ twitch-metrics daily --date yesterday         # backfill a day
 twitch-metrics daily testchannel           # just this one
 twitch-metrics daily --list-channels          # who's in, and what today looks like
 twitch-metrics daily --no-trends              # skip the multi-day charts
+twitch-metrics daily --calendar-days          # trends by date, not by stream
 ```
 
 ```
 […] start    aws account 123456789012 as twitch-metrics
 […] start    daily report for 2026-08-24 — 2 channel(s) from the enabled systemd units
+[…] testchannel  site     http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com
 […] testchannel  twitch   28 KB -> chart_testchannel_twitch_2026-08-24.svg
 […] testchannel  youtube  11 KB -> chart_testchannel_youtube_2026-08-24.svg
 […] testchannel  twitch   -> http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com/twitch/2026-08-24.svg
 […] testchannel  youtube  -> http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com/youtube/2026-08-24.svg
 […] testchannel  page rebuilt from 3 day(s): http://tm-testchannel-<suffix>.s3-website-<region>.amazonaws.com
+[…] prgskidmark  site     http://tm-prgskidmark-<suffix>.s3-website-<region>.amazonaws.com
 […] skip     prgskidmark twitch — offline all day, nothing to chart
 […] stop     1 published, 1 dark in 4.1s
 ```
+
+The `site` line comes first for every channel and does not depend on the run
+succeeding, so a day the channel was dark, a `--dry-run` and a failed upload all
+still tell you the address. A channel that has never been through
+`s3 --setup` says that instead, with the command that fixes it.
 
 A channel polled on both platforms gets a graph each; one polled on only Twitch
 gets one graph, and that is **not** a failure — a platform you don't stream on
@@ -620,6 +636,12 @@ unlisted, and a real one does not belong in a repo that isn't private. Ask for
 your own with `s3 --url`; it is recorded in `data/.s3_buckets.json`, which is
 gitignored.
 
+The suffix is **random per bucket**, not per account, so it cannot be
+recomputed and it is not shared between your channels. Swapping one channel's
+name into another's address gives you a bucket that doesn't exist, and an S3
+website endpoint answers that with a 404. `s3 --list` prints the real one for
+every channel that has a bucket.
+
 The bucket holds nothing but the page and the charts:
 
 ```
@@ -639,10 +661,11 @@ trends/typical-youtube.svg
 `index.html` answers *what happened today*. Everything comparative lives on a
 second page, linked from under the date:
 
-- **Peak viewers by day**, the last ten days as one bar each, Twitch and
-  YouTube charted separately.
+- **Peak viewers by day**, the last ten days *that streamed* as one bar each,
+  Twitch and YouTube charted separately.
 - **Half-hour averages, today vs before**, one bar per day per half hour of the
-  clock — today beside each of the previous five days, oldest to newest.
+  clock — today beside each of the previous five days that streamed, oldest to
+  newest.
 
 The second one is the reason there is a separate module rather than another
 function in `chart.py`. Every graph on the front page buckets by time *since the
@@ -656,8 +679,19 @@ average hides its own spread — one freak evening drags "normal" up and nothing
 on the chart says so — whereas five bars show you immediately whether today is
 outside the range or in the middle of it.
 
-A day you didn't stream is a gap, never a zero, for the same reason the combined
-chart leaves holes: 0 viewers is a real reading a stream that has just gone live
+**The axis counts streams, not dates.** Ten bars mean ten broadcasts, whenever
+they happened. A channel streaming twice a week used to get three bars and seven
+dashes out of a ten-day window — a chart mostly about the days it was resting.
+Now the days off are simply not on it, and because the axis can then span months
+the labels carry the month and the chart names its own date range.
+
+The axis reaches back at most `--lookback` days, 90 by default, so a channel
+quiet since last year does not drag the whole of its history into every run.
+Finding fewer than ten is not a failure; the chart just has fewer bars.
+
+`--calendar-days` restores the old view, dashes and all. A day you didn't stream
+is still a gap there and never a zero, for the same reason the combined chart
+leaves holes: 0 viewers is a real reading a stream that has just gone live
 genuinely has, and drawing a day off the same way would invent a catastrophe out
 of a rest. A channel that spans more than twelve hours has its busiest twelve
 shown, and the chart says so rather than quietly cropping.
@@ -668,8 +702,8 @@ page is still built from a **listing of the bucket**, like `index.html`, so it
 only ever links a chart that is actually there, and the front page's link only
 appears once there is something to link to.
 
-Ten days and five are `--peak-days` and `--compare-days`; the half-hour width is
-the same `--bucket` the per-day charts use.
+Ten and five are `--peak-days` and `--compare-days`, counted in days that
+streamed; the half-hour width is the same `--bucket` the per-day charts use.
 
 ### Both platforms on one chart
 
@@ -975,11 +1009,15 @@ TWITCH_TEST_DATABASE_URL=postgresql://127.0.0.1:5432/twitchmetrics_test \
 ```
 
 Those are the **parity harness**, and they are the reason the migration can be
-trusted. Every aggregate now exists twice — once in `trends.py` and once in SQL
-— and each pair is asserted to produce the same answer on the same fixtures,
+trusted. Every aggregate exists twice — once in `trends.py` and once in SQL —
+and each pair is asserted to produce the same answer on the same fixtures,
 including the cases the committed data does not have: two platforms on different
 polling intervals, a poller that dies mid-day, and a day with no stream at all,
 which must come back as "no peak" and never as a peak of zero.
+
+Python is no longer the path the site takes, but it stays as the definition of
+the right answer — and the strongest assertion in the harness is not that the
+numbers agree, it is that both paths render **byte-identical SVG**.
 
 It deliberately reads `TWITCH_TEST_DATABASE_URL` and never `TWITCH_DATABASE_URL`,
 and clears the latter from its own environment before it starts, so a test run

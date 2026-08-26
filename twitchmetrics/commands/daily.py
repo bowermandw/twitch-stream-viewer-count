@@ -84,11 +84,20 @@ def add_arguments(parser):
     parser.add_argument("--no-trends", action="store_true",
                         help="skip the multi-day charts and the Trends page")
     parser.add_argument("--peak-days", type=int, default=trends.PEAK_DAYS, metavar="N",
-                        help="days on the peaks chart (default {})".format(trends.PEAK_DAYS))
+                        help="days with a stream on the peaks chart "
+                             "(default {})".format(trends.PEAK_DAYS))
     parser.add_argument("--compare-days", type=int, default=trends.COMPARE_DAYS,
                         metavar="N",
-                        help="days shown behind today on the half-hour chart "
-                             "(default {})".format(trends.COMPARE_DAYS))
+                        help="days with a stream shown behind today on the "
+                             "half-hour chart (default {})".format(trends.COMPARE_DAYS))
+    parser.add_argument("--calendar-days", action="store_true",
+                        help="count calendar days rather than days with a stream, "
+                             "so a day off takes a slot and draws a dash")
+    parser.add_argument("--lookback", type=int, default=trends.LOOKBACK_DAYS,
+                        metavar="N",
+                        help="how far back to hunt for a day with a stream "
+                             "(default {}); ignored with --calendar-days".format(
+                                 trends.LOOKBACK_DAYS))
 
 
 # --------------------------------------------------------------------------
@@ -327,23 +336,54 @@ def render_cross_platform(channel, day, live_points):
 def render_trend_charts(channel, day, args):
     """The multi-day charts for every platform with history; [(kind, platform, path)].
 
-    Reads each platform's whole CSV rather than one day of it — that is the
-    point of them. A platform with nothing in the window contributes nothing,
-    so a channel that has only ever streamed on Twitch gets two charts and not
-    two empty ones.
+    Reads the window out of the report tables rather than re-deriving it from
+    every sample the channel has ever produced. The poller has been filling
+    tm.report_daily_peak and tm.report_clock_bucket on every sample since the
+    samples moved into Postgres; this is the first thing to read them.
+
+    A platform with nothing in the window still contributes nothing, so a
+    channel that has only ever streamed on Twitch gets two charts and not four.
+    There is deliberately no "has this platform any samples" guard any more and
+    none is needed: render_peaks() returns None when no day has a peak and
+    render_typical() returns None when no slot has a bar, so an unpolled
+    platform falls out by itself. Re-introducing the guard would mean loading
+    every sample again, which is the one thing this stopped doing.
 
     Written straight to charts/ under a name with no date in it, because they
     describe where the channel is now: each run replaces them.
     """
+    # Once per channel and ahead of the loop, because tm.refresh_range() walks
+    # every platform on the channel itself -- calling it per platform would do
+    # the whole job twice. Its failure is logged and swallowed: the reads below
+    # report their own, and today's page is worth more than the trend charts.
+    #
+    # A streamed axis reaches back as far as the lookback allows, so the tables
+    # have to hold that whole range or the older streams it wants are simply
+    # absent. ensure_reports() clamps the request to the channel's own first
+    # sample, which is what stops a young channel re-refreshing 90 days forever.
+    span = (max(1, args.peak_days, args.compare_days + 1) if args.calendar_days
+            else max(1, args.lookback))
+    try:
+        store.ensure_reports(channel, day, span, minutes=args.bucket)
+    except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+        log("WARN     {} — report tables not refreshed: {}".format(
+            channel, str(exc).splitlines()[0]))
+
     made = []
     for platform in PLATFORMS:
-        samples = store.load(store.locator(platform, channel))
-        if not samples:
+        try:
+            peaks = store.daily_peaks(channel, platform, day, args.peak_days,
+                                      calendar=args.calendar_days,
+                                      lookback=args.lookback)
+            slots, per_day, dropped = store.compare_slots(
+                channel, platform, day, args.compare_days, args.bucket,
+                calendar=args.calendar_days, lookback=args.lookback)
+        except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+            log("WARN     {} {} — no trend charts: {}".format(
+                channel, platform, str(exc).splitlines()[0]))
             continue
-        charts = trends.render_all(samples, channel, platform, day,
-                                   peak_days=args.peak_days,
-                                   compare_days=args.compare_days,
-                                   minutes=args.bucket)
+        charts = trends.render_from(peaks, slots, per_day, channel, platform, day,
+                                    minutes=args.bucket, dropped=dropped)
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -354,6 +394,34 @@ def render_trend_charts(channel, day, args):
                                                os.path.basename(out)))
             made.append((kind, platform, out))
     return made
+
+
+def site_line(channel):
+    """The channel's website address, or the command that would create one.
+
+    Reads the local registry only — no credentials, no network — so this is
+    safe on every path, including --list-channels and a run with no boto3.
+    """
+    from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
+
+    known = s3.bucket_for(channel)
+    if known:
+        return s3.website_url(known["bucket"], known["region"])
+    return "no bucket yet — {} s3 --setup {}".format(config.invocation(), channel)
+
+
+def warn_exit(channel, exc):
+    """Log a SystemExit in full rather than only its first line.
+
+    require_bucket() raises two lines: what is wrong, and the command that
+    fixes it. Keeping only the first threw away the actionable half, so a
+    channel that had never been through `s3 --setup` reported "No S3 bucket"
+    and never said how to get one.
+    """
+    lines = [line.strip() for line in str(exc).splitlines() if line.strip()] or [""]
+    log("WARN     {} — {}".format(channel, lines[0]))
+    for line in lines[1:]:
+        log("WARN     {}   {}".format(channel, line))
 
 
 def _publish_trends(channel, day, charts):
@@ -378,8 +446,7 @@ def _publish_trends(channel, day, charts):
             channel, page["charts"], page["url"]))
         return page["charts"] > 0
     except SystemExit as exc:
-        log("WARN     {} — trends not published: {}".format(
-            channel, str(exc).splitlines()[0]))
+        warn_exit(channel, exc)
         return False
     except Exception as exc:  # noqa: BLE001 - the day's page still has to go out
         log("WARN     {} — trends not published: {}".format(channel, exc))
@@ -414,6 +481,12 @@ def report_channel(channel, day, args):
     didn't stream anywhere — a day off is not a failure.
     """
     from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
+
+    # First, and unconditionally. A day the channel didn't stream, a --dry-run
+    # and a failed upload all used to end without the address anywhere in the
+    # output, leaving the only copy of a random bucket suffix in a JSON file
+    # nobody thinks to open.
+    log("{}  {:<8} {}".format(channel, "site", site_line(channel)))
 
     rendered = []
     outcomes = []
@@ -463,7 +536,7 @@ def report_channel(channel, day, args):
         has_trends = _publish_trends(channel, day, trend_charts)
         page = s3.publish_index(channel, day, titles, trends=has_trends)
     except SystemExit as exc:
-        log("WARN     {} — {}".format(channel, str(exc).splitlines()[0]))
+        warn_exit(channel, exc)
         return "failed"
     except Exception as exc:  # noqa: BLE001 - one channel's outage isn't the run's
         log("WARN     {} — publish failed: {}".format(channel, exc))
@@ -522,6 +595,7 @@ def _list_channels(channels, source, day):
               "below is real:\n    {}\n".format(why))
 
     for channel in channels:
+        print("  {:<18} {}".format(channel, site_line(channel)))
         for platform in PLATFORMS:
             if not reachable:
                 print("  {:<18} {:<8} {}".format(channel, platform, "unknown"))

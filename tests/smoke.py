@@ -9,6 +9,7 @@ in parsing, session detection, chart building and CLI wiring.
 """
 
 import glob
+import inspect
 import json
 import os
 import re
@@ -807,8 +808,8 @@ _end = date(2026, 8, 25)
 # Streamed today and three days ago, nothing in between.
 _history = (_day_samples(_end, 19, 120, lambda i: 100 + i)
             + _day_samples(_end - timedelta(days=3), 19, 120, lambda i: 300 + i))
-_peaks = trends.daily_peaks(_history, _end, 10)
-check("a ten-day window has ten entries", len(_peaks) == 10)
+_peaks = trends.daily_peaks(_history, _end, 10, calendar=True)
+check("a ten-day calendar window has ten entries", len(_peaks) == 10)
 check("oldest first, ending today",
       _peaks[0]["day"] == _end - timedelta(days=9) and _peaks[-1]["day"] == _end)
 check("a day never streamed has no peak, not a zero",
@@ -830,21 +831,21 @@ check("a slot's value is that half hour's average",
 check("and a day off has no slots at all",
       trends.clock_buckets(_history, _end - timedelta(days=1)) == {})
 
-_slots, _per_day, _dropped = trends.compare_slots(_history, _end, 5)
-check("the comparison covers today and five days back", len(_per_day) == 6)
+_slots, _per_day, _dropped = trends.compare_slots(_history, _end, 5, calendar=True)
+check("the calendar comparison covers today and five days back", len(_per_day) == 6)
 check("oldest first, today last", _per_day[-1][0] == _end)
 check("every day in the window gets an entry, data or not",
       sum(1 for _, buckets in _per_day if buckets) == 2)
 check("a short evening is not trimmed", _dropped == 0)
 
 _long = _day_samples(_end, 4, 20 * 60, lambda i: 10 + (500 if 9 * 60 < i < 14 * 60 else 0))
-_kept, _, _lost = trends.compare_slots(_long, _end, 5)
+_kept, _, _lost = trends.compare_slots(_long, _end, 5, calendar=True)
 check("a twenty-hour day is trimmed to half a day of slots",
       len(_kept) == trends.MAX_SLOTS and _lost == 40 - trends.MAX_SLOTS)
 check("and what is kept is contiguous, not the fullest slots scattered about",
       _kept == list(range(_kept[0], _kept[0] + len(_kept))))
 
-_peaks_svg = trends.render_peaks(_peaks, "testchannel", "twitch", _end)
+_peaks_svg = trends.render_peaks(_peaks, "testchannel", "twitch", _end)   # calendar
 check("the peaks chart renders",
       _peaks_svg.startswith("<svg") and _peaks_svg.endswith("</svg>"))
 check("it names the best day and its figure",
@@ -856,6 +857,9 @@ check("one day of history is still a chart",
                                              _end, 10), "t", "twitch", _end) is not None)
 check("no history at all is not a chart",
       trends.render_peaks(trends.daily_peaks([], _end, 10), "t", "twitch", _end) is None)
+check("and neither is a calendar window with nothing in it",
+      trends.render_peaks(trends.daily_peaks([], _end, 10, calendar=True),
+                          "t", "twitch", _end) is None)
 
 _typical_svg = trends.render_typical(_slots, _per_day, "testchannel", "twitch", _end)
 check("the comparison chart renders",
@@ -865,7 +869,7 @@ check("only the days that drew a bar are in the legend",
       ">{}<".format(trends.fmt_day(_end - timedelta(days=3))) in _typical_svg
       and ">{}<".format(trends.fmt_day(_end - timedelta(days=1))) not in _typical_svg)
 check("no data at all is not a chart",
-      trends.render_typical(*trends.compare_slots([], _end, 5)[:2],
+      trends.render_typical(*trends.compare_slots([], _end, 5, calendar=True)[:2],
                             "t", "twitch", _end) is None)
 check("a platform with nothing gets no charts at all",
       trends.render_all([], "t", "twitch", _end) == {})
@@ -873,6 +877,92 @@ check("and one with history gets both",
       sorted(trends.render_all(_history, "t", "twitch", _end)) == ["peaks", "typical"])
 check("the channel name is escaped into the chart",
       "&lt;b&gt;" in trends.render_peaks(_peaks, "<b>", "twitch", _end))
+
+# render_from() is the seam the daily report now goes through: same charts,
+# from aggregates somebody else worked out. Byte-identical output is the whole
+# guarantee -- it is what says the split changed nothing, and it is the shape
+# the SQL path is held to over in the postgres section.
+check("render_from draws exactly what render_all draws",
+      trends.render_from(_peaks, _slots, _per_day, "t", "twitch", _end,
+                         dropped=_dropped)
+      == trends.render_all(_history, "t", "twitch", _end, calendar=True))
+check("and nothing at all still means no charts",
+      trends.render_from([], [], [], "t", "twitch", _end) == {})
+# Clamped to the same range refresh_clock_buckets() clamps its own argument to,
+# or `daily --bucket` would put the labels and the bars on different grids.
+check("a slot width is clamped the way the database clamps it",
+      (trends.bucket_width(0), trends.bucket_width(-5), trends.bucket_width("30"),
+       trends.bucket_width(5000)) == (1, 1, 30, 1440))
+
+# --- comparing streams rather than dates ----------------------------------
+# The default axis. _history streamed today and three days ago and nothing in
+# between, so a calendar window is eight dashes and two bars -- which is the
+# whole reason for this.
+check("the axis is the days that streamed, oldest first",
+      trends.streamed_window(_history, _end, 10)
+      == [_end - timedelta(days=3), _end])
+check("it never returns more than asked for",
+      trends.streamed_window(_history, _end, 1) == [_end])
+check("nothing streamed is an empty axis, not a calendar one",
+      trends.streamed_window([], _end, 10) == [])
+# The cap. A stream last spring must not drag the axis -- or the refresh --
+# back across a quiet winter.
+_ancient = _history + _day_samples(_end - timedelta(days=200), 19, 60, lambda i: 7)
+check("a stream older than the lookback is out of reach",
+      trends.streamed_window(_ancient, _end, 10)
+      == [_end - timedelta(days=3), _end])
+check("and comes back when the lookback is widened",
+      len(trends.streamed_window(_ancient, _end, 10, lookback=365)) == 3)
+
+_speaks = trends.daily_peaks(_history, _end, 10)
+check("the peaks chart draws streams, not dates", len(_speaks) == 2)
+check("so no entry on it can be a day off",
+      all(e["peak"] is not None for e in _speaks))
+check("and the figures are the same ones the calendar axis found",
+      [e["peak"] for e in _speaks] == [419, 219])
+_sslots, _sper, _sdrop = trends.compare_slots(_history, _end, 5)
+check("the comparison does the same", len(_sper) == 2)
+check("with every day on it holding data",
+      all(buckets for _, buckets in _sper))
+check("and the same slots as the calendar window found",
+      _sslots == _slots)
+
+_speaks_svg = trends.render_peaks(_speaks, "testchannel", "twitch", _end)
+check("a streamed axis draws no dashes at all", trends.DASH not in _speaks_svg)
+check("and says how many streams, not how many days",
+      "last 2 day(s) with a stream" in _speaks_svg)
+check("the calendar axis still draws its dashes", trends.DASH in _peaks_svg)
+
+# Labels. "Mon 18" cannot separate two Mondays six weeks apart, and a streamed
+# axis routinely spans that far.
+check("a day is short when the axis stays inside a month",
+      trends.fmt_day(date(2026, 8, 18)) == "Tue 18")
+check("and carries the month when asked",
+      trends.fmt_day(date(2026, 8, 18), True) == "Tue 18 Aug")
+check("an axis inside one month needs no month",
+      not trends.spans_months([date(2026, 8, 1), date(2026, 8, 31)]))
+check("one that crosses a month does",
+      trends.spans_months([date(2026, 7, 30), date(2026, 8, 2)]))
+_across = (_day_samples(_end, 19, 60, lambda i: 5)
+           + _day_samples(date(2026, 7, 28), 19, 60, lambda i: 5))
+check("and a chart spanning one labels its bars with it",
+      "Tue 28 Jul" in trends.render_peaks(
+          trends.daily_peaks(_across, _end, 10), "t", "twitch", _end))
+check("the span is named rather than left to be inferred",
+      "Tue 28 Jul – Tue 25 Aug" in trends.render_peaks(
+          trends.daily_peaks(_across, _end, 10), "t", "twitch", _end))
+
+# "Today" by date, not by position. On the platform a channel did NOT stream
+# today, the newest entry on the axis is not today -- and reading per_day[-1]
+# used to quote that day's best block under the words "Today's best block"
+# while no bar anywhere carried the outline that says which one is today.
+_gap = _day_samples(_end - timedelta(days=3), 19, 120, lambda i: 300 + i)
+_gslots, _gper, _gdrop = trends.compare_slots(_gap, _end, 5)
+check("an axis can end before today", _gper[-1][0] != _end)
+_gsvg = trends.render_typical(_gslots, _gper, "t", "twitch", _end)
+check("and then nothing is called today", ">Today<" not in _gsvg)
+check("nor is another day's best block quoted as today's",
+      "no stream yet" in _gsvg)
 
 # --- s3 naming ------------------------------------------------------------
 section("s3 naming")
@@ -1056,6 +1146,45 @@ with tempfile.TemporaryDirectory() as tmp:
     check("a half-written registry reads as empty, not a crash", s3._load_buckets() == {})
     check("and require_bucket exits with the command to run",
           raises(SystemExit, s3.require_bucket, "ign"))
+config.S3_BUCKETS_PATH = _real_buckets
+
+# --- daily says where the site is -----------------------------------------
+section("daily says where the site is")
+_real_buckets = config.S3_BUCKETS_PATH
+with tempfile.TemporaryDirectory() as tmp:
+    config.S3_BUCKETS_PATH = os.path.join(tmp, ".s3_buckets.json")
+    s3.remember("known", "tm-known-abc1234567", "us-east-2")
+    check("a channel with a bucket reports its address",
+          daily.site_line("known")
+          == "http://tm-known-abc1234567.s3-website.us-east-2.amazonaws.com")
+    # The suffix is random per bucket and cannot be recomputed, so guessing one
+    # from another channel's address is the mistake this line exists to prevent.
+    check("a channel without one says so, and how to fix it",
+          "no bucket yet" in daily.site_line("nobody")
+          and "s3 --setup nobody" in daily.site_line("nobody"))
+    check("naming the site needs no credentials and no network",
+          "amazonaws.com" in daily.site_line("known"))
+
+    _said = []
+    _real_log = daily.log
+    daily.log = _said.append
+    try:
+        # require_bucket() raises two lines and the second is the remedy.
+        # Logging only the first is what left a fresh channel saying "No S3
+        # bucket" and never how to get one.
+        try:
+            s3.require_bucket("nobody")
+        except SystemExit as _exc:
+            daily.warn_exit("nobody", _exc)
+        check("a two-line refusal keeps its remedy line",
+              len(_said) == 2 and "s3 --setup nobody" in _said[-1])
+        check("and every line is still tagged with the channel",
+              all("nobody" in line for line in _said))
+        _said[:] = []
+        daily.warn_exit("nobody", SystemExit("just the one line"))
+        check("a one-line refusal logs one line", len(_said) == 1)
+    finally:
+        daily.log = _real_log
 config.S3_BUCKETS_PATH = _real_buckets
 
 # --- s3 retries -----------------------------------------------------------
@@ -1706,7 +1835,7 @@ else:
 
             # peak per day, including the days with no stream at all -- the
             # invariant this whole migration had to preserve.
-            _want = trends.daily_peaks(_rows, _end, 10)
+            _want = trends.daily_peaks(_rows, _end, 10, calendar=True)
             _got = db.execute("SELECT local_date, peak_viewers, peak_at "
                               "FROM tm.daily_peaks(%s,%s,%s,10,%s)",
                               (_cid, _platform, _end, _zone_name), fetch=True)
@@ -1735,7 +1864,8 @@ else:
 
             # and the busiest-window trim, which is the one with a self-join
             # standing in for a windowed rolling sum
-            _slots, _per_day, _dropped = trends.compare_slots(_rows, _end, 5, 30)
+            _slots, _per_day, _dropped = trends.compare_slots(_rows, _end, 5, 30,
+                                                              calendar=True)
             _sql = db.execute(
                 "SELECT local_date, slot, avg_viewers, used_slots, dropped_slots "
                 "FROM tm.compare_slots(%s,%s,%s,5,30,24,%s)",
@@ -1747,6 +1877,164 @@ else:
             check("{}: and drops the same count".format(_label),
                   _dropped == (_sql[0][3] - len(_sql_slots) if _sql else 0)
                   or _dropped == (_sql[0][4] if _sql else 0))
+
+            # --- and what the daily report actually calls -------------------
+            # Everything above compares raw SQL against Python. These compare
+            # the store functions the report goes THROUGH, which is the thing
+            # that has to be right: same values, same shape, same types. A
+            # result holding the right numbers under the wrong keys, or as
+            # Decimals, draws no chart and raises no error.
+            _sp = store.daily_peaks(_slug, _platform, _end, 10, calendar=True,
+                                    timezone_name=_zone_name)
+            check("{}: store.daily_peaks matches trends.daily_peaks exactly".format(_label),
+                  _sp == _want, "{} vs {}".format(_sp[:2], _want[:2]))
+
+            _ss, _sper, _sdrop = store.compare_slots(_slug, _platform, _end, 5, 30,
+                                                     calendar=True,
+                                                     timezone_name=_zone_name)
+            check("{}: store.compare_slots keeps the same slots".format(_label),
+                  _ss == sorted(_slots), "{} vs {}".format(_ss, sorted(_slots)))
+            # The day axis is the half the older check never looked at, and the
+            # half a sparse table cannot supply: render_typical() indexes its
+            # fades by position, so a dropped empty day recolours the chart.
+            check("{}: and the same day axis, empty days included".format(_label),
+                  [d for d, _ in _sper] == [d for d, _ in _per_day])
+            check("{}: and the same averages, as floats not Decimals".format(_label),
+                  all(set(a) == set(b)
+                      and all(isinstance(v, float) for v in a.values())
+                      and all(abs(a[k] - b[k]) <= _TOL for k in a)
+                      for (_, a), (_, b) in zip(_sper, _per_day)))
+            check("{}: and drops the same count".format(_label), _sdrop == _dropped)
+
+            # A window running past the last stream. The report tables hold
+            # nothing out there, so this is what proves the axis is built in
+            # Python rather than taken from the rows -- invisible on a fixture
+            # whose window happens to end on a day that streamed.
+            _future = _end + timedelta(days=3)
+            _fp = store.daily_peaks(_slug, _platform, _future, 10, calendar=True,
+                                    timezone_name=_zone_name)
+            check("{}: the peaks axis stays full past the last stream".format(_label),
+                  len(_fp) == 10 and [e["peak"] for e in _fp[-3:]] == [None] * 3)
+            _, _fper, _ = store.compare_slots(_slug, _platform, _future, 5, 30,
+                                              calendar=True,
+                                              timezone_name=_zone_name)
+            check("{}: and so does the comparison axis".format(_label),
+                  len(_fper) == 6 and all(not b for _, b in _fper[-3:]))
+
+            # The acceptance test. Not "the numbers agree" but "the page is the
+            # same page": the SQL path and the sample path draw identical SVG.
+            check("{}: the SQL path renders the identical charts".format(_label),
+                  trends.render_from(_sp, _ss, _sper, _slug, _platform, _end,
+                                     minutes=30, dropped=_sdrop)
+                  == trends.render_all(_rows, _slug, _platform, _end, calendar=True))
+
+            # --- and the same again on the streamed axis --------------------
+            # The default. Everything above pins the calendar behaviour behind
+            # its flag; this is the axis the site actually draws, and it has to
+            # agree between SQL and Python just as strictly.
+            _wstream = trends.daily_peaks(_rows, _end, 10)
+            _sstream = store.daily_peaks(_slug, _platform, _end, 10,
+                                         timezone_name=_zone_name)
+            check("{}: store.daily_peaks matches on the streamed axis".format(_label),
+                  _sstream == _wstream,
+                  "{} vs {}".format([e["peak"] for e in _sstream],
+                                    [e["peak"] for e in _wstream]))
+            check("{}: and no day on it is a day off".format(_label),
+                  all(e["peak"] is not None for e in _sstream))
+            check("{}: and every date on it is one the calendar axis called live".format(
+                      _label),
+                  all(e["peak"] is not None
+                      for e in _want if e["day"] in {d["day"] for d in _sstream}))
+
+            _cw, _cper, _cdrop = trends.compare_slots(_rows, _end, 5, 30)
+            _dw, _dper, _ddrop = store.compare_slots(_slug, _platform, _end, 5, 30,
+                                                     timezone_name=_zone_name)
+            check("{}: store.compare_slots matches on the streamed axis".format(_label),
+                  _dw == _cw, "{} vs {}".format(_dw, _cw))
+            check("{}: with the same dates, and every one of them live".format(_label),
+                  [d for d, _ in _dper] == [d for d, _ in _cper]
+                  and all(b for _, b in _dper))
+            check("{}: and the same averages".format(_label),
+                  all(set(a) == set(b)
+                      and all(abs(a[k] - b[k]) <= _TOL for k in a)
+                      for (_, a), (_, b) in zip(_dper, _cper)))
+            check("{}: and drops the same count".format(_label), _ddrop == _cdrop)
+
+            # The acceptance test again, on the axis the site uses. This is the
+            # one that would catch p_days being computed wrongly: a window off
+            # by a day pulls in an extra stream, which reweights the busiest
+            # stretch and moves bars the equality above would still allow.
+            check("{}: the streamed SQL path renders identical charts".format(_label),
+                  trends.render_from(_sstream, _dw, _dper, _slug, _platform, _end,
+                                     minutes=30, dropped=_ddrop)
+                  == trends.render_all(_rows, _slug, _platform, _end))
+
+            # --- the tables keep themselves ---------------------------------
+            # ensure_reports() is what makes the report tables the daily
+            # report's business rather than the poller's alone. Strip them and
+            # it has to notice.
+            db.execute("DELETE FROM tm.report_daily_peak WHERE channel_id=%s", (_cid,))
+            db.execute("DELETE FROM tm.report_clock_bucket WHERE channel_id=%s", (_cid,))
+            check("{}: a stripped window is noticed and rebuilt".format(_label),
+                  store.ensure_reports(_slug, _end, 10, timezone_name=_zone_name)
+                  and store.daily_peaks(_slug, _platform, _end, 10, calendar=True,
+                                        timezone_name=_zone_name) == _want)
+
+            # `daily --bucket` is a real knob: report_clock_bucket keys on the
+            # width so two can coexist, and this is the check that they do.
+            _at30 = db.execute("SELECT count(*) FROM tm.report_clock_bucket "
+                               "WHERE channel_id=%s AND bucket_minutes=30",
+                               (_cid,), fetch=True)[0][0]
+            store.ensure_reports(_slug, _end, 10, minutes=45, timezone_name=_zone_name)
+            _widths = {r[0] for r in db.execute(
+                "SELECT DISTINCT bucket_minutes FROM tm.report_clock_bucket "
+                "WHERE channel_id=%s", (_cid,), fetch=True)}
+            check("{}: a second bucket width lands beside the first".format(_label),
+                  {30, 45} <= _widths, str(sorted(_widths)))
+            check("{}: and leaves the first alone".format(_label),
+                  db.execute("SELECT count(*) FROM tm.report_clock_bucket "
+                             "WHERE channel_id=%s AND bucket_minutes=30",
+                             (_cid,), fetch=True)[0][0] == _at30)
+
+        # A lookback far wider than the channel has existed. Without clamping
+        # the request to the channel's first sample, the coverage count can
+        # never reach the span asked for, every run reads as short, and the
+        # whole 90 days are refreshed forever.
+        _fresh = store.ensure_reports(_slug, _end, 3650, timezone_name=_zone_name)
+        check("a lookback wider than the channel's life still refreshes", _fresh)
+        # Now it is covered, the next run must touch only the two-day tail.
+        # computed_at is the witness: a row older than the tail keeping its
+        # timestamp is proof the whole span was not rebuilt again.
+        _old_day = db.execute(
+            "SELECT min(local_date) FROM tm.report_daily_peak WHERE channel_id=%s",
+            (_cid,), fetch=True)[0][0]
+        _stamp = db.execute(
+            "SELECT computed_at FROM tm.report_daily_peak "
+            "WHERE channel_id=%s AND local_date=%s LIMIT 1",
+            (_cid, _old_day), fetch=True)[0][0]
+        store.ensure_reports(_slug, _end, 3650, timezone_name=_zone_name)
+        check("and the run after it rebuilds only the tail, not the span",
+              db.execute("SELECT computed_at FROM tm.report_daily_peak "
+                         "WHERE channel_id=%s AND local_date=%s LIMIT 1",
+                         (_cid, _old_day), fetch=True)[0][0] == _stamp)
+
+        # A slug the channel table has never heard of. tm.daily_peaks() answers
+        # a NULL channel_id with a full axis of NULLs, so the danger is not an
+        # exception -- it is a chart that silently reads as "never streamed".
+        # A full axis of None peaks draws nothing, which is the honest answer.
+        check("an unknown channel draws nothing and raises nothing",
+              store.daily_peaks("nosuchchannel_smoke", "twitch", _end, 10,
+                                calendar=True, timezone_name=_zone_name)
+              == [{"day": _d, "peak": None, "at": None}
+                  for _d in trends.window(_end, 10)])
+        # On the streamed axis the honest answer is a shorter one: no dates
+        # streamed, so there is no axis, rather than ten days of nothing.
+        check("and on a streamed axis it is simply empty",
+              store.daily_peaks("nosuchchannel_smoke", "twitch", _end, 10,
+                                timezone_name=_zone_name) == [])
+        check("and there is nothing to refresh for it",
+              store.ensure_reports("nosuchchannel_smoke", _end, 10,
+                                   timezone_name=_zone_name) is False)
 
         # --- per-broadcast summaries --------------------------------------
         # The aggregate that had no Python twin, and therefore no parity check,
@@ -1863,6 +2151,23 @@ else:
 
 # --- no dependencies ------------------------------------------------------
 section("no dependencies")
+# The whole plan rests on this direction of dependency: store.py may import
+# trends.py for its day axis and its constants, and trends.py may never import
+# a database. Reverse it and the import cycles.
+_trends_src = open(os.path.join(root, "twitchmetrics/trends.py")).read()
+check("trends.py is arithmetic, not a database client",
+      not re.search(r"^from \.? ?import .*\b(db|store)\b|^from \.(db|store) import",
+                    _trends_src, re.M))
+# The point of the change, asserted rather than assumed: the trend charts no
+# longer pull every sample the channel has ever produced.
+_rtc_src = inspect.getsource(daily.render_trend_charts)
+check("the trend charts no longer read the whole sample history",
+      "store.load" not in _rtc_src)
+check("they read the report tables instead",
+      "store.daily_peaks" in _rtc_src and "store.compare_slots" in _rtc_src)
+check("and something refreshes those tables first",
+      "store.ensure_reports" in _rtc_src)
+
 _forbidden = re.compile(
     r"^\s*(import|from)\s+"
     r"(google|googleapiclient|google_auth\w*|requests|httplib2|oauth2client|matplotlib)\b",
