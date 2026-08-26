@@ -218,7 +218,7 @@ blank. Only `is_live` marks a broadcast.
 twitch-metrics poll testchannel --once           # one sample
 twitch-metrics poll testchannel --no-chatters    # skip chat size
 twitch-metrics poll testchannel --viewers-only   # viewers alone
-twitch-metrics poll testchannel --interval 60    # every minute
+twitch-metrics poll testchannel --interval 300   # every five minutes
 ```
 
 ### Changing the interval
@@ -226,15 +226,21 @@ twitch-metrics poll testchannel --interval 60    # every minute
 No code edit needed. Either flag it per run, or set it once in `.env`:
 
 ```
-TWITCH_INTERVAL=60
+TWITCH_INTERVAL=120
 ```
 
-Precedence is **`--interval` > `TWITCH_INTERVAL` > 300 seconds**, with a minimum
+Precedence is **`--interval` > `TWITCH_INTERVAL` > 60 seconds**, with a minimum
 of 10. A value that isn't a number is reported rather than silently ignored,
 since a typo in a service file would otherwise poll at the wrong rate unnoticed.
 
 Samples land on wall-clock boundaries, so 60 gives you :00, :01, :02 and 300
 gives :00, :05, :10.
+
+A minute is a resolution decision here, not a budget one — see the rate-limit
+note below. Five minutes was the old default and it under-samples visibly: a
+raid or a clip going round moves the viewer count faster than that, and the
+chart drew the recovery as a straight line because nothing was recorded on the
+way down. YOUTUBE_INTERVAL is the opposite case and is bounded by quota.
 
 Twitch's rate limit is 800 points per minute. Polling three metrics every 60
 seconds for one channel uses 3 — even a dozen channels at that rate is nowhere

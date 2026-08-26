@@ -31,7 +31,13 @@ DRIVE_FOLDERS_PATH = os.path.join(DATA_DIR, ".drive_folders.json")
 # gitignored — this file is published, and a default here would name a real
 # channel in the repo. TWITCH_CHANNEL and YOUTUBE_CHANNEL override it.
 DEFAULT_CHANNEL = "testchannel"
-DEFAULT_INTERVAL_SECONDS = 300  # 5 minutes
+# A minute. Twitch's rate limit is 800 points a minute and a sample costs a
+# handful, so this is a resolution decision rather than a budget one -- unlike
+# the YouTube interval below, which is bounded by a fixed daily quota. Five
+# minutes was the old default and it visibly under-samples: a raid or a clip
+# going round moves the viewer count faster than that, and the chart drew the
+# recovery as a straight line because nothing was recorded on the way down.
+DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 10
 HTTP_TIMEOUT = 20       # stops a hung socket stalling a poll loop
 UPLOAD_TIMEOUT = 120    # a chart is small, but 20s is tight on a slow uplink

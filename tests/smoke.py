@@ -237,7 +237,7 @@ with tempfile.TemporaryDirectory() as tmp:
 section("interval")
 _saved = os.environ.pop("TWITCH_INTERVAL", None)
 with no_env_file():
-    check("defaults to 300", config.resolve_interval(None) == 300)
+    check("defaults to a minute", config.resolve_interval(None) == 60)
 os.environ["TWITCH_INTERVAL"] = "60"
 check("TWITCH_INTERVAL is honoured", config.resolve_interval(None) == 60)
 check("--interval beats the env var", config.resolve_interval(120) == 120)
@@ -250,7 +250,7 @@ for _bad in ("sixty", "5", "-1", "1.5"):
         check("rejects {!r}".format(_bad), True)
 os.environ["TWITCH_INTERVAL"] = ""   # emptying a line means "unset", as for TWITCH_CHANNEL
 with no_env_file():
-    check("empty value falls back to the default", config.resolve_interval(None) == 300)
+    check("empty value falls back to the default", config.resolve_interval(None) == 60)
 os.environ.pop("TWITCH_INTERVAL", None)
 if _saved is not None:
     os.environ["TWITCH_INTERVAL"] = _saved
