@@ -647,6 +647,7 @@ The bucket holds nothing but the page and the charts:
 ```
 index.html                   today, rebuilt every run
 trends.html                  the multi-day charts
+day/2026-08-24.html          one day, every platform — written once
 titles.json                  what each day's stream was called
 combined/2026-08-24.svg      both platforms on one axis — leads the page
 twitch/2026-08-24.svg
@@ -655,6 +656,19 @@ twitch/2026-08-23.svg        …
 trends/peaks-twitch.svg      no date: replaced every run
 trends/typical-youtube.svg
 ```
+
+### Day pages
+
+Every date the bucket has a chart for gets a page of its own at
+`day/<date>.html`: the same dark shell as the front page, every platform's chart
+for that date, and links back to Today and to Trends. **Past days** on the front
+page is one link per day pointing here, rather than one link per platform
+pointing at a bare `.svg` with no heading and no way back.
+
+They are written once and then left alone — only today's is rewritten each run,
+because today is still happening. A bucket that predates them fills itself in on
+the next run, since the backfill is driven by which pages are missing rather
+than by anything remembered locally.
 
 ### Trends
 
@@ -688,6 +702,14 @@ the labels carry the month and the chart names its own date range.
 The axis reaches back at most `--lookback` days, 90 by default, so a channel
 quiet since last year does not drag the whole of its history into every run.
 Finding fewer than ten is not a failure; the chart just has fewer bars.
+
+**The bars are links.** Clicking one opens that day's page, and hovering it
+gives the date and the figure. There is no JavaScript involved: the anchors and
+the tooltips are the SVG's own, and `trends.html` embeds each chart with
+`<object>` rather than `<img>` because an SVG embedded as an image is a
+picture — inert down to its tooltips — where one embedded as an object is a
+document. A bar is only a link when the bucket actually holds a page for that
+date, so a day the database remembers from before the site existed stays plain.
 
 `--calendar-days` restores the old view, dashes and all. A day you didn't stream
 is still a gap there and never a zero, for the same reason the combined chart

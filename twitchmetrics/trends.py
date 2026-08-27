@@ -17,7 +17,7 @@ charting library that happens to live in the same package.
 from datetime import time, timedelta
 
 from .chart import (BG, DIM, FG, GRID, MUTED, PAD_L, PAD_R, PLATFORMS,
-                    fmt_count, nice_axis, text)
+                    esc, fmt_count, nice_axis, text)
 
 PEAK_DAYS = 10          # days on the peaks chart
 COMPARE_DAYS = 5        # days shown *behind* today on the comparison chart
@@ -42,6 +42,14 @@ TODAY_FADE = 1.0
 PLATFORM_BY_KEY = {spec["key"]: spec for spec in PLATFORMS}
 
 DASH = "—"         # what a day with no stream gets instead of a bar
+
+# Where a bar sends the reader. Relative, and one level up, because the browser
+# resolves it against the SVG's own URL -- these charts live under trends/.
+DAY_PREFIX = "day/"
+
+# The size each chart renders at, in one place because the page needs it too:
+# an <object> has to be told its aspect ratio, where an <img> works it out.
+SIZES = {"peaks": (1300, 380), "typical": (1300, 430)}
 
 # --- layout ---------------------------------------------------------------
 HEAD_H = 118            # shorter than chart.HEADER_H: no in-stream tiles to fit
@@ -263,6 +271,41 @@ def _grid_lines(out, top_value, step, left, right, y_of):
         line += step
 
 
+def day_link(day, known=None):
+    """The day page's href for `day`, or None when there is no page for it.
+
+    `known` is the set of 'YYYY-MM-DD' the bucket actually holds a page for.
+    None means "link everything": the caller either knows they all exist or has
+    no way to find out, which is the case when nothing is being uploaded.
+    """
+    stamp = day.isoformat()
+    if known is not None and stamp not in known:
+        return None
+    return "../{}{}.html".format(DAY_PREFIX, stamp)
+
+
+def _open_link(href, tip):
+    """An <a> around whatever follows, carrying `tip` as its hover text.
+
+    target="_top" is load-bearing: trends.html embeds these charts in an
+    <object>, and without it the click would replace the chart with the day
+    page rather than the page the reader is looking at.
+    """
+    return ('<a href="{}" target="_top" style="cursor:pointer">'
+            '<title>{}</title>'.format(esc(href), esc(tip)))
+
+
+def _hit(x, y, width, height):
+    """An invisible rectangle, so a two-pixel bar is still worth aiming at.
+
+    pointer-events is spelled out rather than left to the default: a shape with
+    no visible paint is exactly the case the default rule is ambiguous about.
+    """
+    return ('<rect x="{:.1f}" y="{:.1f}" width="{:.1f}" height="{:.1f}" '
+            'fill="{}" fill-opacity="0" pointer-events="all"/>'.format(
+                x, y, width, max(0.0, height), FG))
+
+
 def _bar(x, y, width, height, colour, opacity=1.0, outline=None):
     stroke = (' stroke="{}" stroke-width="1"'.format(outline) if outline else "")
     return ('<rect x="{:.1f}" y="{:.1f}" width="{:.1f}" height="{:.1f}" rx="2" '
@@ -275,11 +318,15 @@ def _bar(x, y, width, height, colour, opacity=1.0, outline=None):
 # --------------------------------------------------------------------------
 
 
-def render_peaks(entries, channel, platform, day, width=1300, height=380):
+def render_peaks(entries, channel, platform, day, width=SIZES["peaks"][0],
+                 height=SIZES["peaks"][1], known=None):
     """Peak concurrent viewers per day, one bar each. None if none were streamed.
 
     Today is drawn at full strength and outlined; the earlier days sit back a
     little, so the bar the reader came for is the one they see first.
+
+    Every bar that has a day page behind it is a link to that page, with the
+    figure repeated as hover text. `known` is passed through to day_link().
     """
     streamed = [e for e in entries if e["peak"] is not None]
     if not streamed:
@@ -322,22 +369,38 @@ def render_peaks(entries, channel, platform, day, width=1300, height=380):
         centre = left + slot_width * (index + 0.5)
         x = centre - bar_width / 2
         label_fill = FG if entry["day"] == day else MUTED
-        out.append(text(centre, bottom + 22, fmt_day(entry["day"], with_month),
-                        size=12, fill=label_fill, anchor="middle"))
+        label = text(centre, bottom + 22, fmt_day(entry["day"], with_month),
+                     size=12, fill=label_fill, anchor="middle")
         if entry["peak"] is None:
             # A dash above the baseline, not a zero-height bar: the day is
             # absent from the record, and 0 viewers is a thing that can happen.
+            # No link either: there is no day page for a day that never was.
+            out.append(label)
             out.append(text(centre, bottom - 10, DASH, size=13, fill=DIM,
                             anchor="middle"))
             continue
         y = y_of(entry["peak"])
         today = entry["day"] == day
+        href = day_link(entry["day"], known)
+        if href:
+            # "·" as the separator and not DASH, which means "no stream here"
+            # everywhere else on these charts and would read as one here.
+            out.append(_open_link(href, "{} · {} peak".format(
+                fmt_day(entry["day"], True), fmt_count(entry["peak"]))))
+            # The whole column is the target, down over the date label, not
+            # just the bar: a quiet day is a few pixels tall, and the date is
+            # what the reader aims at anyway. Transparent, and first so that it
+            # hides nothing.
+            out.append(_hit(x, top, bar_width, bottom - top + 28))
+        out.append(label)
         out.append(_bar(x, y, bar_width, bottom - y, spec["color"],
                         TODAY_FADE if today else 0.72,
                         outline=FG if today else None))
         out.append(text(centre, y - 9, fmt_count(entry["peak"]), size=12,
                         fill=FG if today else MUTED, weight="600" if today else "normal",
                         anchor="middle"))
+        if href:
+            out.append("</a>")
 
     out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
@@ -355,12 +418,17 @@ def render_peaks(entries, channel, platform, day, width=1300, height=380):
 
 
 def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTES,
-                   width=1300, height=430, dropped=0):
+                   width=SIZES["typical"][0], height=SIZES["typical"][1],
+                   dropped=0, known=None):
     """Average viewers per half hour: today beside each earlier day, slot by slot.
 
     Every day keeps its own bar rather than being folded into a mean, so a
     single freak evening reads as one tall bar among five rather than dragging
     "normal" up with it.
+
+    Each bar links to its own day, and so does each swatch in the legend --
+    which is the easier target, being one per day rather than one per half
+    hour. `known` is passed through to day_link().
     """
     if not slots or not any(buckets for _, buckets in per_day):
         return None
@@ -429,8 +497,18 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
             y = y_of(value)
             today = bucket_day == day
             opacity = TODAY_FADE if today else FADES[min(position, len(FADES) - 1)]
+            # No column-wide hit area here, the way the peaks chart has one:
+            # six days share a group, so a full-height target would sit over
+            # its neighbours and the reader would open the wrong day.
+            href = day_link(bucket_day, known)
+            if href:
+                out.append(_open_link(href, "{} · {} · {} avg".format(
+                    fmt_day(bucket_day, True), fmt_slot(slot, minutes),
+                    fmt_count(value))))
             out.append(_bar(x, y, bar_width * 0.88, bottom - y, spec["color"],
                             opacity, outline=FG if today else None))
+            if href:
+                out.append("</a>")
 
     out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
@@ -443,11 +521,17 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
             continue
         today = bucket_day == day
         opacity = TODAY_FADE if today else FADES[min(position, len(FADES) - 1)]
+        label = "Today" if today else fmt_day(bucket_day, with_month)
+        href = day_link(bucket_day, known)
+        if href:
+            out.append(_open_link(href, "Open {}".format(fmt_day(bucket_day, True))))
+            out.append(_hit(legend_x, height - 34, 20 + len(label) * 7.2, 22))
         out.append(_bar(legend_x, height - 30, 13, 13, spec["color"], opacity,
                         outline=FG if today else None))
-        label = "Today" if today else fmt_day(bucket_day, with_month)
         out.append(text(legend_x + 20, height - 19, label, size=12,
                         fill=FG if today else MUTED))
+        if href:
+            out.append("</a>")
         legend_x += 20 + len(label) * 7.2 + 22
     out.append("</svg>")
     return "\n".join(out)
@@ -460,7 +544,7 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
 
 def render_all(samples, channel, platform, day, peak_days=PEAK_DAYS,
                compare_days=COMPARE_DAYS, minutes=BUCKET_MINUTES, calendar=False,
-               lookback=LOOKBACK_DAYS):
+               lookback=LOOKBACK_DAYS, known=None):
     """{"peaks": svg, "typical": svg} for one platform; either key may be absent.
 
     A platform with nothing in the window produces an empty dict rather than an
@@ -473,11 +557,11 @@ def render_all(samples, channel, platform, day, peak_days=PEAK_DAYS,
     return render_from(daily_peaks(samples, day, peak_days, calendar=calendar,
                                    lookback=lookback),
                        slots, per_day, channel, platform, day,
-                       minutes=minutes, dropped=dropped)
+                       minutes=minutes, dropped=dropped, known=known)
 
 
 def render_from(peaks, slots, per_day, channel, platform, day,
-                minutes=BUCKET_MINUTES, dropped=0):
+                minutes=BUCKET_MINUTES, dropped=0, known=None):
     """The same charts, from aggregates somebody else worked out.
 
     Everything render_all() does except the arithmetic, so the daily report can
@@ -485,15 +569,16 @@ def render_from(peaks, slots, per_day, channel, platform, day,
     from every sample the channel has ever produced. The arguments are exactly
     daily_peaks()' return value and compare_slots()' three, whichever side of
     the database they were computed on -- which is what makes the two paths
-    comparable in a test rather than merely alike.
+    comparable in a test rather than merely alike. `known` goes to both charts
+    for the same reason: the two paths have to agree about what is a link.
     """
     minutes = bucket_width(minutes)
     charts = {}
-    drawn = render_peaks(peaks, channel, platform, day)
+    drawn = render_peaks(peaks, channel, platform, day, known=known)
     if drawn:
         charts["peaks"] = drawn
     drawn = render_typical(slots, per_day, channel, platform, day,
-                           minutes=minutes, dropped=dropped)
+                           minutes=minutes, dropped=dropped, known=known)
     if drawn:
         charts["typical"] = drawn
     return charts

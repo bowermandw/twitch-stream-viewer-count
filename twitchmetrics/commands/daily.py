@@ -333,7 +333,7 @@ def render_cross_platform(channel, day, live_points):
     return out
 
 
-def render_trend_charts(channel, day, args):
+def render_trend_charts(channel, day, args, known=None):
     """The multi-day charts for every platform with history; [(kind, platform, path)].
 
     Reads the window out of the report tables rather than re-deriving it from
@@ -351,6 +351,10 @@ def render_trend_charts(channel, day, args):
 
     Written straight to charts/ under a name with no date in it, because they
     describe where the channel is now: each run replaces them.
+
+    `known` is the set of dates the bucket has a day page for, and decides
+    which bars become links. None means link every day that has data, which is
+    what a --no-upload run gets: there is no bucket to ask.
     """
     # Once per channel and ahead of the loop, because tm.refresh_range() walks
     # every platform on the channel itself -- calling it per platform would do
@@ -383,7 +387,8 @@ def render_trend_charts(channel, day, args):
                 channel, platform, str(exc).splitlines()[0]))
             continue
         charts = trends.render_from(peaks, slots, per_day, channel, platform, day,
-                                    minutes=args.bucket, dropped=dropped)
+                                    minutes=args.bucket, dropped=dropped,
+                                    known=known)
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -519,7 +524,23 @@ def report_channel(channel, day, args):
             channel))
         return "failed"
 
-    trend_charts = [] if args.no_trends else render_trend_charts(channel, day, args)
+    # What the trend bars are allowed to link to. Listed rather than assumed,
+    # because the report tables remember days from before this bucket existed
+    # and a bar pointing at a page that was never uploaded is a 404. Today is
+    # added by hand: its charts go up a few lines below this, so the listing
+    # cannot see them yet.
+    known = None
+    if not args.no_upload:
+        try:
+            known = set(s3.list_days(channel)) | {day.isoformat()}
+        except SystemExit as exc:
+            warn_exit(channel, exc)
+        except Exception as exc:  # noqa: BLE001 - unlinked bars beat no charts
+            log("WARN     {} — day pages not listed, linking every bar: {}".format(
+                channel, exc))
+
+    trend_charts = ([] if args.no_trends else
+                    render_trend_charts(channel, day, args, known=known))
 
     if args.no_upload:
         log("{}  {} chart(s) rendered, not published".format(
@@ -542,7 +563,8 @@ def report_channel(channel, day, args):
         log("WARN     {} — publish failed: {}".format(channel, exc))
         return "failed"
 
-    log("{}  page rebuilt from {} day(s): {}".format(channel, page["days"], page["url"]))
+    log("{}  page rebuilt from {} day(s), {} day page(s) written: {}".format(
+        channel, page["days"], page.get("pages", 0), page["url"]))
     # Publish first, then report the failure: a platform that went quiet must
     # still reach the exit code, or a dead poller stays invisible in the timer's
     # journal — but the platform that did work should still be on the page.

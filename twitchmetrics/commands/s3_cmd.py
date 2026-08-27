@@ -125,7 +125,8 @@ def run(args):
                 s3.INDEX_KEY, s3.require_bucket(channel)["bucket"]))
             return 0
         info = s3.publish_index(channel, chart.parse_day("today"))
-        log("s3       {} rebuilt from {} day(s)".format(s3.INDEX_KEY, info["days"]))
+        log("s3       {} rebuilt from {} day(s), {} day page(s) written".format(
+            s3.INDEX_KEY, info["days"], info.get("pages", 0)))
         print(info["url"])
         return 0
 

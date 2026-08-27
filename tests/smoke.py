@@ -878,6 +878,29 @@ check("and one with history gets both",
 check("the channel name is escaped into the chart",
       "&lt;b&gt;" in trends.render_peaks(_peaks, "<b>", "twitch", _end))
 
+# The bars are links. An <img>-embedded SVG is inert down to its tooltips,
+# which is why trends.html embeds these with <object> instead: that is what
+# makes an <a> inside one clickable at all, and target="_top" is what stops the
+# click replacing the chart rather than the page around it.
+_streamed = next(e["day"] for e in _peaks if e["peak"] is not None)
+_dark = next(e["day"] for e in _peaks if e["peak"] is None)
+check("a bar links to its own day page, a directory up from trends/",
+      'href="../day/{}.html"'.format(_streamed.isoformat()) in _peaks_svg)
+check("aimed at the page, not at the frame the chart sits in",
+      'target="_top"' in _peaks_svg)
+check("with the figure repeated as hover text", "peak</title>" in _peaks_svg)
+check("a day with no stream is not a link to a page that was never written",
+      'href="../day/{}.html"'.format(_dark.isoformat()) not in _peaks_svg)
+check("the comparison chart links from its bars and from its legend",
+      "avg</title>" in _typical_svg and "<title>Open " in _typical_svg)
+check("known= suppresses every bar the bucket has no page for",
+      'href="../day/' not in trends.render_peaks(_peaks, "t", "twitch", _end,
+                                                 known=set()))
+_one = trends.render_peaks(_peaks, "t", "twitch", _end,
+                           known={_streamed.isoformat()})
+check("and the bars it suppresses still draw, just unlinked",
+      _one.count('href="../day/') == 1 and _one.count("<rect") > 2)
+
 # render_from() is the seam the daily report now goes through: same charts,
 # from aggregates somebody else worked out. Byte-identical output is the whole
 # guarantee -- it is what says the split changed nothing, and it is the shape
@@ -888,6 +911,13 @@ check("render_from draws exactly what render_all draws",
       == trends.render_all(_history, "t", "twitch", _end, calendar=True))
 check("and nothing at all still means no charts",
       trends.render_from([], [], [], "t", "twitch", _end) == {})
+# The links have to be on both sides of the seam or the parity check below
+# would pass on two charts that disagree about what is clickable.
+check("known= reaches both charts through render_from",
+      trends.render_from(_peaks, _slots, _per_day, "t", "twitch", _end,
+                         dropped=_dropped, known=set())
+      == trends.render_all(_history, "t", "twitch", _end, calendar=True,
+                           known=set()))
 # Clamped to the same range refresh_clock_buckets() clamps its own argument to,
 # or `daily --bucket` would put the labels and the bars on different grids.
 check("a slot width is clamped the way the database clamps it",
@@ -1030,9 +1060,20 @@ check("the channel is the heading", "<h1>testchannel</h1>" in _page)
 check("today's charts are displayed", _page.count("<img") == 2)
 check("today's twitch chart by relative key", 'src="twitch/2026-08-24.svg"' in _page)
 check("today's youtube chart too", 'src="youtube/2026-08-24.svg"' in _page)
-check("past days are links, not images",
-      'href="youtube/2026-08-23.svg"' in _page
+check("past days link to the day page, not to a bare image",
+      'href="day/2026-08-23.html"' in _page
+      and 'href="youtube/2026-08-23.svg"' not in _page
       and 'src="youtube/2026-08-23.svg"' not in _page)
+check("one link per day, naming the platforms it has charts for",
+      '<a href="day/2026-08-24.html">' not in _page          # today is not listed
+      and '<li><span>2026-08-22</span><a href="day/2026-08-22.html">'
+          'Twitch · YouTube</a></li>' in _page)
+check("the derived chart is not named as if it were a platform",
+      "Both platforms" not in s3.render_index(
+          "t", date(2026, 8, 24), {"2026-08-23": ["combined", "twitch"]}))
+check("unless it is all the day has",
+      "Both platforms" in s3.render_index(
+          "t", date(2026, 8, 24), {"2026-08-23": ["combined"]}))
 check("every past day is linked", _page.count("<li>") == 2)
 check("today is not repeated in the list", "<li><span>2026-08-24" not in _page)
 check("newest past day comes first",
@@ -1099,8 +1140,15 @@ check("the trends page is a whole document",
       _trends_page.startswith("<!doctype html>")
       and _trends_page.rstrip().endswith("</html>"))
 check("it shows a panel per chart the bucket holds",
+      _trends_page.count("<object") == 2)
+check("embedded as objects, or the links inside the SVG would be inert",
+      'data="trends/peaks-twitch.svg"' in _trends_page)
+check("each with an <img> fallback for a browser that declines the object",
       _trends_page.count("<img") == 2)
 check("by relative key", 'src="trends/peaks-twitch.svg"' in _trends_page)
+check("and told its aspect ratio, which <object> will not work out",
+      "aspect-ratio: 1300 / 380" in _trends_page
+      and "aspect-ratio: 1300 / 430" in _trends_page)
 check("it never links a chart that isn't there",
       "typical-twitch" not in _trends_page)
 check("it links back to today", 'href="index.html"' in _trends_page)
@@ -1119,6 +1167,41 @@ check("the front page links to it once the charts exist",
       'href="trends.html"' in s3.render_index("t", date(2026, 8, 24), _days, trends=True))
 check("and does not, before they do",
       "trends.html" not in s3.render_index("t", date(2026, 8, 24), _days))
+
+# --- s3 the day page ------------------------------------------------------
+section("s3 day page")
+check("a day page has its own key", s3.day_key("2026-08-24") == "day/2026-08-24.html")
+check("and a date works as well as a string",
+      s3.day_key(date(2026, 8, 24)) == "day/2026-08-24.html")
+check("it round-trips", s3.parse_day_key(s3.day_key("2026-08-24")) == "2026-08-24")
+check("the chart matcher ignores it — or it would become a Past days row",
+      s3.parse_key(s3.day_key("2026-08-24")) is None)
+check("and the day matcher ignores a chart",
+      s3.parse_day_key("twitch/2026-08-24.svg") is None)
+
+_day_page = s3.render_day("testchannel", "2026-08-24", ["twitch", "youtube"],
+                          {"twitch": _tw})
+check("the day page is a whole document",
+      _day_page.startswith("<!doctype html>")
+      and _day_page.rstrip().endswith("</html>"))
+check("it shows every chart the bucket holds for that date",
+      _day_page.count("<img") == 2)
+check("reached one directory up, since the page sits under day/",
+      'src="../twitch/2026-08-24.svg"' in _day_page
+      and 'src="../youtube/2026-08-24.svg"' in _day_page)
+check("it leads with the date", "Mon 24 Aug 2026" in _day_page)
+check("it carries the stream's title", "Hollywood" in _day_page)
+check("and links both ways out, for a reader who arrived from a trend chart",
+      'href="../index.html"' in _day_page and 'href="../trends.html"' in _day_page)
+_both = s3.render_day("t", "2026-08-24", ["combined", "twitch"])
+check("combined leads, as it does on the index",
+      _both.index("Both platforms") < _both.index(">Twitch<"))
+check("a date with no charts says so rather than showing broken images",
+      "<img" not in s3.render_day("t", "2026-08-24", [])
+      and "No graph for" in s3.render_day("t", "2026-08-24", []))
+check("the channel name is escaped",
+      "&lt;script&gt;" in s3.render_day("<script>", "2026-08-24", ["twitch"]))
+check("no script anywhere", "<script" not in _day_page.lower())
 
 # --- s3 the bucket registry -----------------------------------------------
 section("s3 bucket registry")

@@ -6,6 +6,7 @@ the multi-day charts. The bucket holds nothing but those and the SVGs:
 
     index.html
     trends.html
+    day/2026-08-24.html
     twitch/2026-08-24.svg
     youtube/2026-08-24.svg
     trends/peaks-twitch.svg
@@ -26,14 +27,17 @@ import os
 import re
 import secrets
 import stat
+from datetime import date
 
 from . import config, retry
 from .logging import log
+from .trends import SIZES as TREND_SIZES
 
 INDEX_KEY = "index.html"
 TRENDS_KEY = "trends.html"
 TITLES_KEY = "titles.json"
 TRENDS_PREFIX = "trends/"
+DAY_PREFIX = "day/"
 SVG_TYPE = "image/svg+xml"
 
 # Not `immutable`: re-running the report for today legitimately replaces today's
@@ -88,6 +92,9 @@ RETRY_CODES = ("SlowDown", "RequestTimeout", "RequestTimeoutException",
 
 KEY_RE = re.compile(r"^([a-z]+)/(\d{4}-\d{2}-\d{2})\.svg$")
 TREND_KEY_RE = re.compile(r"^" + TRENDS_PREFIX + r"([a-z]+)-([a-z]+)\.svg$")
+# .html, not .svg, which is what keeps a day page out of KEY_RE and so out of
+# the Past days list -- the same property trend_key() is careful about.
+DAY_KEY_RE = re.compile(r"^" + DAY_PREFIX + r"(\d{4}-\d{2}-\d{2})\.html$")
 
 NO_BOTO3 = """The daily report needs boto3, which isn't installed.
 
@@ -204,6 +211,22 @@ def bucket_name(channel):
 def object_key(platform, day):
     """Where one platform's chart for one day lives: 'twitch/2026-08-24.svg'."""
     return "{}/{}.svg".format(str(platform).strip("/. "), day.isoformat())
+
+
+def day_key(day):
+    """One day's page: 'day/2026-08-24.html'.
+
+    `day` may be a date or the 'YYYY-MM-DD' string list_days() keys on, since
+    both callers have one and neither should have to convert.
+    """
+    stamp = day if isinstance(day, str) else day.isoformat()
+    return "{}{}.html".format(DAY_PREFIX, stamp)
+
+
+def parse_day_key(key):
+    """'YYYY-MM-DD' for a day page's key, or None for anything else."""
+    match = DAY_KEY_RE.match(str(key))
+    return match.group(1) if match else None
 
 
 def trend_key(kind, platform):
@@ -543,6 +566,21 @@ def list_trends(channel):
             for platform in PLATFORMS if (kind, platform) in found]
 
 
+def list_day_pages(channel):
+    """{'YYYY-MM-DD', ...} for the day pages the bucket already holds.
+
+    Only so publish_days() can tell a backfill from a rewrite. Nothing is
+    rendered from this — every page's content comes from list_days(), which is
+    the listing that decides what the site says.
+    """
+    found = set()
+    for key in _keys(channel, DAY_PREFIX):
+        parsed = parse_day_key(key)
+        if parsed:
+            found.add(parsed)
+    return found
+
+
 def load_titles(channel):
     """{date: {platform: title}} out of the bucket, or {} if it isn't readable.
 
@@ -583,6 +621,27 @@ def _publish_page(channel, key, page):
     return website_url(known["bucket"], known["region"])
 
 
+def publish_days(channel, days, titles=None, today=None):
+    """Write the day pages that don't exist yet, plus today's. Returns the count.
+
+    Today's is rewritten every run because today is still happening — a second
+    platform may have finished polling since the last one. Every other date is
+    written once and then left alone, so the steady state is one PUT a day
+    however many months the bucket has accumulated, and a bucket that predates
+    day pages fills itself in on the next run rather than needing a migration.
+    """
+    existing = list_day_pages(channel)
+    stamp = today.isoformat() if today is not None else None
+    written = 0
+    for day, platforms in days.items():
+        if day in existing and day != stamp:
+            continue
+        _publish_page(channel, day_key(day),
+                      render_day(channel, day, platforms, (titles or {}).get(day)))
+        written += 1
+    return written
+
+
 def publish_index(channel, today, titles=None, trends=None):
     """Rebuild index.html from what is actually in the bucket and upload it.
 
@@ -603,9 +662,21 @@ def publish_index(channel, today, titles=None, trends=None):
     if trends is None:
         trends = bool(list_trends(channel))
 
+    # Ahead of the index, so the links it is about to draw already resolve, and
+    # swallowing its own failure: the index is the page the run exists to
+    # produce, and a day page that wouldn't upload must not take it down with
+    # it. The next run tries again, because the backfill is driven by what is
+    # missing rather than by anything remembered.
+    try:
+        pages = publish_days(channel, days, stored, today)
+    except Exception as exc:  # noqa: BLE001 - the index still has to go out
+        log("WARN     {} — day pages not published: {}".format(channel, exc))
+        pages = 0
+
     page = render_index(channel, today, days, stored.get(today.isoformat()),
                         trends=trends)
-    return {"url": _publish_page(channel, INDEX_KEY, page), "days": len(days)}
+    return {"url": _publish_page(channel, INDEX_KEY, page), "days": len(days),
+            "pages": pages}
 
 
 def publish_trends(channel, today):
@@ -661,7 +732,7 @@ STYLE = """
   .panel.lead { margin-bottom: 42px; padding-bottom: 34px;
                 border-bottom: 1px solid #303030; }
   .panel.lead h2 { color: #f1f1f1; font-size: 15px; letter-spacing: 0.04em; }
-  .panel img {
+  .panel img, .panel object {
     display: block; width: 100%; height: auto;
     border: 1px solid #303030; border-radius: 8px; background: #0f0f0f;
   }
@@ -728,10 +799,83 @@ PANEL = """  <section class="panel{css}">
     <img src="{key}" alt="{label} concurrent viewers on {date}">
   </section>"""
 
+# <object> rather than <img>, and this is the whole reason the bars are
+# clickable: an SVG embedded with <img> is a picture, inert down to its
+# tooltips, where one embedded with <object> is a document. The nested <img> is
+# the fallback a browser that declines the object still gets -- the same chart,
+# just as inert as before. aspect-ratio is spelled out because <object> does
+# not infer its height from the SVG as dependably as <img> does.
 TREND_PANEL = """  <section class="panel">
     <h2>{label}</h2>
-    <img src="{key}" alt="{label}">
+    <object type="image/svg+xml" data="{key}" aria-label="{label}"
+            style="aspect-ratio: {ratio}"><img src="{key}" alt="{label}"></object>
   </section>"""
+
+# One day's page. No Past days list -- the index has it, and this page is one
+# of its entries -- but links both ways out, since a reader who arrived from a
+# trend chart has never seen the index.
+DAY_BODY = """</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>{channel}</h1>
+    <p class="today">{date}</p>{titles}
+    <p class="nav"><a href="{index}">← Today</a> · <a href="{trends}">Trends →</a></p>
+  </header>
+{panels}
+  <footer>{date}</footer>
+</main>
+</body>
+</html>
+"""
+
+
+def _stream_title(titles):
+    """The '<p class="stream">' for one day's titles, or '' if there are none.
+
+    The platforms carry different titles for the same broadcast — Twitch's is
+    the canonical one. YouTube is the fallback rather than a second line, so a
+    channel streaming only there still gets a title.
+    """
+    headline = next((str((titles or {}).get(key) or "").strip()
+                     for key in TITLE_PREFERENCE
+                     if str((titles or {}).get(key) or "").strip()), "")
+    return ('\n    <p class="stream">{}</p>'.format(html.escape(headline))
+            if headline else "")
+
+
+def render_day(channel, day, platforms, titles=None):
+    """One day's page: every chart recorded for that date, and a way back.
+
+    It lives a directory down, at day/2026-08-24.html, so every reference out
+    of it is '../'-prefixed. That is the only thing separating it from the
+    index, which is why it reuses the index's PANEL wholesale.
+
+    `platforms` is list_days()' value for the date — what the bucket actually
+    holds — so the page never shows a panel for a chart that isn't there.
+    """
+    when = date.fromisoformat(day) if isinstance(day, str) else day
+    pretty = when.strftime("%a %d %b %Y")
+
+    panels = [PANEL.format(
+        label=html.escape(PLATFORM_LABELS.get(platform, platform)),
+        key=html.escape("../" + object_key(platform, when)),
+        date=html.escape(pretty),
+        css=" lead" if platform == "combined" else "")
+        for platform in PLATFORMS if platform in (platforms or ())]
+    if not panels:
+        panels.append('  <p class="empty">No graph for {}.</p>'.format(
+            html.escape(pretty)))
+
+    return (HEAD.format(channel=html.escape(str(channel)), page=html.escape(pretty))
+            + STYLE
+            + DAY_BODY.format(channel=html.escape(str(channel)),
+                              date=html.escape(pretty),
+                              titles=_stream_title(titles),
+                              index=html.escape("../" + INDEX_KEY),
+                              trends=html.escape("../" + TRENDS_KEY),
+                              panels="\n".join(panels)))
 
 
 def render_index(channel, today, days, titles=None, trends=False):
@@ -751,14 +895,7 @@ def render_index(channel, today, days, titles=None, trends=False):
     pretty = today.strftime("%a %d %b %Y")
     todays = days.get(stamp) or []
 
-    # The platforms carry different titles for the same broadcast — Twitch's is
-    # the canonical one. YouTube is the fallback rather than a second line, so
-    # a channel streaming only there still gets a title.
-    headline = next((str((titles or {}).get(key) or "").strip()
-                     for key in TITLE_PREFERENCE
-                     if str((titles or {}).get(key) or "").strip()), "")
-    stream_titles = ('\n    <p class="stream">{}</p>'.format(
-        html.escape(headline)) if headline else "")
+    stream_titles = _stream_title(titles)
 
     panels = []
     for platform in PLATFORMS:
@@ -774,16 +911,23 @@ def render_index(channel, today, days, titles=None, trends=False):
                       'streamed, or the report has not run yet.</p>'.format(
                           html.escape(pretty)))
 
+    # One link per day rather than one per platform. The link text still names
+    # the platforms the date has charts for, so nothing is lost by collapsing
+    # them, and the reader lands on a page with a heading and a way back
+    # instead of on a bare SVG.
     rows = []
     for day, platforms in days.items():
         if day == stamp:
             continue
-        links = " ".join(
-            '<a href="{}">{}</a>'.format(
-                html.escape("{}/{}.svg".format(platform, day)),
-                html.escape(PLATFORM_LABELS.get(platform, platform)))
-            for platform in platforms)
-        rows.append("      <li><span>{}</span>{}</li>".format(html.escape(day), links))
+        # "combined" is left out of the label: it is a chart derived from the
+        # others rather than somewhere the channel streamed, and naming it made
+        # every row read "Both platforms · Twitch · YouTube". The day page
+        # still leads with it.
+        named = [p for p in platforms if p != "combined"] or list(platforms)
+        label = " · ".join(PLATFORM_LABELS.get(platform, platform)
+                           for platform in named)
+        rows.append('      <li><span>{}</span><a href="{}">{}</a></li>'.format(
+            html.escape(day), html.escape(day_key(day)), html.escape(label)))
     past = ("    <ul>\n" + "\n".join(rows) + "\n    </ul>" if rows else
             '    <p class="empty">Nothing earlier yet — this is the first day.</p>')
 
@@ -811,7 +955,8 @@ def render_trends(channel, today, charts):
     panels = [TREND_PANEL.format(
         label=html.escape(TREND_LABELS.get(
             (kind, platform), "{} · {}".format(kind, platform))),
-        key=html.escape(trend_key(kind, platform)))
+        key=html.escape(trend_key(kind, platform)),
+        ratio="{} / {}".format(*TREND_SIZES.get(kind, TREND_SIZES["peaks"])))
         for kind, platform in charts]
     if not panels:
         panels.append('  <p class="empty">No trend charts yet — they appear once '
