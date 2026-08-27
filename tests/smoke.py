@@ -1168,6 +1168,121 @@ check("the front page links to it once the charts exist",
 check("and does not, before they do",
       "trends.html" not in s3.render_index("t", date(2026, 8, 24), _days))
 
+# --- per-broadcast trend charts -------------------------------------------
+section("per-broadcast trend charts")
+
+# Every kind the page can show has to be drawable and measurable, or the panel
+# renders at the wrong aspect ratio and nothing says so.
+check("every trend kind has a size", all(k in trends.SIZES for k in s3.TREND_KINDS))
+check("and a label for both platforms",
+      all((k, p) in s3.TREND_LABELS
+          for k in s3.TREND_KINDS for p in ("twitch", "youtube")))
+# A kind with a hyphen would parse back as the wrong (kind, platform) pair and
+# quietly mislabel a panel, so the names are single words on purpose.
+check("every kind round-trips through its key",
+      all(s3.parse_trend_key(s3.trend_key(k, p)) == (k, p)
+          for k in s3.TREND_KINDS for p in ("twitch", "youtube")))
+check("the per-broadcast charts come after the half-hour averages",
+      s3.TREND_KINDS.index("typical")
+      < min(s3.TREND_KINDS.index(k)
+            for k in ("followers", "likes", "weekday", "location")))
+
+_order = s3.render_trends("t", date(2026, 8, 25),
+                          [(k, "twitch") for k in s3.TREND_KINDS])
+check("and the page draws them in that order",
+      [k for k in s3.TREND_KINDS if k in _order]
+      == sorted((k for k in s3.TREND_KINDS if k in _order),
+                key=lambda k: _order.index("trends/{}-twitch.svg".format(k))))
+
+
+def _entry(day, location, followers=None, likes=None, hour=13):
+    return {"stream_id": 1, "day": day, "weekday": day.weekday(),
+            "title": "t", "location": location, "followers": followers,
+            "likes": likes, "peak": 50,
+            "started": datetime(day.year, day.month, day.day, hour, tzinfo=timezone.utc)}
+
+
+_streams = [_entry(date(2026, 8, 18), "Magic Kingdom", 12),
+            _entry(date(2026, 8, 19), "EPCOT", -7),
+            _entry(date(2026, 8, 20), None, None),
+            _entry(date(2026, 8, 21), "EPCOT", 0),
+            _entry(date(2026, 8, 22), "Animal Kingdom", 9, hour=10),
+            _entry(date(2026, 8, 22), "EPCOT", 4, hour=20)]
+_bars = trends.render_stream_bars(_streams, "t", "twitch", date(2026, 8, 22),
+                                  "followers")
+check("the followers chart draws a bar per broadcast, not per date",
+      _bars.count("<rect") - 1 >= len(_streams) - 1)   # -1 for the background
+check("two broadcasts on one date are both labelled",
+      _bars.count("Animal Kingdom") and _bars.count("EPCOT") >= 2)
+# The distinction the whole chart turns on: a gain of nothing and no reading at
+# all are different facts and must not draw the same mark.
+check("a broadcast that was never sampled draws a dash", trends.DASH in _bars)
+check("and one that genuinely gained nothing draws a labelled zero",
+      ">0</text>" in _bars)
+check("a loss is drawn below the line, not as nothing",
+      "-7" in _bars and trends._signed_axis([12, -7])[0] < 0)
+check("gains are signed, so a bar cannot be read as a total", "+12" in _bars)
+check("it uses the followers colour, not the platform's",
+      chart.METRIC_BY_KEY["followers"]["color"] in _bars)
+check("bars link to the day page", 'href="../day/2026-08-22.html"' in _bars)
+check("and not when the bucket has no page for that day",
+      "day/2026-08-18.html" not in trends.render_stream_bars(
+          _streams, "t", "twitch", date(2026, 8, 22), "followers",
+          known={"2026-08-22"}))
+check("no script anywhere", "<script" not in _bars.lower())
+
+# Self-selection by data rather than by platform name: this is what lets
+# render_streams() be called for both platforms with no branch in the caller.
+check("a chart with nothing to draw is None, not an empty chart",
+      trends.render_stream_bars(_streams, "t", "twitch", date(2026, 8, 22),
+                                "likes") is None
+      and trends.render_stream_bars([], "t", "twitch", date(2026, 8, 22),
+                                    "followers") is None)
+
+_groups = [{"key": "0", "streams": 2, "total": 21, "average": 10.5, "best": 12,
+            "best_stream_id": 1},
+           {"key": "5", "streams": 1, "total": -7, "average": -7.0, "best": -7,
+            "best_stream_id": 2}]
+_week = trends.render_stream_groups(_groups, "t", "twitch", date(2026, 8, 22),
+                                    "followers", "weekday")
+check("the weekday chart names all seven days",
+      all(d in _week for d in trends.WEEKDAYS))
+check("a day never streamed on is a dash, not a zero", trends.DASH in _week)
+check("the counts behind each average are shown", "2 stream(s)" in _week)
+check("averages are not links — a weekday is not a date", "<a href" not in _week)
+check("but the count is still reachable, as a tooltip", "<title>" in _week)
+
+_place = trends.render_stream_groups(
+    [{"key": "EPCOT", "streams": 1, "total": 4, "average": 4.0, "best": 4,
+      "best_stream_id": 1},
+     {"key": "Magic Kingdom", "streams": 2, "total": 30, "average": 15.0,
+      "best": 20, "best_stream_id": 2},
+     {"key": "", "streams": 1, "total": 1, "average": 1.0, "best": 1,
+      "best_stream_id": 3}],
+    "t", "twitch", date(2026, 8, 22), "followers", "location")
+check("the location chart puts the best place first",
+      _place.index("Magic Kingdom") < _place.index("EPCOT"))
+check("and names an unmatched title rather than dropping it",
+      trends.UNKNOWN_LOCATION in _place)
+check("an empty grouping draws nothing",
+      trends.render_stream_groups([], "t", "twitch", date(2026, 8, 22),
+                                  "followers", "weekday") is None)
+
+# The axis labels are drawn with fmt_count(), which rounds to whole numbers, so
+# a fractional step prints gridlines that are unevenly spaced in their labels.
+check("every axis step is a whole number",
+      all(float(trends._signed_axis(v)[2]).is_integer()
+          for v in ([9, -3], [1], [2, 3], [10.67, 4.0, 18.67], [537], [0, 0])))
+check("and zero is always on a gridline",
+      all(trends._signed_axis(v)[0] % trends._signed_axis(v)[2] == 0
+          for v in ([9, -3], [-3, -9], [12, -7])))
+
+check("render_streams returns only what it could draw",
+      set(trends.render_streams(_streams, {"weekday": _groups}, "t", "twitch",
+                                date(2026, 8, 22))) == {"followers", "weekday"})
+check("and nothing at all for a platform with neither",
+      trends.render_streams([], {}, "t", "youtube", date(2026, 8, 22)) == {})
+
 # --- s3 the day page ------------------------------------------------------
 section("s3 day page")
 check("a day page has its own key", s3.day_key("2026-08-24") == "day/2026-08-24.html")
@@ -2228,6 +2343,153 @@ else:
               chart.render_platforms(_gseries, "gridtest", _gday)
               == chart.render_platforms(_gseries, "gridtest", _gday,
                                         aligned=(_sg, _sv, _sc)))
+
+        # --- per-broadcast trends -----------------------------------------
+        # These have no Python twin, so nothing compares them to a second
+        # implementation the way the parity harness above does. That makes
+        # testing them directly the only cover they get -- which is the lesson
+        # 006_fix_stream_metrics.sql was written to record.
+        _lslug = "smoke_locations"
+        _lacct = store.account_id(_lslug, "twitch", timezone_name=_zone_name)
+        _lcid = db.execute("SELECT channel_id FROM tm.platform_account "
+                           "WHERE account_id = %s", (_lacct,), fetch=True)[0][0]
+        for _seq, _pat, _loc in ((10, "Magic Kingdom", "Magic Kingdom"),
+                                 (20, "EPCOT", "EPCOT")):
+            db.execute("INSERT INTO tm.stream_location_rule "
+                       "(channel_id, seq, pattern, location) VALUES (%s,%s,%s,%s)",
+                       (_lcid, _seq, _pat, _loc))
+
+        def _place(title):
+            return db.execute("SELECT tm.stream_location(%s, %s)",
+                              (_lcid, title), fetch=True)[0][0]
+
+        check("a location rule matches anywhere in the title",
+              _place("LIVE: EPCOT tonight") == "EPCOT")
+        check("and does so regardless of case",
+              _place("live: epcot tonight") == "EPCOT")
+        # Lowest seq wins, which is what makes a rule slottable above another.
+        check("the lowest seq wins when two rules match",
+              _place("Magic Kingdom then EPCOT") == "Magic Kingdom")
+        check("an unmatched title has no location, rather than a guessed one",
+              _place("Just chatting") is None)
+        check("and neither an empty nor a missing one",
+              _place("") is None and _place(None) is None)
+
+        # Two broadcasts on ONE date at two places, plus one crossing local
+        # midnight. Every claim the location chart makes rests on these three.
+        _lplan = [("2026-08-15 10:00", 2, "EPCOT", 6),
+                  ("2026-08-15 18:00", 2, "Magic Kingdom", 20),
+                  ("2026-08-22 22:00", 4, "Magic Kingdom", 30)]
+        # Written as REPORTING-zone wall clock and converted, so "22:00" means
+        # ten at night wherever the test is run and the midnight-crossing case
+        # actually crosses midnight.
+        from zoneinfo import ZoneInfo as _ZI          # noqa: PLC0415
+        _reporting = _ZI(_zone_name)
+
+        def _at(local):
+            return (datetime.strptime(local, "%Y-%m-%d %H:%M")
+                    .replace(tzinfo=_reporting).astimezone(timezone.utc))
+
+        _followers = 1000
+        for _start, _hours, _park, _gain in _lplan:
+            _begin = _at(_start)
+            _steps = _hours * 4
+            for _i in range(_steps + 1):
+                _when = _begin + timedelta(minutes=15 * _i)
+                store.record("twitch", _lacct, {
+                    "timestamp_utc": _when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "is_live": "true", "viewer_count": "40",
+                    "follower_count": str(_followers + round(_gain * _i / _steps)),
+                    "chatter_count": "5", "title": "LIVE: {} day".format(_park),
+                    "game": "IRL",
+                    "started_at": _begin.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "stream_id": _begin.strftime("%y%m%d%H%M"),
+                }, source="fixture", refresh=False)
+            _followers += _gain
+            _off = _begin + timedelta(hours=_hours, minutes=30)
+            store.record("twitch", _lacct, {
+                "timestamp_utc": _off.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "is_live": "false", "viewer_count": "", "chatter_count": "",
+                "follower_count": str(_followers), "title": "", "game": "",
+                "started_at": "", "stream_id": ""}, source="fixture", refresh=False)
+
+        db.execute("SELECT tm.refresh_range(%s, %s, %s, %s, 30)",
+                   (_lcid, date(2026, 8, 1), date(2026, 8, 31), _zone_name))
+        # The gap 005 had to close for report_stream_metric, closed here too:
+        # refresh_range() must fill this table, or an imported archive never
+        # produces a per-broadcast row at all.
+        check("refresh_range fills the stream trends",
+              db.execute("SELECT count(*) FROM tm.report_stream_trend "
+                         "WHERE channel_id = %s", (_lcid,), fetch=True)[0][0] == 3)
+
+        _rows = store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                    timezone_name=_zone_name)
+        check("one row per broadcast, oldest first",
+              len(_rows) == 3
+              and [r["started"] for r in _rows] == sorted(r["started"] for r in _rows))
+        # The whole reason this axis exists next to the peaks chart.
+        _same_day = [r for r in _rows if r["day"] == date(2026, 8, 15)]
+        check("two broadcasts on one date stay two rows", len(_same_day) == 2)
+        check("and keep their own locations",
+              {r["location"] for r in _same_day} == {"EPCOT", "Magic Kingdom"})
+        check("the weekday matches Python's date.weekday()",
+              all(r["day"].weekday() == r["weekday"] for r in _rows))
+        # 10pm Saturday to 2am Sunday is a Saturday stream, not half of each.
+        _late = [r for r in _rows if r["followers"] == 30]
+        check("a broadcast crossing local midnight is filed under its start",
+              len(_late) == 1 and _late[0]["day"] == date(2026, 8, 22)
+              and _late[0]["weekday"] == 5)
+        check("the follower delta is the gain across the broadcast",
+              sorted(r["followers"] for r in _rows) == [6, 20, 30])
+        check("a twitch broadcast carries no likes", all(r["likes"] is None
+                                                         for r in _rows))
+
+        _by_day = {g["key"]: g for g in store.stream_groups(
+            _lslug, "twitch", "followers", "weekday", date(2026, 8, 31),
+            timezone_name=_zone_name)}
+        check("the weekday rollup groups the two Saturdays together",
+              _by_day["5"]["streams"] == 3 and _by_day["5"]["total"] == 56)
+        check("and averages them per broadcast",
+              abs(_by_day["5"]["average"] - 56 / 3) < 1e-6)
+        check("a weekday nobody streamed on is absent, not zero",
+              set(_by_day) == {"5"})
+
+        _by_place = {g["key"]: g for g in store.stream_groups(
+            _lslug, "twitch", "followers", "location", date(2026, 8, 31),
+            timezone_name=_zone_name)}
+        check("the location rollup splits a single date between two parks",
+              _by_place["EPCOT"]["streams"] == 1
+              and _by_place["Magic Kingdom"]["streams"] == 2)
+        check("and names the best broadcast in each",
+              _by_place["Magic Kingdom"]["best"] == 30)
+
+        # The window both charts read must be the same window, or the rollup
+        # summarises broadcasts the bars above it do not show.
+        check("a narrower window narrows the rollup with it",
+              sum(g["streams"] for g in store.stream_groups(
+                  _lslug, "twitch", "followers", "location", date(2026, 8, 31),
+                  count=2, timezone_name=_zone_name)) == 2)
+        check("and a lookback that excludes a broadcast excludes it from both",
+              len(store.stream_trends(_lslug, "twitch", date(2026, 8, 22),
+                                      lookback=3, timezone_name=_zone_name)) == 1)
+
+        _refused = refusal(lambda: db.execute(
+            "SELECT * FROM tm.stream_groups(%s,'twitch','followers','park',"
+            "%s,10,90,%s)", (_lcid, date(2026, 8, 31), _zone_name), fetch=True))
+        check("an unknown grouping raises rather than returning nothing",
+              "park" in _refused, _refused.splitlines()[0][:80])
+
+        # A rule change rewrites history, so the table has to be re-filed.
+        db.execute("DELETE FROM tm.stream_location_rule WHERE channel_id = %s "
+                   "AND pattern = 'EPCOT'", (_lcid,))
+        db.execute("SELECT tm.refresh_stream_trends(%s, %s, %s, NULL)",
+                   (_lcid, date(2026, 8, 1), date(2026, 8, 31)))
+        check("dropping a rule moves its broadcasts to unknown, not out",
+              len(store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                      timezone_name=_zone_name)) == 3
+              and sum(1 for r in store.stream_trends(
+                  _lslug, "twitch", date(2026, 8, 31),
+                  timezone_name=_zone_name) if r["location"] is None) == 1)
     os.environ.pop("TWITCH_DATABASE_URL", None)
     db.close()
     db.reset()

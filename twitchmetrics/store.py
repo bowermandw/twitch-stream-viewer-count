@@ -821,6 +821,103 @@ def compare_slots(channel, platform, day, days=trends.COMPARE_DAYS,
             dropped)
 
 
+# --------------------------------------------------------------------------
+# per-broadcast trends
+# --------------------------------------------------------------------------
+#
+# The two above compare DAYS. These compare BROADCASTS, which is a different
+# axis and not merely a finer one: a Saturday spent at two parks is two rows
+# here and one bar there, and the location rollup is only answerable on this
+# side of that distinction.
+#
+# Neither has a pure-Python twin in trends.py, because neither re-derives
+# anything -- tm.report_stream_trend is filled by the poller and by the nightly
+# refresh, and there is no CSV path that could produce it. So there is no parity
+# check to hold them to, and none is missing: the SQL is tested directly.
+
+
+STREAM_TRENDS_SQL = """
+SELECT stream_id, local_date, started_at, weekday, title, location,
+       follower_delta, likes_peak, peak_viewers
+  FROM tm.stream_trends(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
+      -- ::integer for DAILY_PEAKS_SQL's reason: psycopg sends a small Python
+      -- int as int2, and overload resolution will not widen it.
+      %s::integer, %s::integer, %s)
+ ORDER BY started_at
+"""
+
+
+def stream_trends(channel, platform, day, count=trends.STREAM_COUNT,
+                  lookback=trends.LOOKBACK_DAYS, timezone_name=None):
+    """The last `count` broadcasts on or before `day`, oldest first.
+
+    [{"stream_id", "day", "started", "weekday", "title", "location",
+      "followers", "likes", "peak"}, ...]
+
+    `day` is the local date the broadcast STARTED on, so a stream that ran past
+    midnight is filed under the evening it belongs to rather than split.
+
+    "followers" is the gain across the broadcast's own samples and "likes" the
+    peak of a count that only climbs. Either is None when the platform does not
+    carry it -- a Twitch row has no likes and a YouTube row no followers -- and
+    that is what lets the renderers select themselves by returning None rather
+    than by testing the platform's name.
+    """
+    if count <= 0:
+        # The SQL clamps with greatest(0, p_streams) and would agree, but the
+        # guard keeps `--stream-count 0` from making a round trip to say so.
+        return []
+    rows = db.execute(STREAM_TRENDS_SQL,
+                      (config.channel_slug(channel), platform, day,
+                       max(1, int(count)), max(1, int(lookback)),
+                       timezone_name or config.resolve_db_timezone()), fetch=True)
+    return [{"stream_id": row[0], "day": row[1],
+             "started": row[2].astimezone(timezone.utc) if row[2] else None,
+             "weekday": int(row[3]), "title": row[4], "location": row[5],
+             "followers": row[6], "likes": row[7], "peak": row[8]}
+            for row in rows]
+
+
+STREAM_GROUPS_SQL = """
+SELECT group_key, streams, total, average, best, best_stream_id
+  FROM tm.stream_groups(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s, %s, %s,
+      %s::integer, %s::integer, %s)
+ ORDER BY group_key
+"""
+
+
+def stream_groups(channel, platform, metric, grouping, day,
+                  count=trends.STREAM_COUNT, lookback=trends.LOOKBACK_DAYS,
+                  timezone_name=None):
+    """One row per weekday or per location over the same window, sparse.
+
+    [{"key", "streams", "total", "average", "best", "best_stream_id"}, ...]
+
+    `grouping` is "weekday" or "location"; the SQL raises on anything else
+    rather than returning nothing, which would read as a channel that gained no
+    followers. `metric` is "followers" or "likes".
+
+    Sparse on purpose, like compare_slots(): a weekday nobody streamed on has no
+    row at all. The renderer builds the Mon..Sun axis and fills it from this.
+
+    An unmatched location arrives as "" and is left that way -- the renderer
+    owns the word shown for it, so there is one place that decides.
+    """
+    if count <= 0:
+        return []
+    rows = db.execute(STREAM_GROUPS_SQL,
+                      (config.channel_slug(channel), platform, metric, grouping,
+                       day, max(1, int(count)), max(1, int(lookback)),
+                       timezone_name or config.resolve_db_timezone()), fetch=True)
+    # float, not Decimal: nice_axis() divides by 4.0 and the renderers divide by
+    # the top value, and Decimal / float raises rather than coercing.
+    return [{"key": row[0], "streams": int(row[1]), "total": int(row[2]),
+             "average": float(row[3]), "best": row[4], "best_stream_id": row[5]}
+            for row in rows]
+
+
 COVERAGE_SQL = """
 SELECT c.channel_id,
        (SELECT count(DISTINCT p.local_date)

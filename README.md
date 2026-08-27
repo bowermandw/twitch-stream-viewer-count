@@ -137,6 +137,7 @@ echo 'TWITCH_DATABASE_URL=postgresql://twitch:PASSWORD@127.0.0.1:5432/twitchmetr
 twitch-metrics db --init       # create the tables; safe to run again
 twitch-metrics db --import     # load the CSVs already in data/
 twitch-metrics db --verify     # prove the database agrees with them
+twitch-metrics db --locations  # the location rules, and what each one claims
 ```
 
 `db --status` is the one to reach for when something is wrong. It never raises,
@@ -655,6 +656,10 @@ youtube/2026-08-24.svg
 twitch/2026-08-23.svg        …
 trends/peaks-twitch.svg      no date: replaced every run
 trends/typical-youtube.svg
+trends/followers-twitch.svg  per broadcast, not per day
+trends/likes-youtube.svg
+trends/weekday-twitch.svg
+trends/location-twitch.svg
 ```
 
 ### Day pages
@@ -726,6 +731,66 @@ appears once there is something to link to.
 
 Ten and five are `--peak-days` and `--compare-days`, counted in days that
 streamed; the half-hour width is the same `--bucket` the per-day charts use.
+
+### Per broadcast: followers, likes, and where you were
+
+The charts above compare **dates**. The four below them compare **broadcasts**,
+which is a different axis and not just a finer one: a Saturday spent at two
+parks is one bar up there and two bars down here, and only the second can
+answer *which park*.
+
+- **Followers gained per stream**, Twitch, the last ten broadcasts.
+- **Peak likes per stream**, YouTube, the same ten.
+- **Followers by day of week**, and **by location** — the same broadcasts
+  averaged, which is the pair that answers "when is it worth going out".
+
+**"Gained" means across the broadcast**, first sample to last, and not across
+the day. The two are genuinely different numbers and both are kept: the day
+page's figure counts the whole local day including the hours you were offline,
+because a day's total must not lose the followers who arrived while you slept.
+This one deliberately does lose them, because a number attributed to Animal
+Kingdom has to have been earned there.
+
+A broadcast whose follower count was never sampled draws a **dash**; one that
+genuinely gained nobody draws a **labelled zero**; one that *lost* followers
+draws **below the line**, which is why these axes have a floor the others don't
+need. Three different facts, three different marks — the same rule the peaks
+chart follows for a day off.
+
+The bars are coloured by **metric** rather than by platform. Four Twitch panels
+in the same purple would be distinguishable only by their headings, and
+followers and likes already carry a colour each on every per-day panel.
+
+`--stream-count` sets how many broadcasts, ten by default. `--lookback` bounds
+how far back they may be found, exactly as it does for the charts above.
+
+#### Locations
+
+Neither platform reports where you are, so the only place a park name exists is
+the title you wrote. A small table of rules reads it:
+
+```
+twitch-metrics db yourchannel --location-rule 'Magic Kingdom'
+twitch-metrics db yourchannel --location-rule 'Hollywood Studios=DHS'
+twitch-metrics db yourchannel --locations
+twitch-metrics db yourchannel --drop-location-rule 20
+```
+
+A rule is a **case-insensitive substring** of the title, and deliberately not a
+regular expression: a regex living in a data row is a footgun with a long fuse,
+because one malformed rule makes every later refresh raise inside a function
+nobody is watching. A substring cannot fail.
+
+The **lowest `seq` that matches wins**, and new rules are numbered in tens so a
+more specific one can be slotted between two others without renumbering. A
+title that matches nothing is charted as **Unknown** rather than dropped — the
+bar is the symptom that a title has drifted out of its rule, and a missing bar
+would be no symptom at all.
+
+`--locations` prints how many broadcasts each rule currently claims, which is
+the only way to notice that a reworded title has quietly stopped matching.
+Changing a rule rewrites history, so both commands re-file every broadcast
+before they return.
 
 ### Both platforms on one chart
 

@@ -26,6 +26,9 @@ from .. import config, db, store
 
 
 def add_arguments(parser):
+    parser.add_argument("channel", nargs="?", default=None,
+                        help="channel the location rules belong to "
+                             "(default: the configured channel)")
     parser.add_argument("--status", action="store_true",
                         help="what is configured, what answers, and which "
                              "schema files have been applied")
@@ -43,6 +46,16 @@ def add_arguments(parser):
                         help="differences to print per file in --verify (default 10)")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="read and count, but write nothing")
+    parser.add_argument("--locations", action="store_true",
+                        help="list this channel's location rules, with how many "
+                             "of its broadcasts each one currently claims")
+    parser.add_argument("--location-rule", dest="location_rule", action="append",
+                        metavar="PATTERN[=NAME]",
+                        help="add a rule matching PATTERN in a stream's title; "
+                             "repeatable, and NAME defaults to PATTERN")
+    parser.add_argument("--drop-location-rule", dest="drop_location_rule",
+                        type=int, action="append", metavar="SEQ",
+                        help="remove the rule with this seq, as --locations prints it")
 
 
 # --------------------------------------------------------------------------
@@ -287,6 +300,129 @@ def verify_archives(paths, limit=10):
 
 
 # --------------------------------------------------------------------------
+# --locations
+# --------------------------------------------------------------------------
+#
+# The only configuration in the whole database. Everything else here is derived
+# from a sample and can be rebuilt by deleting it; a location rule is a fact
+# about the world that nothing in the API reports, so it is typed in once and
+# then kept.
+
+
+SEQ_STEP = 10       # room to slot a more specific rule between two others
+
+
+def _channel_id(channel):
+    """The channel's row id, or None when the database has never seen it."""
+    rows = db.execute("SELECT channel_id FROM tm.channel WHERE slug = %s",
+                      (config.channel_slug(channel),), fetch=True)
+    return rows[0][0] if rows else None
+
+
+def _refresh_locations(channel_id):
+    """Re-file every broadcast, because a rule change rewrites history.
+
+    Only the stream trends: a rule touches no sample and no per-day aggregate,
+    so refreshing the range would redo a great deal of arithmetic to arrive at
+    the same numbers.
+    """
+    span = db.execute("""
+        SELECT min(s.sampled_at AT TIME ZONE c.report_timezone)::date,
+               max(s.sampled_at AT TIME ZONE c.report_timezone)::date
+          FROM tm.sample_all s JOIN tm.channel c ON c.channel_id = s.channel_id
+         WHERE s.channel_id = %s""", (channel_id,), fetch=True)
+    if not span or span[0][0] is None:
+        return 0
+    return db.execute("SELECT tm.refresh_stream_trends(%s, %s, %s, NULL)",
+                      (channel_id, span[0][0], span[0][1]), fetch=True)[0][0]
+
+
+def add_location_rules(channel, rules, dry_run=False):
+    """Append rules, in the order given. Returns an exit code."""
+    channel_id = _channel_id(channel)
+    if channel_id is None:
+        print("No channel {!r} in the database yet — poll it, or run "
+              "`{} db --import`, first.".format(channel, config.invocation()))
+        return 1
+
+    highest = db.execute("SELECT coalesce(max(seq), 0) FROM tm.stream_location_rule "
+                         "WHERE channel_id = %s", (channel_id,), fetch=True)[0][0]
+    for offset, raw in enumerate(rules, start=1):
+        pattern, _, name = str(raw).partition("=")
+        pattern, name = pattern.strip(), name.strip()
+        if not pattern:
+            print("skipped an empty rule")
+            continue
+        seq = highest + offset * SEQ_STEP
+        if dry_run:
+            print("would add  {:>4}  {!r} -> {}".format(seq, pattern, name or pattern))
+            continue
+        db.execute("INSERT INTO tm.stream_location_rule "
+                   "(channel_id, seq, pattern, location) VALUES (%s, %s, %s, %s)",
+                   (channel_id, seq, pattern, name or pattern))
+        print("added      {:>4}  {!r} -> {}".format(seq, pattern, name or pattern))
+    if not dry_run:
+        print("re-filed {} broadcast(s)".format(_refresh_locations(channel_id)))
+    return 0
+
+
+def drop_location_rules(channel, seqs, dry_run=False):
+    """Remove rules by seq. Returns an exit code."""
+    channel_id = _channel_id(channel)
+    if channel_id is None:
+        print("No channel {!r} in the database.".format(channel))
+        return 1
+    for seq in seqs:
+        if dry_run:
+            print("would drop {:>4}".format(seq))
+            continue
+        gone = db.execute("DELETE FROM tm.stream_location_rule "
+                          "WHERE channel_id = %s AND seq = %s RETURNING pattern",
+                          (channel_id, seq), fetch=True)
+        print("dropped    {:>4}  {!r}".format(seq, gone[0][0]) if gone
+              else "no rule with seq {}".format(seq))
+    if not dry_run:
+        print("re-filed {} broadcast(s)".format(_refresh_locations(channel_id)))
+    return 0
+
+
+def list_locations(channel):
+    """The rules, and what each one currently claims. Returns an exit code.
+
+    The counts are the point rather than a flourish. A rule that claims nothing
+    is a title that has been reworded, and the only symptom otherwise is a bar
+    quietly moving to "Unknown" on a chart nobody is reading that closely.
+    """
+    channel_id = _channel_id(channel)
+    if channel_id is None:
+        print("No channel {!r} in the database.".format(channel))
+        return 1
+
+    rules = db.execute("SELECT seq, pattern, location FROM tm.stream_location_rule "
+                       "WHERE channel_id = %s ORDER BY seq", (channel_id,), fetch=True)
+    if not rules:
+        print("No location rules for {}. Add one with:\n"
+              "    {} db {} --location-rule 'Magic Kingdom'".format(
+                  channel, config.invocation(), channel))
+        return 0
+
+    # Counted from the report table rather than by re-running the matcher, so
+    # this reports what the CHARTS say and not what they ought to say.
+    claimed = dict(db.execute(
+        "SELECT coalesce(location, ''), count(*) FROM tm.report_stream_trend "
+        "WHERE channel_id = %s GROUP BY 1", (channel_id,), fetch=True))
+    print("   seq  pattern                          location              streams")
+    for seq, pattern, location in rules:
+        print("  {:>4}  {:<32} {:<21} {:>7}".format(
+            seq, pattern[:32], location[:21], claimed.get(location, 0)))
+    unknown = claimed.get("", 0)
+    total = sum(claimed.values())
+    print("  {} of {} broadcast(s) matched; {} unknown".format(
+        total - unknown, total, unknown))
+    return 0
+
+
+# --------------------------------------------------------------------------
 # entry point
 # --------------------------------------------------------------------------
 
@@ -294,7 +430,23 @@ def verify_archives(paths, limit=10):
 def run(args):
     if args.status:
         return status()
+    channel = config.resolve_channel(args.channel)
     try:
+        # Before --init, deliberately: a rule change is cheap and the schema is
+        # almost certainly already applied, so making the reader type both
+        # would be ceremony. They compose in the order they are written.
+        if args.location_rule:
+            code = add_location_rules(channel, args.location_rule,
+                                      dry_run=args.dry_run)
+            if code or not (args.drop_location_rule or args.locations):
+                return code
+        if args.drop_location_rule:
+            code = drop_location_rules(channel, args.drop_location_rule,
+                                       dry_run=args.dry_run)
+            if code or not args.locations:
+                return code
+        if args.locations:
+            return list_locations(channel)
         if args.init:
             code = init(dry_run=args.dry_run)
             if code or not (args.do_import or args.verify):

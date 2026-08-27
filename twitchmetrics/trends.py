@@ -14,14 +14,31 @@ these read as the same family as the per-day graphs rather than as a second
 charting library that happens to live in the same package.
 """
 
+import math
 from datetime import time, timedelta
 
-from .chart import (BG, DIM, FG, GRID, MUTED, PAD_L, PAD_R, PLATFORMS,
-                    esc, fmt_count, nice_axis, text)
+from .chart import (BG, DIM, FG, GRID, METRIC_BY_KEY, MUTED, PAD_L, PAD_R,
+                    PLATFORMS, esc, fmt_count, nice_axis, text)
 
 PEAK_DAYS = 10          # days on the peaks chart
 COMPARE_DAYS = 5        # days shown *behind* today on the comparison chart
 BUCKET_MINUTES = 30
+
+# Broadcasts on the per-stream charts. Ten BROADCASTS, not ten days that
+# streamed: those charts collapse a day spent at two places into one bar, which
+# is exactly the reading the location chart exists to avoid.
+STREAM_COUNT = 10
+
+# What a broadcast whose title matched no location rule is called. Named rather
+# than dropped -- an unlabelled bar says "a title has drifted out of its rule",
+# which is something to go and fix, where a missing bar says nothing at all.
+UNKNOWN_LOCATION = "Unknown"
+
+# Monday first, matching both date.weekday() and the weekday column the report
+# table stores. The axis is filled from this rather than from the rows, for the
+# reason compare_slots()' per_day axis is: a renderer taking its axis from the
+# data relabels itself when a day is missing.
+WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # How far back to hunt for a day that streamed. The charts compare streams, not
 # dates, so the axis has to be allowed to reach past a quiet fortnight -- but
@@ -43,13 +60,19 @@ PLATFORM_BY_KEY = {spec["key"]: spec for spec in PLATFORMS}
 
 DASH = "—"         # what a day with no stream gets instead of a bar
 
+# The zero line, when zero is not the floor. A chart with bars hanging below the
+# baseline has to say which line the baseline is, and position no longer does.
+DIVIDER_ZERO = "#5a5a5a"
+
 # Where a bar sends the reader. Relative, and one level up, because the browser
 # resolves it against the SVG's own URL -- these charts live under trends/.
 DAY_PREFIX = "day/"
 
 # The size each chart renders at, in one place because the page needs it too:
 # an <object> has to be told its aspect ratio, where an <img> works it out.
-SIZES = {"peaks": (1300, 380), "typical": (1300, 430)}
+SIZES = {"peaks": (1300, 380), "typical": (1300, 430),
+         "followers": (1300, 400), "likes": (1300, 400),
+         "weekday": (1300, 360), "location": (1300, 360)}
 
 # --- layout ---------------------------------------------------------------
 HEAD_H = 118            # shorter than chart.HEADER_H: no in-stream tiles to fit
@@ -538,6 +561,340 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
 
 
 # --------------------------------------------------------------------------
+# per-broadcast bars
+# --------------------------------------------------------------------------
+
+
+# What each metric is called on its own chart. The set is data so that a third
+# metric is an entry here rather than a third renderer -- which is the same
+# reason tm.report_stream_metric is stored long.
+STREAM_METRICS = {
+    "followers": {"title": "Followers gained per stream",
+                  "best": "Best stream", "average": "Average gain",
+                  "noun": "gained", "signed": True},
+    "likes": {"title": "Peak likes per stream",
+              "best": "Best stream", "average": "Average peak",
+              "noun": "likes", "signed": False},
+}
+
+GROUPINGS = {
+    "weekday":  {"title": "{} by day of week", "best": "Best day"},
+    "location": {"title": "{} by location",    "best": "Best location"},
+}
+
+
+def _fmt_avg(value):
+    """'18' when a mean lands whole, '10.7' when it does not."""
+    if abs(value - round(value)) < 0.05:
+        return fmt_count(value)
+    return "{:.1f}".format(value)
+
+
+def _fmt_signed(value, signed=True):
+    """'+18' / '-5' for a delta, plain for a count that cannot go backwards."""
+    if not signed:
+        return fmt_count(value)
+    return "{}{}".format("+" if value > 0 else "", fmt_count(value))
+
+
+def _whole_step(step):
+    """The next 1/2/5-times-a-power-of-ten step at or above `step`, as an int.
+
+    nice_axis() will hand back 2.5, which is a fine step for a viewer count in
+    the hundreds and a wrong one here. These axes are small -- a follower gain
+    is single or double figures -- and _signed_grid() labels its lines with
+    fmt_count(), which rounds to whole numbers. A 2.5 step therefore prints
+    0, 2, 5, 8, 10: gridlines evenly spaced on the page, unevenly spaced in
+    their labels, and two of the labels simply untrue.
+
+    These axes count people, so the step counts people too.
+    """
+    step = max(1.0, float(step))
+    magnitude = 10 ** math.floor(math.log10(step))
+    for mult in (1, 2, 5):
+        if step <= mult * magnitude + 1e-9:
+            return int(mult * magnitude)
+    return int(10 * magnitude)
+
+
+def _signed_axis(values):
+    """(low, top, step) for an axis that may need room BELOW zero.
+
+    Followers go down as well as up. Drawing a week that lost five as a
+    zero-height bar would say "gained nothing", which is a different and
+    happier fact -- the same objection the peaks chart raises against drawing a
+    day off as a zero. So the baseline leaves the floor when it has to.
+
+    Both ends are rounded onto one shared whole step, which is what puts a
+    gridline exactly on zero rather than near it.
+    """
+    high = max(list(values) + [0])
+    low = min(list(values) + [0])
+    _, step = nice_axis(high)
+    if low < 0:
+        _, down_step = nice_axis(-low)
+        step = max(step, down_step)
+    step = _whole_step(step)
+
+    top = int(math.ceil(high / step) * step) if high > 0 else 0
+    floor = -int(math.ceil(-low / step) * step) if low < 0 else 0
+    # nice_axis()' courtesy, kept: never let a bar graze the ceiling or the
+    # floor, where it reads as clipped rather than as measured.
+    if high > 0 and top - high < step * 0.12:
+        top += step
+    if low < 0 and low - floor < step * 0.12:
+        floor -= step
+    if top == floor:            # every value was exactly zero
+        top = step
+    return floor, top, step
+
+
+def _signed_grid(out, low, top, step, left, right, y_of):
+    """_grid_lines(), but starting from a floor that may be below zero.
+
+    Zero is drawn brighter when it is not the floor: with bars on both sides of
+    it, which line is the baseline stops being obvious from position alone.
+    """
+    line = low
+    while line <= top + step * 0.001:
+        y = y_of(line)
+        zero = abs(line) < step * 0.001
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" '
+                   'stroke="{}" stroke-width="1"/>'.format(
+                       left, y, right, y, DIVIDER_ZERO if (zero and low < 0) else GRID))
+        out.append(text(right + 12, y + 4, fmt_count(line), size=12, fill=MUTED))
+        line += step
+
+
+def _tip(inner, tip):
+    """A hover title on something that is not a link.
+
+    The group charts have no day page to send anyone to -- a weekday is not a
+    date -- but the count behind an average still has to be reachable, and a
+    <title> needs an element to be a child of.
+    """
+    return '<g><title>{}</title>{}</g>'.format(esc(tip), inner)
+
+
+def render_stream_bars(entries, channel, platform, day, metric,
+                       width=SIZES["followers"][0], height=SIZES["followers"][1],
+                       known=None):
+    """One bar per broadcast: followers gained, or likes peaked.
+
+    `entries` is store.stream_trends()' list, oldest first. `metric` picks both
+    the field and the palette -- "followers" and "likes" already carry a colour
+    each on every per-day panel (chart.METRICS), and reusing them is what keeps
+    four Twitch panels on one page from being four identical purple charts
+    distinguishable only by their headings.
+
+    Returns None when no broadcast carries the metric, which is what makes
+    these charts select their own platform: a YouTube row has no follower delta
+    and a Twitch row no likes, so the wrong pairing simply never renders and no
+    caller has to test a platform's name.
+
+    The axis counts BROADCASTS. Two on one day are two bars, which is the whole
+    reason this exists next to the peaks chart rather than instead of it.
+    """
+    present = [e for e in entries if e.get(metric) is not None]
+    if not present:
+        return None
+
+    spec = _spec(platform)
+    words = STREAM_METRICS[metric]
+    colour = METRIC_BY_KEY.get(metric, {}).get("color", spec["color"])
+    signed = words["signed"]
+
+    low_value, top_value, step = _signed_axis([e[metric] for e in present])
+    left, right = PAD_L, width - PAD_R
+    top, bottom = HEAD_H, height - FOOT_H - 16
+
+    def y_of(value):
+        span = top_value - low_value
+        return bottom - ((value - low_value) / span) * (bottom - top)
+
+    dated = [e["day"] for e in entries]
+    with_month = spans_months(dated)
+    out = _open_svg(width, height,
+                    "{}, last {} broadcast(s)".format(words["title"], len(present)),
+                    "{} · {} · to {}".format(channel, spec["label"],
+                                             day.strftime("%a %-d %b %Y")))
+
+    best = max(present, key=lambda e: e[metric])
+    average = sum(e[metric] for e in present) / len(present)
+    tile_x = width - PAD_R + 84
+    _tile(out, tile_x, _fmt_signed(best[metric], signed), words["best"],
+          best.get("location") or fmt_day(best["day"], True), colour=colour)
+    # The span, because a broadcast axis is not contiguous and the reader
+    # cannot infer how long ten of them took from the labels.
+    _tile(out, tile_x - 175, _fmt_avg(average), words["average"],
+          "over {} broadcast(s)".format(len(present)))
+
+    _signed_grid(out, low_value, top_value, step, left, right, y_of)
+    base = y_of(0)
+
+    slot_width = (right - left) / len(entries)
+    bar_width = slot_width * (1 - GROUP_GAP)
+    newest = entries[-1] if entries else None
+    for index, entry in enumerate(entries):
+        centre = left + slot_width * (index + 0.5)
+        x = centre - bar_width / 2
+        latest = entry is newest
+        when = entry.get("started")
+        clock = (when.astimezone().strftime("%-I:%M %p").lower() if when else "")
+        # Two bars can share a date, so the date alone is not a label. The
+        # location says which of the two this was; the clock does when there is
+        # no location to say it with.
+        second = entry.get("location") or clock
+        out.append(text(centre, bottom + 22, fmt_day(entry["day"], with_month),
+                        size=12, fill=FG if latest else MUTED, anchor="middle"))
+        if second:
+            out.append(text(centre, bottom + 38, second[:18], size=10,
+                            fill=MUTED if latest else DIM, anchor="middle"))
+
+        value = entry.get(metric)
+        if value is None:
+            # A dash on the baseline, not a zero-height bar. The broadcast
+            # happened; the number was never sampled, and 0 is a real reading.
+            out.append(text(centre, base - 10, DASH, size=13, fill=DIM,
+                            anchor="middle"))
+            continue
+
+        y = y_of(max(value, 0))
+        depth = abs(base - y_of(value))
+        href = day_link(entry["day"], known)
+        if href:
+            out.append(_open_link(href, "{}{} · {} {}".format(
+                fmt_day(entry["day"], True),
+                " · " + entry["location"] if entry.get("location") else
+                (" · " + clock if clock else ""),
+                _fmt_signed(value, signed), words["noun"])))
+            out.append(_hit(x, top, bar_width, bottom - top + 44))
+        out.append(_bar(x, y, bar_width, depth, colour,
+                        1.0 if latest else 0.72, outline=FG if latest else None))
+        # Above the bar when it grows, below when it shrinks -- a label inside
+        # the axis either way.
+        label_y = y - 9 if value >= 0 else y_of(value) + 18
+        out.append(text(centre, label_y, _fmt_signed(value, signed), size=12,
+                        fill=FG if latest else MUTED,
+                        weight="600" if latest else "normal", anchor="middle"))
+        if href:
+            out.append("</a>")
+
+    out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+               'stroke-width="1"/>'.format(left, base, right, base, GRID))
+    out.append(text(right, height - 16, fmt_span(dated), size=12, fill=DIM,
+                    anchor="end"))
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# which day, and which place
+# --------------------------------------------------------------------------
+
+
+def render_stream_groups(groups, channel, platform, day, metric, grouping,
+                         width=SIZES["weekday"][0], height=SIZES["weekday"][1],
+                         count=STREAM_COUNT):
+    """Average per broadcast, grouped by weekday or by location.
+
+    `groups` is store.stream_groups()' list and is SPARSE -- a weekday nobody
+    streamed on is simply absent. The axis is built here: Mon..Sun in order for
+    a weekday, and busiest-first for a location, so the answer to "where is
+    worth it" is the leftmost bar.
+
+    A group with no broadcasts is drawn as a dash rather than a zero bar, for
+    the reason a day off is on the peaks chart: nothing happened is not the
+    same reading as nothing was gained.
+    """
+    if not groups:
+        return None
+
+    spec = _spec(platform)
+    words = STREAM_METRICS[metric]
+    shape = GROUPINGS[grouping]
+    colour = METRIC_BY_KEY.get(metric, {}).get("color", spec["color"])
+    signed = words["signed"]
+    found = {row["key"]: row for row in groups}
+
+    if grouping == "weekday":
+        # Every weekday, in order, whether or not it was streamed -- the point
+        # of the chart is partly which days are missing.
+        axis = [(str(n), name) for n, name in enumerate(WEEKDAYS)]
+    else:
+        axis = [(row["key"], row["key"] or UNKNOWN_LOCATION)
+                for row in sorted(groups, key=lambda r: r["average"], reverse=True)]
+
+    drawn = [found[key] for key, _ in axis if key in found]
+    if not drawn:
+        return None
+
+    low_value, top_value, step = _signed_axis([row["average"] for row in drawn])
+    left, right = PAD_L, width - PAD_R
+    top, bottom = HEAD_H, height - FOOT_H - 16
+
+    def y_of(value):
+        span = top_value - low_value
+        return bottom - ((value - low_value) / span) * (bottom - top)
+
+    streams = sum(row["streams"] for row in drawn)
+    out = _open_svg(width, height,
+                    shape["title"].format(words["title"].replace(" per stream", "")),
+                    "{} · {} · average per broadcast, last {} of them".format(
+                        channel, spec["label"], streams))
+
+    best = max(drawn, key=lambda row: row["average"])
+    best_label = dict(axis).get(best["key"], best["key"] or UNKNOWN_LOCATION)
+    tile_x = width - PAD_R + 84
+    _tile(out, tile_x, _fmt_avg(best["average"]), shape["best"],
+          "{} · {} broadcast(s)".format(best_label, best["streams"]), colour=colour)
+    _tile(out, tile_x - 175, str(len(drawn)),
+          "Groups" if grouping == "location" else "Days streamed",
+          "of {} broadcast(s)".format(streams))
+
+    _signed_grid(out, low_value, top_value, step, left, right, y_of)
+    base = y_of(0)
+
+    slot_width = (right - left) / len(axis)
+    bar_width = slot_width * (1 - GROUP_GAP)
+    for index, (key, label) in enumerate(axis):
+        centre = left + slot_width * (index + 0.5)
+        x = centre - bar_width / 2
+        row = found.get(key)
+        out.append(text(centre, bottom + 22, label[:18], size=12,
+                        fill=MUTED if row else DIM, anchor="middle"))
+        if row is None:
+            out.append(text(centre, base - 10, DASH, size=13, fill=DIM,
+                            anchor="middle"))
+            continue
+        out.append(text(centre, bottom + 38,
+                        "{} stream(s)".format(row["streams"]), size=10,
+                        fill=DIM, anchor="middle"))
+        value = row["average"]
+        y = y_of(max(value, 0))
+        depth = abs(base - y_of(value))
+        top_bar = row is best
+        # No link: a weekday is not a date and a location is not a page. The
+        # count and the best single broadcast go in the tooltip instead, which
+        # is what stops an average being read as a certainty.
+        out.append(_tip(
+            _bar(x, y, bar_width, depth, colour, 1.0 if top_bar else 0.72,
+                 outline=FG if top_bar else None),
+            "{} · {} broadcast(s) · {} avg · best {}".format(
+                label, row["streams"], _fmt_avg(value),
+                _fmt_signed(row["best"], signed))))
+        label_y = y - 9 if value >= 0 else y_of(value) + 18
+        out.append(text(centre, label_y, _fmt_avg(value), size=12,
+                        fill=FG if top_bar else MUTED,
+                        weight="600" if top_bar else "normal", anchor="middle"))
+
+    out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+               'stroke-width="1"/>'.format(left, base, right, base, GRID))
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
 # both, for one platform
 # --------------------------------------------------------------------------
 
@@ -581,4 +938,38 @@ def render_from(peaks, slots, per_day, channel, platform, day,
                            minutes=minutes, dropped=dropped, known=known)
     if drawn:
         charts["typical"] = drawn
+    return charts
+
+
+def render_streams(rows, groups, channel, platform, day, known=None):
+    """The per-broadcast charts: {"followers", "likes", "weekday", "location"}.
+
+    Any key may be absent, and on a normal channel most of them are: `rows` is
+    one platform's broadcasts, so the followers chart draws for Twitch and the
+    likes chart for YouTube and each returns None for the other. Nothing here
+    tests a platform's name -- the absent metric is absent from the data.
+
+    `groups` is {"weekday": [...], "location": [...]} as store.stream_groups()
+    returns them, and both roll up FOLLOWERS: "which day was worth it" is a
+    question about the audience you keep, and likes are a YouTube-only measure
+    of the one you had. Passing a different metric is a one-line change here
+    rather than a new renderer.
+
+    Deliberately not folded into render_from(). That function's signature is
+    load-bearing -- the parity harness drives the Python and SQL aggregate
+    paths through it and compares the SVG byte for byte -- and these aggregates
+    have no Python twin to be compared against, because there is no CSV path
+    that could produce them.
+    """
+    charts = {}
+    for metric in STREAM_METRICS:
+        drawn = render_stream_bars(rows, channel, platform, day, metric,
+                                   known=known)
+        if drawn:
+            charts[metric] = drawn
+    for grouping in GROUPINGS:
+        drawn = render_stream_groups(groups.get(grouping) or [], channel,
+                                     platform, day, "followers", grouping)
+        if drawn:
+            charts[grouping] = drawn
     return charts

@@ -68,12 +68,24 @@ TITLE_PREFERENCE = ("twitch", "youtube")
 # The multi-day charts, in the order the Trends page shows them. They are one
 # per platform and not per day — each run overwrites them, because they describe
 # where the channel is now rather than what happened on a particular date.
-TREND_KINDS = ("peaks", "typical")
+# The last four count BROADCASTS rather than dates, and sit below the two that
+# count dates -- the page reads from "how many watched" down to "how many
+# stayed, and where". A kind is one lowercase word because trend_key() puts it
+# in front of a hyphen and TREND_KEY_RE will not take a second one.
+TREND_KINDS = ("peaks", "typical", "followers", "likes", "weekday", "location")
 TREND_LABELS = {
     ("peaks", "twitch"): "Peak viewers by day · Twitch",
     ("peaks", "youtube"): "Peak viewers by day · YouTube",
     ("typical", "twitch"): "Half-hour averages, today vs before · Twitch",
     ("typical", "youtube"): "Half-hour averages, today vs before · YouTube",
+    ("followers", "twitch"): "Followers gained per stream · Twitch",
+    ("followers", "youtube"): "Followers gained per stream · YouTube",
+    ("likes", "youtube"): "Peak likes per stream · YouTube",
+    ("likes", "twitch"): "Peak likes per stream · Twitch",
+    ("weekday", "twitch"): "Followers by day of week · Twitch",
+    ("weekday", "youtube"): "Followers by day of week · YouTube",
+    ("location", "twitch"): "Followers by location · Twitch",
+    ("location", "youtube"): "Followers by location · YouTube",
 }
 
 # These nine regions predate the dotted website endpoint and still answer on

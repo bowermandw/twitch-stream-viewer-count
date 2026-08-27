@@ -90,6 +90,11 @@ def add_arguments(parser):
                         metavar="N",
                         help="days with a stream shown behind today on the "
                              "half-hour chart (default {})".format(trends.COMPARE_DAYS))
+    parser.add_argument("--stream-count", type=int, default=trends.STREAM_COUNT,
+                        metavar="N",
+                        help="broadcasts on the per-stream charts (default {}); "
+                             "these count broadcasts, not days".format(
+                                 trends.STREAM_COUNT))
     parser.add_argument("--calendar-days", action="store_true",
                         help="count calendar days rather than days with a stream, "
                              "so a day off takes a slot and draws a dash")
@@ -389,6 +394,23 @@ def render_trend_charts(channel, day, args, known=None):
         charts = trends.render_from(peaks, slots, per_day, channel, platform, day,
                                     minutes=args.bucket, dropped=dropped,
                                     known=known)
+        # The per-broadcast charts, from the same run's tables. Their own try:
+        # a channel whose stream trends are missing should still get the two
+        # charts above, which is the same courtesy _publish_trends() extends to
+        # a platform that failed while its sibling published.
+        try:
+            rows = store.stream_trends(channel, platform, day, args.stream_count,
+                                       lookback=args.lookback)
+            groups = {grouping: store.stream_groups(
+                          channel, platform, "followers", grouping, day,
+                          args.stream_count, lookback=args.lookback)
+                      for grouping in trends.GROUPINGS}
+        except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+            log("WARN     {} {} — no per-stream charts: {}".format(
+                channel, platform, str(exc).splitlines()[0]))
+        else:
+            charts.update(trends.render_streams(rows, groups, channel, platform,
+                                                day, known=known))
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
