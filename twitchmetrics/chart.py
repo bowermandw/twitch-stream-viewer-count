@@ -36,6 +36,12 @@ METRICS = [
 ]
 METRIC_BY_KEY = {m["key"]: m for m in METRICS}
 
+# Watch time is nobody's sampled series, so it takes no colour from METRICS.
+# Teal keeps it distinct from all five of them at a glance, which is the point:
+# every other figure on these charts was read off an API, and this one was
+# worked out.
+WATCH_COLOR = "#2dd4bf"
+
 PANEL_LINE = "#ffffff"  # bucket averages inside a panel, over any series colour
 
 # The cross-platform chart. Each platform keeps its own brand colour, softened
@@ -124,6 +130,96 @@ def bucket_averages(session, bucket_minutes, key="viewers"):
             "n": len(values),
         })
     return out
+
+
+# --------------------------------------------------------------------------
+# watch time
+# --------------------------------------------------------------------------
+
+
+def watch_time(points):
+    """(estimated_viewer_minutes, covered_seconds) under a viewer curve.
+
+    `points` is [(when, viewers)] in any order; anything with no number is
+    dropped. The area under the curve IS watch time, and a trapezoid between
+    each consecutive pair is the whole of the arithmetic:
+
+        (viewers_before + viewers_after) / 2 * gap_seconds / 60
+
+    A trapezoid rather than "viewers x the poll interval", because the interval
+    is not a guarantee -- a restart, a slow API call and a spooled backfill all
+    make gaps of their own, and the trapezoid is right for any of them.
+
+    A gap wider than GAP_TOLERANCE times the median one is NOT integrated.
+    Crediting three hours of viewers to a poller that was down for three hours
+    would be inventing an audience, and this number is quoted. That is what the
+    second return value is for: covered_seconds says how much of the stream the
+    estimate actually rests on, so a small total from an outage stays
+    distinguishable from a small total from a quiet night.
+
+    Returns (None, 0) when nothing could be integrated -- a single sample, or a
+    session whose every gap was too wide. None and never 0, for the reason a day
+    off charts as a dash: "we do not know" is not "nobody watched".
+
+    tm.stream_watch_slices() implements the identical rule in SQL, down to the
+    upper-median tie-break, and tests/smoke.py holds the two together.
+    """
+    ordered = sorted((when, value) for when, value in points if value is not None)
+    gaps = []
+    for (before, first), (after, second) in zip(ordered, ordered[1:]):
+        seconds = (after - before).total_seconds()
+        if seconds > 0:
+            gaps.append((seconds, first, second))
+    if not gaps:
+        return None, 0
+
+    # median_step()'s rule: sorted, then indexed at len // 2, which is the UPPER
+    # median on an even count. Not a mean, so one three-hour outage cannot widen
+    # the cap enough to admit itself.
+    widths = sorted(gap for gap, _, _ in gaps)
+    cap = widths[len(widths) // 2] * GAP_TOLERANCE
+
+    minutes, covered = 0.0, 0.0
+    for seconds, first, second in gaps:
+        if seconds <= cap:
+            minutes += (first + second) / 2.0 * seconds / 60.0
+            covered += seconds
+    if not covered:
+        return None, 0
+    return minutes, covered
+
+
+def session_watch_time(session, key="viewers"):
+    """watch_time() over a session of sample dicts, which is what chart.py holds."""
+    return watch_time([(s["when"], s.get(key)) for s in session])
+
+
+DASH_HOURS = "\u2014"   # what fmt_hours() prints when nothing could be integrated
+
+
+def fmt_hours(minutes):
+    """Watch minutes as hours: '4.2 h' while it is small, '1,204 h' once it is not.
+
+    One decimal below a hundred because a broadcast is single or double figures
+    of watch hours and the decimal is most of the signal; none above it, because
+    at four figures the tenth is noise and the comma is what a reader needs.
+    """
+    if minutes is None:
+        return DASH_HOURS
+    hours = minutes / 60.0
+    return "{:.1f} h".format(hours) if hours < 100 else "{:,.0f} h".format(hours)
+
+
+def fmt_coverage(covered, duration):
+    """'98% covered', or "" when the whole stream was.
+
+    Silent at 100%, which is the ordinary case: a caption that says nothing is
+    wrong on every chart trains the eye to skip the one where something is.
+    """
+    if not duration or covered is None:
+        return ""
+    share = covered / float(duration)
+    return "" if share >= 0.995 else "{:.0f}% covered".format(share * 100)
 
 
 # --------------------------------------------------------------------------
@@ -587,6 +683,17 @@ def render_stacked(session, channel, bucket_minutes, width, show_buckets=True,
                 size=11, fill=DIM, anchor="end"))
         tile_x -= 190
 
+    # Leftmost, after the metric tiles, because it is the only figure here that
+    # is DERIVED rather than sampled -- an integral under the viewer curve and
+    # not a reading off it. "Estimated" is in the label rather than in a footnote
+    # for the same reason: this number gets quoted.
+    watched, covered = session_watch_time(session)
+    out.append(text(tile_x, 52, fmt_hours(watched), size=27, fill=WATCH_COLOR,
+                    weight="700", anchor="end"))
+    out.append(text(tile_x, 74, "Est. watch time", size=12, fill=MUTED, anchor="end"))
+    out.append(text(tile_x, 91, fmt_coverage(covered, duration) or "live, this stream",
+                    size=11, fill=DIM, anchor="end"))
+
     for index, metric in enumerate(metrics):
         top = HEADER_H + index * (PANEL_H + PANEL_GAP)
         draw_panel(out, metric, session, (left, right, top, top + PANEL_H),
@@ -675,6 +782,13 @@ def render_composite(session, channel, width, height, metrics=None, day=None):
                 fmt_clock(start + timedelta(seconds=stats["peak_at"]))),
                 size=11, fill=DIM, anchor="end"))
         tile_x -= 190
+
+    watched, covered = session_watch_time(session)
+    out.append(text(tile_x, 52, fmt_hours(watched), size=27, fill=WATCH_COLOR,
+                    weight="700", anchor="end"))
+    out.append(text(tile_x, 74, "Est. watch time", size=12, fill=MUTED, anchor="end"))
+    out.append(text(tile_x, 91, fmt_coverage(covered, duration) or "live, this stream",
+                    size=11, fill=DIM, anchor="end"))
 
     legend_x = left
     for metric in metrics:
@@ -849,8 +963,22 @@ def render_platforms(series, channel, day, width=1300, height=430, show_combined
     out.append('<rect width="{}" height="{}" fill="{}"/>'.format(width, height, BG))
     out.append(text(PAD_L, 46, "Concurrent viewers, everywhere", size=21, fill=FG,
                     weight="700"))
-    out.append(text(PAD_L, 74, "{} · {}".format(channel, day.strftime("%a %-d %b %Y")),
-                    size=14, fill=MUTED))
+    # Watch time goes in the subtitle rather than into a tile of its own: the
+    # tiles here are already one per platform plus the combined peak, and a
+    # seventh at 175px apart would run off the left edge on a three-platform
+    # channel. Summed across platforms, since that is what this chart is for.
+    #
+    # Deliberately from `series` and not from the aligned grid. The grid carries
+    # a value forward to paint a continuous line, so summing it would count a
+    # carried minute as watched -- and `series` is what both callers pass
+    # identically, which is what keeps the two paths' SVG byte-for-byte equal.
+    watched = [watch_time(entry["points"])[0] for entry in series]
+    total = sum(v for v in watched if v is not None) if any(
+        v is not None for v in watched) else None
+    subtitle = "{} · {}".format(channel, day.strftime("%a %-d %b %Y"))
+    if total is not None:
+        subtitle += "  ·  {} estimated watch time, live".format(fmt_hours(total))
+    out.append(text(PAD_L, 74, subtitle, size=14, fill=MUTED))
 
     # Headline tiles, right to left: the combined peak first, because "how many
     # people were watching at once" is the number this chart exists to answer.
@@ -936,8 +1064,18 @@ def print_summary(session, bucket_minutes, metrics=None):
     duration = (session[-1]["when"] - start).total_seconds()
     metrics = metrics or available_metrics(session)
 
+    watched, covered = session_watch_time(session)
     print("  started   {}".format(start.astimezone().strftime("%a %-d %b %Y, %-I:%M %p")))
     print("  duration  {}   ({} samples)".format(fmt_elapsed(duration), len(session)))
+    print("  watched   {} estimated   ({})".format(
+        fmt_hours(watched),
+        fmt_coverage(covered, duration) or "whole stream integrated"))
+    if watched is not None:
+        # Spelled out once, in the one place a person reads numbers rather than
+        # looks at them. Neither platform reports watch time -- this is the area
+        # under the concurrent-viewer curve, so it counts the live audience and
+        # nothing that watched the replay afterwards.
+        print("            live only; excludes replay watch time")
 
     for metric in metrics:
         stats = summarise(session, metric["key"])

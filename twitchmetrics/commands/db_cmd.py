@@ -21,6 +21,7 @@ database that will not answer.
 import glob
 import os
 import sys
+import time
 
 from .. import config, db, store
 
@@ -46,6 +47,10 @@ def add_arguments(parser):
                         help="differences to print per file in --verify (default 10)")
     parser.add_argument("--dry-run", dest="dry_run", action="store_true",
                         help="read and count, but write nothing")
+    parser.add_argument("--rebuild", action="store_true",
+                        help="recompute every report table over the whole span "
+                             "of samples; needed after a schema change adds a "
+                             "column the nightly refresh would never backfill")
     parser.add_argument("--locations", action="store_true",
                         help="list this channel's location rules, with how many "
                              "of its broadcasts each one currently claims")
@@ -268,6 +273,37 @@ def _rebuild_reports():
     return len(spans)
 
 
+def rebuild(dry_run=False):
+    """`db --rebuild`: recompute every report table from the samples. 0 on success.
+
+    Exists because store.ensure_reports() cannot notice this class of staleness.
+    It judges a window by how many DATES tm.report_daily_peak holds, so a schema
+    change that adds a COLUMN leaves every one of those dates present and every
+    new column NULL -- and the nightly refresh would touch only the tail, for
+    ever. 007 and 008 both shipped a one-shot DO block for exactly that, and this
+    is the same pass made re-runnable and given a name.
+
+    Cheap enough to run by hand and idempotent, so the answer to "are the report
+    tables right?" is to run it rather than to reason about it.
+    """
+    if dry_run:
+        spans = db.execute("""
+            SELECT c.slug,
+                   min(s.sampled_at AT TIME ZONE c.report_timezone)::date,
+                   max(s.sampled_at AT TIME ZONE c.report_timezone)::date
+              FROM tm.sample_all s JOIN tm.channel c ON c.channel_id = s.channel_id
+             GROUP BY c.slug ORDER BY c.slug""", fetch=True)
+        for slug, first, last in spans:
+            print("would rebuild  {:<16} {} .. {}".format(slug, first, last))
+        print("{} channel(s); nothing written".format(len(spans)))
+        return 0
+    started = time.monotonic()
+    count = _rebuild_reports()
+    print("rebuilt report tables for {} channel(s) in {:.1f}s".format(
+        count, time.monotonic() - started))
+    return 0
+
+
 def verify_archives(paths, limit=10):
     """Compare every archive against the database. Non-zero if any disagrees."""
     if not paths:
@@ -457,7 +493,11 @@ def run(args):
             if code or not args.verify:
                 return code
         if args.verify:
-            return verify_archives(archives(args.all), limit=args.limit)
+            code = verify_archives(archives(args.all), limit=args.limit)
+            if code or not args.rebuild:
+                return code
+        if args.rebuild:
+            return rebuild(dry_run=args.dry_run)
     except db.NotConfigured as exc:
         sys.exit(str(exc))
     except db.Unreachable as exc:

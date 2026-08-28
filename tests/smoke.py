@@ -1283,6 +1283,164 @@ check("render_streams returns only what it could draw",
 check("and nothing at all for a platform with neither",
       trends.render_streams([], {}, "t", "youtube", date(2026, 8, 22)) == {})
 
+# --- watch time -----------------------------------------------------------
+section("watch time")
+
+# The arithmetic first, on curves whose area can be worked out by hand. Neither
+# platform reports watch time; this is an integral under the concurrent-viewer
+# curve, so the thing that has to be right is the integral.
+_wbase = datetime(2026, 8, 24, 12, 0, tzinfo=timezone.utc)
+
+
+def _curve(values, step=60):
+    return [(_wbase + timedelta(seconds=step * i), v) for i, v in enumerate(values)]
+
+
+check("a flat curve is viewers times minutes",
+      chart.watch_time(_curve([100] * 61))[0] == 6000.0)          # 100 x 60 min
+check("and the whole hour counts as covered",
+      chart.watch_time(_curve([100] * 61))[1] == 3600.0)
+# The trapezoid, and the reason it is one: 0 -> 100 over a minute is fifty
+# viewer-minutes, not zero and not a hundred.
+check("a ramp is trapezoidal, not rectangular",
+      chart.watch_time(_curve([0, 100]))[0] == 50.0)
+check("a longer poll interval is worth proportionally more",
+      chart.watch_time(_curve([10, 10], step=300))[0] == 50.0)
+check("one sample cannot be integrated at all",
+      chart.watch_time(_curve([100])) == (None, 0))
+check("and neither can nothing", chart.watch_time([]) == (None, 0))
+check("a missing reading is skipped rather than counted as zero",
+      chart.watch_time([(_wbase, 100), (_wbase + timedelta(seconds=60), None),
+                        (_wbase + timedelta(seconds=120), 100)])[0] == 200.0)
+check("points arrive in any order and are sorted first",
+      chart.watch_time(list(reversed(_curve([100] * 61))))[0] == 6000.0)
+
+# The load-bearing one. A poller that died for an hour must not be credited with
+# an hour of viewers -- that is the difference between an estimate and a fiction,
+# and every caveat attached to this number depends on it holding.
+_gappy = _curve([50] * 10) + [(_wbase + timedelta(seconds=4200), 50),
+                              (_wbase + timedelta(seconds=4260), 50)]
+_gapped, _gapcov = chart.watch_time(_gappy)
+check("a gap wider than the poller's rhythm is not integrated",
+      _gapped == 50.0 * 9 + 50.0)          # nine 60s steps, then the last one
+check("and it is not counted as covered either", _gapcov == 600.0)
+check("so coverage reports the hole rather than hiding it",
+      chart.fmt_coverage(_gapcov, 4260) == "14% covered")
+check("a fully covered stream says nothing at all",
+      chart.fmt_coverage(3600, 3600) == "")
+
+check("hours read small with a decimal and large with a comma",
+      (chart.fmt_hours(126), chart.fmt_hours(600000))
+      == ("2.1 h", "10,000 h"))
+check("and nothing to report is a dash, never a zero",
+      chart.fmt_hours(None) == chart.DASH_HOURS)
+
+# The per-day charts carry the figure, which is what "output it on the graph"
+# means for a graph that is already five panels of sampled series.
+_wsession = [{"when": w, "viewers": v, "live": True, "stream_id": "s1"}
+             for w, v in _curve([120] * 61)]
+_wsvg = chart.render_stacked(_wsession, "t", 30, 1300, day=date(2026, 8, 24))
+check("the stacked chart shows estimated watch time",
+      # 120 viewers held for an hour is 120 watch hours, which is over
+      # fmt_hours()' hundred-hour line and so prints without the decimal.
+      "Est. watch time" in _wsvg and "120 h" in _wsvg)
+check("in a colour no sampled metric uses",
+      chart.WATCH_COLOR in _wsvg
+      and chart.WATCH_COLOR not in {m["color"] for m in chart.METRICS})
+check("the composite chart shows it too",
+      "Est. watch time" in chart.render_composite(_wsession, "t", 1300, 560,
+                                                  day=date(2026, 8, 24)))
+
+# --- the per-broadcast bars -----------------------------------------------
+def _wentry(day, hours, coverage=1.0, hour=13):
+    return dict(_entry(day, None, followers=1, hour=hour),
+                watchtime=hours, watch_minutes=None if hours is None else hours * 60,
+                coverage=coverage)
+
+
+_wstreams = [_wentry(date(2026, 8, 24), 2615.9),
+             _wentry(date(2026, 8, 25), 3445.5),
+             _wentry(date(2026, 8, 26), None),
+             _wentry(date(2026, 8, 27), 4026.8, coverage=0.91)]
+_wbars = trends.render_stream_bars(_wstreams, "t", "youtube", date(2026, 8, 27),
+                                   "watchtime")
+check("watch hours draw one bar per broadcast", "4,027" in _wbars)
+check("a broadcast that could not be integrated is a dash, not a zero bar",
+      trends.DASH in _wbars)
+check("hours are never signed — an integral cannot go backwards",
+      "+4,027" not in _wbars)
+check("a short-covered broadcast says so where a reader can find it",
+      "91% of the broadcast covered" in _wbars)
+check("and a fully covered one adds no asterisk",
+      "of the broadcast covered" not in trends.render_stream_bars(
+          _wstreams[:2], "t", "youtube", date(2026, 8, 25), "watchtime"))
+check("small figures keep a decimal, large ones lose it",
+      (trends.fmt_watch_hours(4.25), trends.fmt_watch_hours(2615.9))
+      == ("4.2", "2,616"))
+# Unlike followers and likes, this one is carried by BOTH platforms, so it is
+# the one chart here that cannot select itself by the metric being absent.
+check("it draws for Twitch as readily as for YouTube",
+      trends.render_stream_bars(_wstreams, "t", "twitch", date(2026, 8, 27),
+                                "watchtime") is not None)
+
+# --- the trailing total ---------------------------------------------------
+_wdays = [{"day": date(2026, 8, 20) + timedelta(days=n),
+           "status": "live" if n else "dark",
+           "watch_minutes": None if not n else n * 6000.0,
+           "watchtime": None if not n else n * 100.0,
+           "covered": 3600,
+           "rolling_minutes": None if not n else n * (n + 1) / 2 * 6000.0,
+           "rolling": None if not n else n * (n + 1) / 2 * 100.0}
+          for n in range(6)]
+_wroll = trends.render_watch_rolling(_wdays, "t", "youtube", date(2026, 8, 25),
+                                     target=trends.YPP_TARGET_HOURS)
+check("the rolling chart draws the trailing total", "1,500" in _wroll)
+check("it says what the estimate excludes, on the chart itself",
+      "excludes replay watch time" in _wroll)
+# Matched around the apostrophe: everything drawn goes through chart.esc(), so
+# the SVG holds "platform&#x27;s" and a literal search for the sentence fails.
+check("and that it is not the platform's own figure",
+      "Not the platform" in _wroll and "own figure" in _wroll)
+check("YouTube gets the 4,000-hour reference line",
+      "4,000 h reference" in _wroll)
+# The line is a reference and not a goal, because the estimate cannot support
+# being read as progress towards monetisation. The chart has to say so itself:
+# a caveat that lives only in a docstring is a caveat nobody reading it sees.
+check("labelled a reference rather than a target",
+      "reference" in _wroll and "not the YPP figure" in _wroll)
+check("Twitch has no such threshold, so it gets no line",
+      "reference" not in trends.render_watch_rolling(
+          _wdays, "t", "twitch", date(2026, 8, 25)))
+check("a day with no stream still moves the trailing total",
+      _wroll.count("<circle") >= 1)
+check("nothing to draw is None, not an empty chart",
+      trends.render_watch_rolling([], "t", "youtube", date(2026, 8, 25)) is None
+      and trends.render_watch_rolling(
+          [dict(d, rolling=None) for d in _wdays], "t", "youtube",
+          date(2026, 8, 25)) is None)
+check("no script anywhere", "<script" not in _wroll.lower())
+
+check("render_streams adds the rolling chart when it is given the days",
+      "watchrolling" in trends.render_streams(
+          _wstreams, {}, "t", "youtube", date(2026, 8, 27), watch=_wdays))
+check("and leaves it out when it is not",
+      "watchrolling" not in trends.render_streams(
+          _wstreams, {}, "t", "youtube", date(2026, 8, 27)))
+
+# Every kind the renderers can produce has to be publishable, or the chart is
+# written to charts/ every night and never reaches the page.
+check("both new charts are known to the publisher",
+      {"watchtime", "watchrolling"} <= set(s3.TREND_KINDS))
+check("both have a label on every platform",
+      all((k, p) in s3.TREND_LABELS
+          for k in ("watchtime", "watchrolling") for p in ("twitch", "youtube")))
+check("and an aspect ratio, or the page cannot size the <object>",
+      all(k in trends.SIZES for k in ("watchtime", "watchrolling")))
+check("the labels say the number is an estimate",
+      all("Estimated" in s3.TREND_LABELS[(k, p)]
+          for k in ("watchtime", "watchrolling") for p in ("twitch", "youtube")))
+
+
 # --- s3 the day page ------------------------------------------------------
 section("s3 day page")
 check("a day page has its own key", s3.day_key("2026-08-24") == "day/2026-08-24.html")
@@ -2282,6 +2440,34 @@ else:
                       and _have[:2] == _want[:2] and abs(_have[2] - _want[2]) <= _TOL
                       and _have[3:] == _want[3:],
                       "{} vs {}".format(_want, _have))
+
+            # --- watch time, on both sides of the language boundary -------
+            # The estimator exists twice -- chart.watch_time() for the CSV path
+            # and the per-day graphs, tm.stream_watch_slices() for the report
+            # tables -- and the two have to agree to the penny or the same
+            # broadcast reports one figure in `graph` and another on the site.
+            # Every part of the rule is a place they could drift: the trapezoid,
+            # the UPPER-median gap, and the tolerance that decides which gaps
+            # count at all.
+            _wsql = db.execute(
+                "SELECT watch_minutes, covered_seconds, span_seconds "
+                "FROM tm.stream_watch_time(%s)", (_sid,), fetch=True)[0]
+            _wpy, _cpy = chart.watch_time(
+                [(s["when"], s.get("viewers")) for s in _mine])
+            check("{}: SQL and Python integrate to the same minutes".format(_label),
+                  (_wsql[0] is None) == (_wpy is None)
+                  and (_wpy is None or abs(float(_wsql[0]) - _wpy) <= 0.01),
+                  "{} vs {}".format(_wsql[0], _wpy))
+            check("{}: and agree on how much was covered".format(_label),
+                  (_wsql[1] or 0) == int(_cpy),
+                  "{} vs {}".format(_wsql[1], _cpy))
+            # Coverage is measured against the whole broadcast rather than
+            # against the part that carried a viewer count, so a stream YouTube
+            # reported no number for at the start reads as short rather than
+            # as complete.
+            check("{}: coverage cannot exceed the broadcast".format(_label),
+                  _wsql[2] is None or (_wsql[1] or 0) <= _wsql[2] + 1,
+                  "{} covered of {} span".format(_wsql[1], _wsql[2]))
 
         # --- the minute grid ----------------------------------------------
         # chart.align_platforms() exists twice as well now, and this is the

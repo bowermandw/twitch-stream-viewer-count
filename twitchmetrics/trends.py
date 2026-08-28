@@ -18,7 +18,7 @@ import math
 from datetime import time, timedelta
 
 from .chart import (BG, DIM, FG, GRID, METRIC_BY_KEY, MUTED, PAD_L, PAD_R,
-                    PLATFORMS, esc, fmt_count, nice_axis, text)
+                    PLATFORMS, WATCH_COLOR, esc, fmt_count, nice_axis, text)
 
 PEAK_DAYS = 10          # days on the peaks chart
 COMPARE_DAYS = 5        # days shown *behind* today on the comparison chart
@@ -39,6 +39,23 @@ UNKNOWN_LOCATION = "Unknown"
 # reason compare_slots()' per_day axis is: a renderer taking its axis from the
 # data relabels itself when a day is missing.
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+# Days on the rolling watch-time chart, and the window its trailing total sums.
+# 365 because the figure it is standing next to -- YouTube's 4,000-hour Partner
+# Programme bar -- is a trailing-twelve-months one, and a rolling total measured
+# over any other span would invite exactly the comparison it cannot support.
+WATCH_DAYS = 30
+ROLLING_DAYS = 365
+
+# The YPP threshold, drawn as a reference line on the YouTube chart only.
+#
+# It is a reference and NOT a progress bar, and the chart says so in as many
+# words. The real figure counts valid public watch hours across live AND VOD;
+# this estimate integrates the live concurrent-viewer curve and knows nothing
+# about replays or about YouTube's validity rules, so it undercounts by a margin
+# nothing here can measure. Twitch has no equivalent bar, which is why the line
+# is platform-gated rather than a constant on every chart.
+YPP_TARGET_HOURS = 4000
 
 # How far back to hunt for a day that streamed. The charts compare streams, not
 # dates, so the axis has to be allowed to reach past a quiet fortnight -- but
@@ -72,7 +89,8 @@ DAY_PREFIX = "day/"
 # an <object> has to be told its aspect ratio, where an <img> works it out.
 SIZES = {"peaks": (1300, 380), "typical": (1300, 430),
          "followers": (1300, 400), "likes": (1300, 400),
-         "weekday": (1300, 360), "location": (1300, 360)}
+         "weekday": (1300, 360), "location": (1300, 360),
+         "watchtime": (1300, 400), "watchrolling": (1300, 400)}
 
 # --- layout ---------------------------------------------------------------
 HEAD_H = 118            # shorter than chart.HEADER_H: no in-stream tiles to fit
@@ -575,6 +593,17 @@ STREAM_METRICS = {
     "likes": {"title": "Peak likes per stream",
               "best": "Best stream", "average": "Average peak",
               "noun": "likes", "signed": False},
+    # The one entry whose values are not whole people. `hours` switches the two
+    # formatters below; everything else about the renderer is unchanged, which
+    # is the point of the set being data.
+    #
+    # Both platforms carry it, unlike the two above -- so this is the one chart
+    # here that draws twice, and the only one that cannot select its platform by
+    # the metric simply being absent.
+    "watchtime": {"title": "Estimated watch hours per stream",
+                  "best": "Best stream", "average": "Average per stream",
+                  "noun": "estimated watch hours", "signed": False,
+                  "hours": True, "color": WATCH_COLOR},
 }
 
 GROUPINGS = {
@@ -595,6 +624,46 @@ def _fmt_signed(value, signed=True):
     if not signed:
         return fmt_count(value)
     return "{}{}".format("+" if value > 0 else "", fmt_count(value))
+
+
+def fmt_watch_hours(hours):
+    """Watch hours for a bar or a tile: '4.2' small, '2,615' once it is not.
+
+    Bare, with no unit. Every chart that prints these says "watch hours" in its
+    heading, and repeating it on twelve bars is noise -- the same reason the
+    peaks chart labels its bars with a number and not with "viewers".
+    """
+    if hours is None:
+        return DASH
+    return "{:.1f}".format(hours) if abs(hours) < 10 else fmt_count(hours)
+
+
+def _coverage_note(entry):
+    """' · 91% of the broadcast covered', or '' when all of it was.
+
+    Silent at 100%, which is the ordinary case. A qualifier printed on every
+    chart teaches the eye to skip it, and this one has to still be legible on
+    the chart where a poller died mid-stream and the bar is short for a reason
+    that has nothing to do with the audience.
+    """
+    share = entry.get("coverage")
+    if share is None or share >= 0.995:
+        return ""
+    return " · {:.0f}% of the broadcast covered".format(share * 100)
+
+
+def _fmt_value(metric, value):
+    """One bar's label, in whatever unit that metric counts in."""
+    spec = STREAM_METRICS[metric]
+    if spec.get("hours"):
+        return fmt_watch_hours(value)
+    return _fmt_signed(value, spec["signed"])
+
+
+def _fmt_mean(metric, value):
+    """The same for an average, which followers and likes print differently."""
+    spec = STREAM_METRICS[metric]
+    return fmt_watch_hours(value) if spec.get("hours") else _fmt_avg(value)
 
 
 def _whole_step(step):
@@ -701,8 +770,11 @@ def render_stream_bars(entries, channel, platform, day, metric,
 
     spec = _spec(platform)
     words = STREAM_METRICS[metric]
-    colour = METRIC_BY_KEY.get(metric, {}).get("color", spec["color"])
-    signed = words["signed"]
+    # The metric's own colour first, then one it declares for itself, then the
+    # platform's. Watch time is in no per-panel palette because it is in no
+    # sampled series, so it brings its own.
+    colour = (METRIC_BY_KEY.get(metric, {}).get("color")
+              or words.get("color") or spec["color"])
 
     low_value, top_value, step = _signed_axis([e[metric] for e in present])
     left, right = PAD_L, width - PAD_R
@@ -722,11 +794,11 @@ def render_stream_bars(entries, channel, platform, day, metric,
     best = max(present, key=lambda e: e[metric])
     average = sum(e[metric] for e in present) / len(present)
     tile_x = width - PAD_R + 84
-    _tile(out, tile_x, _fmt_signed(best[metric], signed), words["best"],
+    _tile(out, tile_x, _fmt_value(metric, best[metric]), words["best"],
           best.get("location") or fmt_day(best["day"], True), colour=colour)
     # The span, because a broadcast axis is not contiguous and the reader
     # cannot infer how long ten of them took from the labels.
-    _tile(out, tile_x - 175, _fmt_avg(average), words["average"],
+    _tile(out, tile_x - 175, _fmt_mean(metric, average), words["average"],
           "over {} broadcast(s)".format(len(present)))
 
     _signed_grid(out, low_value, top_value, step, left, right, y_of)
@@ -763,18 +835,23 @@ def render_stream_bars(entries, channel, platform, day, metric,
         depth = abs(base - y_of(value))
         href = day_link(entry["day"], known)
         if href:
-            out.append(_open_link(href, "{}{} · {} {}".format(
+            out.append(_open_link(href, "{}{} · {} {}{}".format(
                 fmt_day(entry["day"], True),
                 " · " + entry["location"] if entry.get("location") else
                 (" · " + clock if clock else ""),
-                _fmt_signed(value, signed), words["noun"])))
+                _fmt_value(metric, value), words["noun"],
+                # Only watch time has a coverage figure, and only when it is
+                # short of the whole broadcast. It belongs in the tooltip rather
+                # than under the bar: it qualifies the number for anyone who
+                # goes looking, without putting an asterisk on a healthy chart.
+                _coverage_note(entry) if words.get("hours") else "")))
             out.append(_hit(x, top, bar_width, bottom - top + 44))
         out.append(_bar(x, y, bar_width, depth, colour,
                         1.0 if latest else 0.72, outline=FG if latest else None))
         # Above the bar when it grows, below when it shrinks -- a label inside
         # the axis either way.
         label_y = y - 9 if value >= 0 else y_of(value) + 18
-        out.append(text(centre, label_y, _fmt_signed(value, signed), size=12,
+        out.append(text(centre, label_y, _fmt_value(metric, value), size=12,
                         fill=FG if latest else MUTED,
                         weight="600" if latest else "normal", anchor="middle"))
         if href:
@@ -813,8 +890,8 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
     spec = _spec(platform)
     words = STREAM_METRICS[metric]
     shape = GROUPINGS[grouping]
-    colour = METRIC_BY_KEY.get(metric, {}).get("color", spec["color"])
-    signed = words["signed"]
+    colour = (METRIC_BY_KEY.get(metric, {}).get("color")
+              or words.get("color") or spec["color"])
     found = {row["key"]: row for row in groups}
 
     if grouping == "weekday":
@@ -846,7 +923,7 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
     best = max(drawn, key=lambda row: row["average"])
     best_label = dict(axis).get(best["key"], best["key"] or UNKNOWN_LOCATION)
     tile_x = width - PAD_R + 84
-    _tile(out, tile_x, _fmt_avg(best["average"]), shape["best"],
+    _tile(out, tile_x, _fmt_mean(metric, best["average"]), shape["best"],
           "{} · {} broadcast(s)".format(best_label, best["streams"]), colour=colour)
     _tile(out, tile_x - 175, str(len(drawn)),
           "Groups" if grouping == "location" else "Days streamed",
@@ -881,15 +958,162 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
             _bar(x, y, bar_width, depth, colour, 1.0 if top_bar else 0.72,
                  outline=FG if top_bar else None),
             "{} · {} broadcast(s) · {} avg · best {}".format(
-                label, row["streams"], _fmt_avg(value),
-                _fmt_signed(row["best"], signed))))
+                label, row["streams"], _fmt_mean(metric, value),
+                _fmt_value(metric, row["best"]))))
         label_y = y - 9 if value >= 0 else y_of(value) + 18
-        out.append(text(centre, label_y, _fmt_avg(value), size=12,
+        out.append(text(centre, label_y, _fmt_mean(metric, value), size=12,
                         fill=FG if top_bar else MUTED,
                         weight="600" if top_bar else "normal", anchor="middle"))
 
     out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                'stroke-width="1"/>'.format(left, base, right, base, GRID))
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+# --------------------------------------------------------------------------
+# the trailing total
+# --------------------------------------------------------------------------
+
+
+def render_watch_rolling(rows, channel, platform, day,
+                         width=SIZES["watchrolling"][0],
+                         height=SIZES["watchrolling"][1],
+                         rolling=ROLLING_DAYS, target=None):
+    """Estimated watch hours over the trailing `rolling` days, at each day of the window.
+
+    `rows` is store.watch_totals()' list, oldest first and DENSE -- a day nobody
+    streamed is present with a None watch time, because the trailing total still
+    moves on it as an older day falls out of the back of the window. That is the
+    whole reason this is a line and not a bar per broadcast: it answers "which
+    way is the twelve-month figure going", which no per-stream chart can.
+
+    `target` draws a dashed reference line, and is the YouTube Partner Programme's
+    4,000 hours when the caller passes it. It is a REFERENCE and not a goal line,
+    and the footer says so: the YPP figure counts valid public watch hours across
+    live and VOD, where this integrates the live concurrent-viewer curve alone.
+    Anyone reading this chart as progress towards monetisation is reading a number
+    that is low by a margin nothing here can measure. Passing target=None -- which
+    is what Twitch gets, having no such threshold -- simply omits the line.
+
+    Returns None when no day in the window has a trailing total, which is what
+    keeps a channel with no watch history from publishing an empty chart.
+    """
+    present = [r for r in rows if r.get("rolling") is not None]
+    if not present:
+        return None
+
+    spec = _spec(platform)
+    left, right = PAD_L, width - PAD_R
+    top, bottom = HEAD_H, height - FOOT_H - 16
+
+    highest = max(r["rolling"] for r in present)
+    # The reference line is only worth an axis that reaches it when it is within
+    # sight. On a channel three times past it, stretching the axis to include it
+    # would flatten the curve the chart exists to show; on one approaching it,
+    # leaving it off the top would hide the only thing being approached.
+    reach = max(highest, target) if target and target <= highest * 3 else highest
+    _, step = nice_axis(reach)
+    # _whole_step() for _grid_lines()' reason, which only ever bit the viewer
+    # charts in theory: the labels are drawn with fmt_count(), so a fractional
+    # step prints "0, 0, 0" for gridlines at 0, 0.2 and 0.4. A viewer count is
+    # never small enough to produce one; a channel three days into collecting is
+    # very easily under one watch hour.
+    step = _whole_step(step)
+    top_value = max(step, int(math.ceil(reach / step) * step))
+
+    def x_of(index):
+        return left + (index + 0.5) * ((right - left) / max(1, len(rows)))
+
+    def y_of(value):
+        return bottom - (value / top_value) * (bottom - top) if top_value else bottom
+
+    latest = present[-1]
+    streamed = sum(1 for r in rows if r.get("watch_minutes") is not None)
+    out = _open_svg(
+        width, height,
+        "Estimated watch hours, trailing {} days".format(rolling),
+        "{} · {} · live only, excludes replay watch time".format(
+            channel, spec["label"]))
+
+    tile_x = width - PAD_R + 84
+    _tile(out, tile_x, fmt_watch_hours(latest["rolling"]),
+          "Past {} days".format(rolling),
+          "to {}".format(fmt_day(latest["day"], True)), colour=WATCH_COLOR)
+    _tile(out, tile_x - 175, str(streamed), "Days with watch time",
+          "of {} in view".format(len(rows)))
+    if target:
+        share = latest["rolling"] / float(target) * 100.0
+        _tile(out, tile_x - 350, "{:.0f}%".format(share),
+              "Of the {} reference".format(fmt_count(target)),
+              "estimate, not the YPP figure")
+
+    _grid_lines(out, top_value, step, left, right, y_of)
+
+    if target and target <= top_value:
+        y = y_of(target)
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" '
+                   'stroke="{}" stroke-width="1.4" stroke-dasharray="6 4" '
+                   'opacity="0.8"/>'.format(left, y, right, y, FG))
+        out.append(text(left + 6, y - 7, "{} h reference".format(fmt_count(target)),
+                        size=11, fill=DIM))
+
+    # One run, not several: the trailing total is defined on every day the report
+    # tables hold, including the ones with no stream, so there is no gap to keep.
+    points = [(x_of(index), y_of(row["rolling"]))
+              for index, row in enumerate(rows) if row.get("rolling") is not None]
+    coords = " ".join("{:.1f},{:.1f}".format(x, y) for x, y in points)
+    if len(points) > 1:
+        out.append('<path d="M {:.1f},{:.1f} L {} L {:.1f},{:.1f} Z" fill="{}" '
+                   'opacity="0.16"/>'.format(points[0][0], bottom,
+                                             coords.replace(" ", " L "),
+                                             points[-1][0], bottom, WATCH_COLOR))
+        out.append('<polyline points="{}" fill="none" stroke="{}" stroke-width="2.2" '
+                   'stroke-linejoin="round" stroke-linecap="round"/>'.format(
+                       coords, WATCH_COLOR))
+    else:
+        out.append('<circle cx="{:.1f}" cy="{:.1f}" r="3" fill="{}"/>'.format(
+            points[0][0], points[0][1], WATCH_COLOR))
+
+    # A marker on the newest point, which is the one figure anybody came for.
+    out.append('<circle cx="{:.1f}" cy="{:.1f}" r="4" fill="{}" stroke="{}" '
+               'stroke-width="2"/>'.format(points[-1][0], points[-1][1], BG,
+                                           WATCH_COLOR))
+
+    dated = [r["day"] for r in rows]
+    with_month = spans_months(dated)
+    # Every label would collide on a 365-day window, so they thin to about a
+    # dozen. The count and not the stride is fixed, so the axis reads the same
+    # whether it is showing a fortnight or a year.
+    stride = max(1, len(rows) // 12)
+    for index, row in enumerate(rows):
+        if index % stride and index != len(rows) - 1:
+            continue
+        out.append(text(x_of(index), bottom + 22, fmt_day(row["day"], with_month),
+                        size=11, fill=MUTED, anchor="middle"))
+
+    # Each day's own contribution, reachable but not drawn: on this axis a single
+    # day is a rounding error against a year of them, and a bar for it would be
+    # a pixel. The per-broadcast chart is where a day is legible.
+    for index, row in enumerate(rows):
+        if row.get("rolling") is None:
+            continue
+        own = row.get("watchtime")
+        out.append(_tip(_hit(x_of(index) - 8, top, 16, bottom - top),
+                        "{} · {} trailing · {} that day".format(
+                            fmt_day(row["day"], True),
+                            fmt_watch_hours(row["rolling"]),
+                            fmt_watch_hours(own) if own is not None
+                            else "no stream")))
+
+    out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
+               'stroke-width="1"/>'.format(left, bottom, right, bottom, GRID))
+    out.append(text(left, height - 16,
+                    "Area under the concurrent-viewer curve. Not the platform's "
+                    "own figure, and not comparable with it.",
+                    size=11, fill=DIM))
+    out.append(text(right, height - 16, fmt_span(dated), size=12, fill=DIM,
+                    anchor="end"))
     out.append("</svg>")
     return "\n".join(out)
 
@@ -941,7 +1165,7 @@ def render_from(peaks, slots, per_day, channel, platform, day,
     return charts
 
 
-def render_streams(rows, groups, channel, platform, day, known=None):
+def render_streams(rows, groups, channel, platform, day, known=None, watch=()):
     """The per-broadcast charts: {"followers", "likes", "weekday", "location"}.
 
     Any key may be absent, and on a normal channel most of them are: `rows` is
@@ -954,6 +1178,10 @@ def render_streams(rows, groups, channel, platform, day, known=None):
     question about the audience you keep, and likes are a YouTube-only measure
     of the one you had. Passing a different metric is a one-line change here
     rather than a new renderer.
+
+    `watch` is store.watch_totals()' list, and adds the trailing-total chart when
+    it is passed. Optional because it comes from a different query than `rows`
+    and a caller that could not run it should still get the rest.
 
     Deliberately not folded into render_from(). That function's signature is
     load-bearing -- the parity harness drives the Python and SQL aggregate
@@ -972,4 +1200,13 @@ def render_streams(rows, groups, channel, platform, day, known=None):
                                      platform, day, "followers", grouping)
         if drawn:
             charts[grouping] = drawn
+    if watch:
+        # Only YouTube gets the reference line. Twitch has no watch-hour
+        # threshold to be near, and drawing one there would invent a target the
+        # platform does not have.
+        drawn = render_watch_rolling(
+            watch, channel, platform, day,
+            target=YPP_TARGET_HOURS if platform == "youtube" else None)
+        if drawn:
+            charts["watchrolling"] = drawn
     return charts

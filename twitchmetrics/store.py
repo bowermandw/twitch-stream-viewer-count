@@ -838,7 +838,8 @@ def compare_slots(channel, platform, day, days=trends.COMPARE_DAYS,
 
 STREAM_TRENDS_SQL = """
 SELECT stream_id, local_date, started_at, weekday, title, location,
-       follower_delta, likes_peak, peak_viewers
+       follower_delta, likes_peak, peak_viewers,
+       watch_minutes, covered_seconds, span_seconds
   FROM tm.stream_trends(
       (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
       -- ::integer for DAILY_PEAKS_SQL's reason: psycopg sends a small Python
@@ -853,7 +854,8 @@ def stream_trends(channel, platform, day, count=trends.STREAM_COUNT,
     """The last `count` broadcasts on or before `day`, oldest first.
 
     [{"stream_id", "day", "started", "weekday", "title", "location",
-      "followers", "likes", "peak"}, ...]
+      "followers", "likes", "peak", "watch_minutes", "watchtime",
+      "covered", "span", "coverage"}, ...]
 
     `day` is the local date the broadcast STARTED on, so a stream that ran past
     midnight is filed under the evening it belongs to rather than split.
@@ -863,6 +865,14 @@ def stream_trends(channel, platform, day, count=trends.STREAM_COUNT,
     carry it -- a Twitch row has no likes and a YouTube row no followers -- and
     that is what lets the renderers select themselves by returning None rather
     than by testing the platform's name.
+
+    "watch_minutes" is the integral under the concurrent-viewer curve and
+    "watchtime" the same figure in HOURS, which is the unit the charts draw and
+    the one a person says out loud. Both platforms carry it, so unlike the two
+    above it is not what selects a renderer. It is an ESTIMATE of live watch
+    time only -- see 008_watchtime.sql for what it cannot be used for -- and
+    "coverage" is the share of the broadcast that was actually integrated, which
+    is what keeps a low figure from an outage readable as one.
     """
     if count <= 0:
         # The SQL clamps with greatest(0, p_streams) and would agree, but the
@@ -872,10 +882,18 @@ def stream_trends(channel, platform, day, count=trends.STREAM_COUNT,
                       (config.channel_slug(channel), platform, day,
                        max(1, int(count)), max(1, int(lookback)),
                        timezone_name or config.resolve_db_timezone()), fetch=True)
+    # float, not Decimal, for stream_groups()' reason: nice_axis() divides by
+    # 4.0 and every renderer divides by the top value, and Decimal / float
+    # raises rather than coercing.
     return [{"stream_id": row[0], "day": row[1],
              "started": row[2].astimezone(timezone.utc) if row[2] else None,
              "weekday": int(row[3]), "title": row[4], "location": row[5],
-             "followers": row[6], "likes": row[7], "peak": row[8]}
+             "followers": row[6], "likes": row[7], "peak": row[8],
+             "watch_minutes": float(row[9]) if row[9] is not None else None,
+             "watchtime": float(row[9]) / 60.0 if row[9] is not None else None,
+             "covered": row[10], "span": row[11],
+             "coverage": (float(row[10]) / row[11]
+                          if row[10] is not None and row[11] else None)}
             for row in rows]
 
 
@@ -897,7 +915,9 @@ def stream_groups(channel, platform, metric, grouping, day,
 
     `grouping` is "weekday" or "location"; the SQL raises on anything else
     rather than returning nothing, which would read as a channel that gained no
-    followers. `metric` is "followers" or "likes".
+    followers. `metric` is "followers", "likes" or "watchtime" -- and watchtime
+    arrives in HOURS, converted in the SQL so the three renderers cannot each
+    remember it differently.
 
     Sparse on purpose, like compare_slots(): a weekday nobody streamed on has no
     row at all. The renderer builds the Mon..Sun axis and fills it from this.
@@ -913,9 +933,70 @@ def stream_groups(channel, platform, metric, grouping, day,
                        timezone_name or config.resolve_db_timezone()), fetch=True)
     # float, not Decimal: nice_axis() divides by 4.0 and the renderers divide by
     # the top value, and Decimal / float raises rather than coercing.
-    return [{"key": row[0], "streams": int(row[1]), "total": int(row[2]),
-             "average": float(row[3]), "best": row[4], "best_stream_id": row[5]}
+    # "total" and "best" are numeric now rather than integers: watchtime is
+    # fractional, and one shape for all three metrics beats a cast that depends
+    # on which was asked for.
+    return [{"key": row[0], "streams": int(row[1]),
+             "total": float(row[2]) if row[2] is not None else 0.0,
+             "average": float(row[3]),
+             "best": float(row[4]) if row[4] is not None else None,
+             "best_stream_id": row[5]}
             for row in rows]
+
+
+# --------------------------------------------------------------------------
+# watch time
+# --------------------------------------------------------------------------
+
+
+WATCH_TOTALS_SQL = """
+SELECT local_date, status::text, watch_minutes, covered_seconds, rolling_minutes
+  FROM tm.watch_totals(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
+      %s::integer, %s::integer, %s)
+ ORDER BY local_date
+"""
+
+
+def watch_totals(channel, platform, day, days=trends.WATCH_DAYS,
+                 rolling=trends.ROLLING_DAYS, timezone_name=None):
+    """Estimated watch time per local day, with the trailing total at each.
+
+    [{"day", "status", "watch_minutes", "watchtime", "covered",
+      "rolling_minutes", "rolling"}, ...] -- oldest first, one entry per day in
+    the window whether or not it was streamed.
+
+    DENSE, unlike stream_trends(): the underlying report table holds a row for
+    every day in a refreshed range, and a day off arrives with watch_minutes
+    None. The renderer draws that as a dash, which is the distinction the peaks
+    chart already makes -- "did not stream" is not "nobody watched".
+
+    "rolling" is the trailing `rolling`-day total in HOURS, that day inclusive,
+    so the newest entry is the past-twelve-months figure when rolling is 365.
+    It is an estimate of LIVE watch time and undercounts by however much of the
+    audience arrived after the broadcast ended; 008_watchtime.sql says why that
+    makes it unfit for judging the 4,000-hour Partner Programme threshold, and
+    trends.render_watch_rolling() repeats the warning where a reader will see it.
+    """
+    if days <= 0:
+        return []
+    rows = db.execute(WATCH_TOTALS_SQL,
+                      (config.channel_slug(channel), platform, day,
+                       max(1, int(days)), max(1, int(rolling)),
+                       timezone_name or config.resolve_db_timezone()), fetch=True)
+    out = []
+    for local_date, status, minutes, covered, rolling_minutes in rows:
+        minutes = float(minutes) if minutes is not None else None
+        rolled = float(rolling_minutes) if rolling_minutes is not None else None
+        out.append({
+            "day": local_date, "status": status,
+            "watch_minutes": minutes,
+            "watchtime": minutes / 60.0 if minutes is not None else None,
+            "covered": covered,
+            "rolling_minutes": rolled,
+            "rolling": rolled / 60.0 if rolled is not None else None,
+        })
+    return out
 
 
 COVERAGE_SQL = """

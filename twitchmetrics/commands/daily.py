@@ -95,6 +95,15 @@ def add_arguments(parser):
                         help="broadcasts on the per-stream charts (default {}); "
                              "these count broadcasts, not days".format(
                                  trends.STREAM_COUNT))
+    parser.add_argument("--watch-days", type=int, default=trends.WATCH_DAYS,
+                        metavar="N",
+                        help="days on the rolling watch-time chart "
+                             "(default {})".format(trends.WATCH_DAYS))
+    parser.add_argument("--rolling-days", type=int, default=trends.ROLLING_DAYS,
+                        metavar="N",
+                        help="days the trailing watch-time total sums over "
+                             "(default {}, a twelve-month window)".format(
+                                 trends.ROLLING_DAYS))
     parser.add_argument("--calendar-days", action="store_true",
                         help="count calendar days rather than days with a stream, "
                              "so a day off takes a slot and draws a dash")
@@ -405,12 +414,18 @@ def render_trend_charts(channel, day, args, known=None):
                           channel, platform, "followers", grouping, day,
                           args.stream_count, lookback=args.lookback)
                       for grouping in trends.GROUPINGS}
+            # A window of DAYS, not of broadcasts, and a different query for
+            # that reason: the trailing total moves on days nobody streamed as
+            # older days drop out of the back of it, so a broadcast axis has no
+            # room for the question it answers.
+            watch = store.watch_totals(channel, platform, day, args.watch_days,
+                                       rolling=args.rolling_days)
         except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
             log("WARN     {} {} — no per-stream charts: {}".format(
                 channel, platform, str(exc).splitlines()[0]))
         else:
             charts.update(trends.render_streams(rows, groups, channel, platform,
-                                                day, known=known))
+                                                day, known=known, watch=watch))
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

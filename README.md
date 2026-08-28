@@ -137,12 +137,22 @@ echo 'TWITCH_DATABASE_URL=postgresql://twitch:PASSWORD@127.0.0.1:5432/twitchmetr
 twitch-metrics db --init       # create the tables; safe to run again
 twitch-metrics db --import     # load the CSVs already in data/
 twitch-metrics db --verify     # prove the database agrees with them
+twitch-metrics db --rebuild    # recompute every report table from the samples
 twitch-metrics db --locations  # the location rules, and what each one claims
 ```
 
 `db --status` is the one to reach for when something is wrong. It never raises,
 and it tells the three lookalike failures apart: nothing configured, psycopg not
 installed, and a database that will not answer.
+
+`db --rebuild` exists because the nightly refresh cannot notice one particular
+kind of staleness. `store.ensure_reports()` judges a window by how many **dates**
+`tm.report_daily_peak` holds — so a schema change that adds a **column** leaves
+every one of those dates present and every new column `NULL`, and the refresh
+would touch only the tail of the window for ever. It is idempotent and takes a
+fraction of a second per channel, so the answer to "are the report tables right?"
+is to run it rather than to reason about it. `--dry-run` prints the spans it
+would recompute and writes nothing.
 
 ### Why not just keep the CSVs
 
@@ -422,7 +432,10 @@ twitch-metrics graph data/youtube_testchannel.csv --only viewers
 
 (The YouTube *Analytics* API does give exact `subscribersGained` and
 `subscribersLost` per day — but no absolute total, and it needs OAuth as the
-channel's own Google account.)
+channel's own Google account. The same wall stands in front of
+`estimatedMinutesWatched` and `averageViewDuration`; see
+[Estimated watch time](#estimated-watch-time) for what this project does about
+it and what that substitute can and cannot be used for.)
 
 Charting works exactly as it does for Twitch, via the file path:
 
@@ -734,13 +747,15 @@ streamed; the half-hour width is the same `--bucket` the per-day charts use.
 
 ### Per broadcast: followers, likes, and where you were
 
-The charts above compare **dates**. The four below them compare **broadcasts**,
+The charts above compare **dates**. The ones below them compare **broadcasts**,
 which is a different axis and not just a finer one: a Saturday spent at two
 parks is one bar up there and two bars down here, and only the second can
 answer *which park*.
 
 - **Followers gained per stream**, Twitch, the last ten broadcasts.
 - **Peak likes per stream**, YouTube, the same ten.
+- **Estimated watch hours per stream**, both platforms — see
+  [Estimated watch time](#estimated-watch-time).
 - **Followers by day of week**, and **by location** — the same broadcasts
   averaged, which is the pair that answers "when is it worth going out".
 
@@ -791,6 +806,86 @@ would be no symptom at all.
 the only way to notice that a reworded title has quietly stopped matching.
 Changing a rule rewrites history, so both commands re-file every broadcast
 before they return.
+
+### Estimated watch time
+
+**Neither platform gives this number out.** YouTube's `estimatedMinutesWatched`
+and `averageViewDuration` live in the YouTube *Analytics* API, which is
+owner-only: `ids=channel==MINE`, scope `yt-analytics.readonly`, and a Google
+account that owns the channel or holds a Studio permission on it. An API key
+cannot reach them at any quota tier, and Twitch has no equivalent endpoint at
+all. If you are not the owner, there is no configuration that changes that —
+the only route is the owner adding your account under **Studio → Settings →
+Permissions**.
+
+What this project *has* is the curve itself, sampled every sixty seconds. The
+area under it **is** watch time:
+
+```
+watch minutes = Σ (viewers_before + viewers_after) / 2 × gap_seconds / 60
+```
+
+A trapezoid rather than "viewers × the poll interval", because the interval is
+not a guarantee — a restart, a slow API call and a spooled backfill all make
+gaps of their own, and the trapezoid is right for any of them.
+
+It appears in four places:
+
+- a **headline tile** on every per-day graph, and a line in `graph`'s summary;
+- **estimated watch hours per stream**, one bar per broadcast, both platforms;
+- **estimated watch hours, trailing 365 days**, a rolling total per day;
+- `tm.report_stream_trend.watch_minutes` and `tm.report_daily_peak.watch_minutes`,
+  if you would rather query it than look at it.
+
+#### What it is not
+
+Three limits, all structural, and named here because a figure like this gets
+quoted.
+
+**It is live only.** Watch time accumulated on the archived broadcast after the
+stream ends is invisible to a poller sampling `concurrentViewers`, and on a
+channel with a back catalogue that is frequently the larger share. This number
+reads **low** against Studio, sometimes by a lot.
+
+**It is not YouTube's definition.** Studio counts partial minutes, ad breaks and
+validity rules this has no visibility into. It is a trend line to compare
+against its own history, never a figure to reconcile.
+
+**It cannot judge the 4,000-hour threshold.** The YouTube Partner Programme bar
+counts *valid public watch hours* across live **and** VOD in the trailing twelve
+months. This misses VOD entirely and applies none of the validity rules, so it
+undercounts by a margin nothing here can measure. The rolling chart draws 4,000
+as a dashed **reference** line on YouTube — because the shape of the trailing
+total is worth watching — and labels it "estimate, not the YPP figure" on the
+chart itself. The real number is in Studio's YPP eligibility card, and only the
+owner can see it. Twitch has no such threshold, so its chart gets no line.
+
+#### Coverage is what makes it readable
+
+A gap wider than the poller's own rhythm is **not integrated at all**. Crediting
+three hours of viewers to a poller that was down for three hours would be
+inventing an audience, and every caveat above depends on this never happening.
+The cap is `median_gap × 2.5` — the same `GAP_TOLERANCE` that already decides a
+poller stopped.
+
+So each broadcast carries `covered_seconds` beside its watch minutes, and a low
+total from an outage stays distinguishable from a low total from a quiet night.
+Anything short of the whole broadcast says so in the bar's tooltip; a fully
+covered one adds no asterisk, because a qualifier printed on every chart teaches
+the eye to skip the one where it matters.
+
+A broadcast that could not be integrated at all — one sample, or every gap too
+wide — draws a **dash**, never a zero. The same rule the peaks chart follows for
+a day off: "we don't know" is not "nobody watched".
+
+The estimator exists twice, in `chart.watch_time()` for the CSV path and the
+per-day graphs and in `tm.stream_watch_slices()` for the report tables, and
+`tests/smoke.py` holds the two to the penny — trapezoid, upper-median gap and
+tolerance alike — so the same broadcast cannot report one figure in `graph` and
+another on the site.
+
+`--watch-days` sets how many days the rolling chart shows (30), and
+`--rolling-days` how long a window its trailing total sums (365).
 
 ### Both platforms on one chart
 
