@@ -210,6 +210,46 @@ def fmt_hours(minutes):
     return "{:.1f} h".format(hours) if hours < 100 else "{:,.0f} h".format(hours)
 
 
+def live_seconds(window):
+    """Seconds the channel was actually live, offline stretches taken out.
+
+    The denominator coverage needs, and NOT the window's wall-clock duration.
+    A `session` here can be a whole day, and select_day() deliberately keeps the
+    offline rows between two broadcasts so the day charts as one continuous
+    axis. On a day with a morning stream and an evening one, the wall clock
+    therefore includes the afternoon he spent not streaming -- and measuring
+    integrated time against that reports a poller failure where there was a
+    lunch break.
+
+    Measured across each contiguous run of LIVE samples, first to last, which is
+    exactly the span watch_time() can integrate over. Deliberately not
+    `duration - sum(offline_spans())`: those spans open at the first OFFLINE row
+    rather than at the last live one, because they are drawn as shaded bands and
+    a band has to start where the data stops. Reusing them here would credit one
+    poll interval of live time per gap -- harmless on a chart, wrong in a
+    percentage that is supposed to read 100%.
+
+    Note this is the time the channel was LIVE, not the time that could be
+    integrated. The difference is the point: a poller that died mid-broadcast
+    leaves no rows at all rather than offline ones, so its outage stays inside
+    this figure and coverage correctly drops, while an advertised break does
+    not. A live sample YouTube reported no viewer count for counts here too,
+    and so shows up as the shortfall it is.
+    """
+    total, opened, last = 0.0, None, None
+    for sample in window:
+        if sample.get("live"):
+            if opened is None:
+                opened = sample["when"]
+            last = sample["when"]
+        elif opened is not None:
+            total += (last - opened).total_seconds()
+            opened = None
+    if opened is not None:
+        total += (last - opened).total_seconds()
+    return total
+
+
 def fmt_coverage(covered, duration):
     """'98% covered', or "" when the whole stream was.
 
@@ -691,7 +731,8 @@ def render_stacked(session, channel, bucket_minutes, width, show_buckets=True,
     out.append(text(tile_x, 52, fmt_hours(watched), size=27, fill=WATCH_COLOR,
                     weight="700", anchor="end"))
     out.append(text(tile_x, 74, "Est. watch time", size=12, fill=MUTED, anchor="end"))
-    out.append(text(tile_x, 91, fmt_coverage(covered, duration) or "live, this stream",
+    out.append(text(tile_x, 91,
+                    fmt_coverage(covered, live_seconds(session)) or "live, this stream",
                     size=11, fill=DIM, anchor="end"))
 
     for index, metric in enumerate(metrics):
@@ -787,7 +828,8 @@ def render_composite(session, channel, width, height, metrics=None, day=None):
     out.append(text(tile_x, 52, fmt_hours(watched), size=27, fill=WATCH_COLOR,
                     weight="700", anchor="end"))
     out.append(text(tile_x, 74, "Est. watch time", size=12, fill=MUTED, anchor="end"))
-    out.append(text(tile_x, 91, fmt_coverage(covered, duration) or "live, this stream",
+    out.append(text(tile_x, 91,
+                    fmt_coverage(covered, live_seconds(session)) or "live, this stream",
                     size=11, fill=DIM, anchor="end"))
 
     legend_x = left
@@ -1069,7 +1111,7 @@ def print_summary(session, bucket_minutes, metrics=None):
     print("  duration  {}   ({} samples)".format(fmt_elapsed(duration), len(session)))
     print("  watched   {} estimated   ({})".format(
         fmt_hours(watched),
-        fmt_coverage(covered, duration) or "whole stream integrated"))
+        fmt_coverage(covered, live_seconds(session)) or "whole stream integrated"))
     if watched is not None:
         # Spelled out once, in the one place a person reads numbers rather than
         # looks at them. Neither platform reports watch time -- this is the area

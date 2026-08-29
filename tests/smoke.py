@@ -1351,6 +1351,40 @@ check("the composite chart shows it too",
       "Est. watch time" in chart.render_composite(_wsession, "t", 1300, 560,
                                                   day=date(2026, 8, 24)))
 
+# The case that only appears on a day with two broadcasts in it, and the one
+# that made the caption lie: select_day() keeps the offline rows between them so
+# the day charts as one axis, which puts hours he was not streaming into the
+# wall clock. Measuring integrated time against that reports a poller failure
+# where there was an afternoon off.
+_two = ([{"when": w, "viewers": v, "live": True, "stream_id": "s1"}
+         for w, v in _curve([100] * 61)]
+        + [{"when": _wbase + timedelta(seconds=3600 + 60 * i), "viewers": None,
+            "live": False, "stream_id": None} for i in range(1, 120)]
+        + [{"when": w, "viewers": v, "live": True, "stream_id": "s2"}
+           for w, v in [(_wbase + timedelta(seconds=10800 + 60 * i), 100)
+                        for i in range(61)]])
+check("a day with two broadcasts is five hours wide",
+      (_two[-1]["when"] - _two[0]["when"]).total_seconds() == 4 * 3600)
+check("but only two of them were live",
+      chart.live_seconds(_two) == 2 * 3600)
+_twowatch, _twocov = chart.session_watch_time(_two)
+check("the gap between broadcasts is not integrated",
+      _twowatch == 12000.0)                       # two flat hours at 100
+check("nor counted as covered", _twocov == 2 * 3600)
+# The assertion that was false before live_seconds() existed: measured against
+# the wall clock this read "50% covered", which is a poller fault, on a day the
+# poller did not miss a sample.
+check("so an afternoon off is not reported as an outage",
+      chart.fmt_coverage(_twocov, chart.live_seconds(_two)) == "")
+check("while a poller that died mid-broadcast still shows short",
+      chart.fmt_coverage(1800, chart.live_seconds(_two)) == "25% covered")
+check("one broadcast is unchanged — live time is the whole window",
+      chart.live_seconds(_wsession)
+      == (_wsession[-1]["when"] - _wsession[0]["when"]).total_seconds())
+check("and the chart says so rather than flagging a hole",
+      "covered" not in chart.render_stacked(_two, "t", 30, 1300,
+                                            day=date(2026, 8, 24)))
+
 # --- the per-broadcast bars -----------------------------------------------
 def _wentry(day, hours, coverage=1.0, hour=13):
     return dict(_entry(day, None, followers=1, hour=hour),
