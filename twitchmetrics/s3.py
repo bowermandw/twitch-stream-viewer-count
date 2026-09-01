@@ -72,7 +72,7 @@ TITLE_PREFERENCE = ("twitch", "youtube")
 # count dates -- the page reads from "how many watched" down to "how many
 # stayed, and where". A kind is one lowercase word because trend_key() puts it
 # in front of a hyphen and TREND_KEY_RE will not take a second one.
-TREND_KINDS = ("peaks", "typical", "watchtime", "watchrolling",
+TREND_KINDS = ("peaks", "typical", "watchtime", "watchrolling", "watchlocation",
                "followers", "likes", "weekday", "location")
 TREND_LABELS = {
     ("peaks", "twitch"): "Peak viewers by day · Twitch",
@@ -94,6 +94,10 @@ TREND_LABELS = {
     ("watchtime", "youtube"): "Estimated watch hours per stream · YouTube",
     ("watchrolling", "twitch"): "Estimated watch hours, trailing 12 months · Twitch",
     ("watchrolling", "youtube"): "Estimated watch hours, trailing 12 months · YouTube",
+    # The three watch charts read together, so this sits with them rather than
+    # beside the other by-location chart: "how many hours" then "where they were".
+    ("watchlocation", "twitch"): "Estimated watch hours by location · Twitch",
+    ("watchlocation", "youtube"): "Estimated watch hours by location · YouTube",
 }
 
 # These nine regions predate the dotted website endpoint and still answer on

@@ -420,12 +420,17 @@ def render_trend_charts(channel, day, args, known=None):
             # room for the question it answers.
             watch = store.watch_totals(channel, platform, day, args.watch_days,
                                        rolling=args.rolling_days)
+            # Neither window applies: this is every broadcast on record, so it
+            # takes no --stream-count and no --watch-days. 009_location_watch.sql
+            # says why a venue's average is not a windowed question.
+            location_watch = store.location_watch(channel, platform)
         except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
             log("WARN     {} {} — no per-stream charts: {}".format(
                 channel, platform, str(exc).splitlines()[0]))
         else:
             charts.update(trends.render_streams(rows, groups, channel, platform,
-                                                day, known=known, watch=watch))
+                                                day, known=known, watch=watch,
+                                                location_watch=location_watch))
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

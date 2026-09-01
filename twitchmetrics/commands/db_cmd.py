@@ -358,9 +358,14 @@ def _channel_id(channel):
 def _refresh_locations(channel_id):
     """Re-file every broadcast, because a rule change rewrites history.
 
-    Only the stream trends: a rule touches no sample and no per-day aggregate,
-    so refreshing the range would redo a great deal of arithmetic to arrive at
-    the same numbers.
+    The stream trends and the location rollup that reads them, and nothing else:
+    a rule touches no sample and no per-day aggregate, so refreshing the whole
+    range would redo a great deal of arithmetic to arrive at the same numbers.
+
+    The rollup is not optional. It is keyed BY location, so a rule change moves
+    rows between its keys rather than merely changing a column -- and left alone
+    it would keep charting the old filing until the next nightly run, which is a
+    stale chart nobody would think to blame on a rule they changed by hand.
     """
     span = db.execute("""
         SELECT min(s.sampled_at AT TIME ZONE c.report_timezone)::date,
@@ -369,8 +374,13 @@ def _refresh_locations(channel_id):
          WHERE s.channel_id = %s""", (channel_id,), fetch=True)
     if not span or span[0][0] is None:
         return 0
-    return db.execute("SELECT tm.refresh_stream_trends(%s, %s, %s, NULL)",
-                      (channel_id, span[0][0], span[0][1]), fetch=True)[0][0]
+    refiled = db.execute("SELECT tm.refresh_stream_trends(%s, %s, %s, NULL)",
+                         (channel_id, span[0][0], span[0][1]), fetch=True)[0][0]
+    # After the trends, because it reads what they have just written.
+    db.execute("""
+        SELECT tm.refresh_location_watch(a.channel_id, a.platform, NULL)
+          FROM tm.platform_account a WHERE a.channel_id = %s""", (channel_id,))
+    return refiled
 
 
 def add_location_rules(channel, rules, dry_run=False):

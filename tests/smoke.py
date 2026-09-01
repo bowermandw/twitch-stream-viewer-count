@@ -1262,6 +1262,16 @@ _place = trends.render_stream_groups(
     "t", "twitch", date(2026, 8, 22), "followers", "location")
 check("the location chart puts the best place first",
       _place.index("Magic Kingdom") < _place.index("EPCOT"))
+# Kept for the watch-hours section below, which has to prove it did not change
+# this one when it added span_label and the coverage clause.
+_place_rows = [{"key": "EPCOT", "streams": 1, "total": 4, "average": 4.0,
+                "best": 4, "best_stream_id": 1},
+               {"key": "Magic Kingdom", "streams": 2, "total": 30,
+                "average": 15.0, "best": 20, "best_stream_id": 2}]
+_placebefore = trends.render_stream_groups(
+    [{"key": "EPCOT", "streams": 1, "total": 4, "average": 4.0, "best": 4,
+      "best_stream_id": 1}], "t", "twitch", date(2026, 8, 22),
+    "followers", "location")
 check("and names an unmatched title rather than dropping it",
       trends.UNKNOWN_LOCATION in _place)
 check("an empty grouping draws nothing",
@@ -1473,6 +1483,93 @@ check("and an aspect ratio, or the page cannot size the <object>",
 check("the labels say the number is an estimate",
       all("Estimated" in s3.TREND_LABELS[(k, p)]
           for k in ("watchtime", "watchrolling") for p in ("twitch", "youtube")))
+
+# --- watch hours by location ----------------------------------------------
+# The same renderer as the followers-by-location chart, fed a different metric
+# and a window that is not a window. What is worth testing is therefore not the
+# drawing -- that is already covered -- but that the metric reaches it, that the
+# subtitle stops claiming "last N", and that the three registries know the kind.
+_wplace = [{"key": "Alton Towers", "streams": 3, "total": 300.0, "average": 100.0,
+            "best": 140.0, "best_stream_id": 1, "covered": 27000, "span": 27000,
+            "coverage": 1.0},
+           {"key": "Thorpe Park", "streams": 2, "total": 80.0, "average": 40.0,
+            "best": 50.0, "best_stream_id": 2, "covered": 9000, "span": 18000,
+            "coverage": 0.5},
+           {"key": "", "streams": 1, "total": 4.25, "average": 4.25,
+            "best": 4.25, "best_stream_id": 3, "covered": 3600, "span": 3600,
+            "coverage": 1.0}]
+_wplacesvg = trends.render_stream_groups(
+    _wplace, "t", "twitch", date(2026, 8, 27), "watchtime", "location",
+    span_label="all 6 on record")
+check("the venue chart is titled in watch hours, not followers",
+      "Estimated watch hours by location" in _wplacesvg, _wplacesvg[:0])
+check("the busiest venue is leftmost",
+      _wplacesvg.index("Alton Towers") < _wplacesvg.index("Thorpe Park"))
+check("an unfiled broadcast is still named",
+      trends.UNKNOWN_LOCATION in _wplacesvg)
+# The bug this catches is the metric not reaching _fmt_mean(): followers print
+# "+100" and watch hours print "100". A signed label here means the chart is
+# drawing hours through the follower formatter.
+check("the bars are labelled in hours, not as signed counts",
+      "+100" not in _wplacesvg and trends.fmt_watch_hours(100.0) in _wplacesvg)
+check("a small figure keeps its decimal", trends.fmt_watch_hours(4.25) == "4.2")
+check("the subtitle names the all-time window",
+      "all 6 on record" in _wplacesvg and "last 6 of them" not in _wplacesvg)
+# Weighted by broadcast: 39,600 of 48,600 seconds is 81%, where averaging the
+# three venues' own shares would say 83% and quietly flatter the estimate.
+check("coverage is weighted by broadcast, not by venue",
+      "81% of broadcasts covered" in _wplacesvg, _wplacesvg[:0])
+check("and is silent when every broadcast was covered",
+      "covered" not in trends.render_stream_groups(
+          [dict(row, covered=100, span=100, coverage=1.0) for row in _wplace],
+          "t", "twitch", date(2026, 8, 27), "watchtime", "location"))
+
+# The half of span_label that protects everything already on the page: rows with
+# no coverage keys and no label must render exactly as they did before it existed.
+check("a caller that passes neither gets the old subtitle byte for byte",
+      "last 3 of them" in trends.render_stream_groups(
+          _groups + [{"key": "3", "streams": 0, "total": 0, "average": 0.0,
+                      "best": 0, "best_stream_id": 4}],
+          "t", "twitch", date(2026, 8, 22), "followers", "weekday"))
+check("and the followers-by-location chart is untouched",
+      trends.render_stream_groups(
+          [{"key": "EPCOT", "streams": 1, "total": 4, "average": 4.0, "best": 4,
+            "best_stream_id": 1}], "t", "twitch", date(2026, 8, 22),
+          "followers", "location") == _placebefore)
+
+check("render_streams draws the venue chart when it is given the rollup",
+      "watchlocation" in trends.render_streams(
+          _wstreams, {}, "t", "twitch", date(2026, 8, 27),
+          location_watch=_wplace))
+check("and leaves it out when it is not",
+      "watchlocation" not in trends.render_streams(
+          _wstreams, {}, "t", "twitch", date(2026, 8, 27)))
+# It must not collide with the followers-by-location chart: both are drawn by
+# render_stream_groups, and an equal key would mean one silently overwrote the
+# other in the dict the daily run writes to disk.
+_bothplaces = trends.render_streams(
+    _wstreams, {"location": _place_rows}, "t", "twitch", date(2026, 8, 27),
+    location_watch=_wplace)
+check("both by-location charts survive the same run",
+      {"location", "watchlocation"} <= set(_bothplaces))
+check("and they are not the same drawing",
+      _bothplaces["location"] != _bothplaces["watchlocation"])
+
+check("the venue chart is known to the publisher",
+      "watchlocation" in s3.TREND_KINDS)
+check("it has a label on every platform",
+      all(("watchlocation", p) in s3.TREND_LABELS for p in ("twitch", "youtube")))
+check("its label says the number is an estimate",
+      all("Estimated" in s3.TREND_LABELS[("watchlocation", p)]
+          for p in ("twitch", "youtube")))
+check("and an aspect ratio, or the page cannot size the <object>",
+      "watchlocation" in trends.SIZES)
+# One lowercase word, or s3.trend_key() builds a key TREND_KEY_RE will not read
+# back -- and the Trends page is rebuilt from what the bucket holds.
+check("its kind survives a round trip through the bucket key",
+      s3.trend_key("watchlocation", "twitch") ==
+      "trends/watchlocation-twitch.svg")
+check("no script anywhere", "<script" not in _wplacesvg.lower())
 
 
 # --- s3 the day page ------------------------------------------------------
@@ -2699,17 +2796,108 @@ else:
         check("an unknown grouping raises rather than returning nothing",
               "park" in _refused, _refused.splitlines()[0][:80])
 
+        # --- watch hours by venue, all-time -------------------------------
+        # 40 viewers held flat and sampled every 15 minutes, so the trapezoid
+        # collapses to viewers x live seconds and the hours are worth asserting
+        # exactly: a 2-hour broadcast is 8 gaps of 900s, 40 x 7200 / 60 = 4,800
+        # watch minutes = 80 hours. That arithmetic being checkable end to end is
+        # why this fixture holds its viewer count still.
+        _venues = {g["key"]: g for g in store.location_watch(
+            _lslug, "twitch", timezone_name=_zone_name)}
+        check("refresh_range fills the venue rollup",
+              set(_venues) == {"EPCOT", "Magic Kingdom"}, str(sorted(_venues)))
+        check("one broadcast at a venue gives that venue its hours",
+              abs(_venues["EPCOT"]["average"] - 80.0) < _TOL,
+              str(_venues["EPCOT"]["average"]))
+        check("and two are summed and averaged, not counted once",
+              _venues["Magic Kingdom"]["streams"] == 2
+              and abs(_venues["Magic Kingdom"]["total"] - 240.0) < _TOL
+              and abs(_venues["Magic Kingdom"]["average"] - 120.0) < _TOL,
+              str(_venues["Magic Kingdom"]))
+        check("the best broadcast at a venue is its longest, not its average",
+              abs(_venues["Magic Kingdom"]["best"] - 160.0) < _TOL)
+        check("hours arrive from the SQL, so a renderer cannot halve them twice",
+              abs(_venues["Magic Kingdom"]["total"]
+                  - _venues["Magic Kingdom"]["average"] * 2) < _TOL)
+        check("a fully polled venue reports full coverage",
+              _venues["EPCOT"]["coverage"] == 1.0,
+              str(_venues["EPCOT"]["coverage"]))
+        check("and carries the dates it spans",
+              _venues["Magic Kingdom"]["first_day"] == date(2026, 8, 15)
+              and _venues["Magic Kingdom"]["last_day"] == date(2026, 8, 22))
+
+        # The parity oracle. tm.stream_groups() computes the same aggregate at
+        # read time over a window, so opened wide enough to cover everything it
+        # must land on exactly what the table stored. This is what keeps the two
+        # from drifting the way 007 and 008's Python/SQL twins would have.
+        _wide = {g["key"]: g for g in store.stream_groups(
+            _lslug, "twitch", "watchtime", "location", date(2026, 8, 31),
+            count=10000, lookback=10000, timezone_name=_zone_name)}
+        check("the stored rollup matches the windowed one over the same rows",
+              set(_wide) == set(_venues) and all(
+                  _wide[k]["streams"] == _venues[k]["streams"]
+                  and abs(_wide[k]["total"] - _venues[k]["total"]) < _TOL
+                  and abs(_wide[k]["average"] - _venues[k]["average"]) < _TOL
+                  and abs(_wide[k]["best"] - _venues[k]["best"]) < _TOL
+                  for k in _wide),
+              "{} vs {}".format({k: _wide[k]["total"] for k in _wide},
+                                {k: _venues[k]["total"] for k in _venues}))
+        # And the difference that justifies the table existing at all: narrowing
+        # the window narrows the read function and must NOT touch the table.
+        check("a narrow window narrows the windowed rollup",
+              sum(g["streams"] for g in store.stream_groups(
+                  _lslug, "twitch", "watchtime", "location", date(2026, 8, 31),
+                  count=1, timezone_name=_zone_name)) == 1)
+        check("but the stored one is all-time and does not move with it",
+              sum(g["streams"] for g in store.location_watch(
+                  _lslug, "twitch", timezone_name=_zone_name)) == 3)
+
+        # The invariants the CHECKs encode, enforced by the database rather than
+        # by whoever writes the next refresh function -- the same argument
+        # report_daily_peak's dark-day CHECK is tested under above.
+        def _refuses(columns, values):
+            """True when the database rejects the row. A violated CHECK arrives
+            as db.Unreachable, the way the dark-day check above is tested."""
+            try:
+                db.execute(
+                    "INSERT INTO tm.report_location_watch (channel_id, tz, "
+                    "platform, location, streams, first_local_date, "
+                    "last_local_date{}) VALUES (%s, %s, 'twitch', 'Nowhere', {}, "
+                    "'2026-01-01', '2026-01-01'{})".format(
+                        columns, values[0], values[1]),
+                    (_lcid, _zone_name))
+            except db.Unreachable:
+                return True
+            return False
+
+        check("a venue with no broadcasts cannot be stored at all",
+              _refuses("", ("0", "")))
+        check("and half an estimate is refused, a total without an average",
+              _refuses(", watch_minutes", ("1", ", 60")))
+
         # A rule change rewrites history, so the table has to be re-filed.
         db.execute("DELETE FROM tm.stream_location_rule WHERE channel_id = %s "
                    "AND pattern = 'EPCOT'", (_lcid,))
-        db.execute("SELECT tm.refresh_stream_trends(%s, %s, %s, NULL)",
-                   (_lcid, date(2026, 8, 1), date(2026, 8, 31)))
+        from twitchmetrics.commands import db_cmd  # noqa: PLC0415 - needs a database
+        db_cmd._refresh_locations(_lcid)
         check("dropping a rule moves its broadcasts to unknown, not out",
               len(store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
                                       timezone_name=_zone_name)) == 3
               and sum(1 for r in store.stream_trends(
                   _lslug, "twitch", date(2026, 8, 31),
                   timezone_name=_zone_name) if r["location"] is None) == 1)
+        # The half a rule change would silently leave behind. The rollup is keyed
+        # BY location, so re-filing moves rows between keys -- and a stale EPCOT
+        # row would go on being charted with nothing to explain it.
+        _after = {g["key"]: g for g in store.location_watch(
+            _lslug, "twitch", timezone_name=_zone_name)}
+        check("and the venue rollup is re-filed with them",
+              set(_after) == {"", "Magic Kingdom"}, str(sorted(_after)))
+        check("the unfiled broadcast keeps its hours under the empty key",
+              abs(_after[""]["average"] - 80.0) < _TOL)
+        check("and no hours went missing in the move",
+              abs(sum(g["total"] for g in _after.values())
+                  - sum(g["total"] for g in _venues.values())) < _TOL)
     os.environ.pop("TWITCH_DATABASE_URL", None)
     db.close()
     db.reset()

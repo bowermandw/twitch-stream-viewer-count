@@ -90,7 +90,8 @@ DAY_PREFIX = "day/"
 SIZES = {"peaks": (1300, 380), "typical": (1300, 430),
          "followers": (1300, 400), "likes": (1300, 400),
          "weekday": (1300, 360), "location": (1300, 360),
-         "watchtime": (1300, 400), "watchrolling": (1300, 400)}
+         "watchtime": (1300, 400), "watchrolling": (1300, 400),
+         "watchlocation": (1300, 360)}
 
 # --- layout ---------------------------------------------------------------
 HEAD_H = 118            # shorter than chart.HEADER_H: no in-stream tiles to fit
@@ -638,18 +639,23 @@ def fmt_watch_hours(hours):
     return "{:.1f}".format(hours) if abs(hours) < 10 else fmt_count(hours)
 
 
-def _coverage_note(entry):
+def _coverage_note(entry, noun="the broadcast"):
     """' · 91% of the broadcast covered', or '' when all of it was.
 
     Silent at 100%, which is the ordinary case. A qualifier printed on every
     chart teaches the eye to skip it, and this one has to still be legible on
     the chart where a poller died mid-stream and the bar is short for a reason
     that has nothing to do with the audience.
+
+    `noun` is what was covered, because the same ratio describes one broadcast on
+    the per-stream chart and a whole venue's worth of them on the location one.
+    A parameter rather than a second function: the 0.995 threshold is the part
+    worth having in exactly one place.
     """
     share = entry.get("coverage")
     if share is None or share >= 0.995:
         return ""
-    return " · {:.0f}% of the broadcast covered".format(share * 100)
+    return " · {:.0f}% of {} covered".format(share * 100, noun)
 
 
 def _fmt_value(metric, value):
@@ -872,7 +878,7 @@ def render_stream_bars(entries, channel, platform, day, metric,
 
 def render_stream_groups(groups, channel, platform, day, metric, grouping,
                          width=SIZES["weekday"][0], height=SIZES["weekday"][1],
-                         count=STREAM_COUNT):
+                         count=STREAM_COUNT, span_label=None):
     """Average per broadcast, grouped by weekday or by location.
 
     `groups` is store.stream_groups()' list and is SPARSE -- a weekday nobody
@@ -883,6 +889,17 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
     A group with no broadcasts is drawn as a dash rather than a zero bar, for
     the reason a day off is on the peaks chart: nothing happened is not the
     same reading as nothing was gained.
+
+    `span_label` names the window in the subtitle, for the caller whose rows did
+    not come from a "last N broadcasts" query -- store.location_watch() is
+    all-time, and "last 41 of them" would be a plain untruth about it. Default
+    None keeps the existing wording byte for byte, which is what lets the two
+    charts that already use this go on being compared against their fixtures.
+
+    Coverage, when the rows carry it, is appended to the subtitle rather than
+    printed per bar: a venue's bars are already labelled, and the one thing a
+    reader needs before trusting the height of all of them is what share of the
+    broadcasts behind them a poller actually saw.
     """
     if not groups:
         return None
@@ -915,10 +932,18 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
         return bottom - ((value - low_value) / span) * (bottom - top)
 
     streams = sum(row["streams"] for row in drawn)
+    # Weighted by broadcast rather than averaged over the groups: a venue with
+    # thirty streams and one with two should not have equal say in the caveat.
+    covered = sum(row.get("covered") or 0 for row in drawn)
+    spanned = sum(row.get("span") or 0 for row in drawn)
     out = _open_svg(width, height,
                     shape["title"].format(words["title"].replace(" per stream", "")),
-                    "{} · {} · average per broadcast, last {} of them".format(
-                        channel, spec["label"], streams))
+                    "{} · {} · average per broadcast, {}{}".format(
+                        channel, spec["label"],
+                        span_label or "last {} of them".format(streams),
+                        _coverage_note({"coverage": covered / float(spanned)
+                                        if spanned else None},
+                                       noun="broadcasts")))
 
     best = max(drawn, key=lambda row: row["average"])
     best_label = dict(axis).get(best["key"], best["key"] or UNKNOWN_LOCATION)
@@ -1165,8 +1190,10 @@ def render_from(peaks, slots, per_day, channel, platform, day,
     return charts
 
 
-def render_streams(rows, groups, channel, platform, day, known=None, watch=()):
-    """The per-broadcast charts: {"followers", "likes", "weekday", "location"}.
+def render_streams(rows, groups, channel, platform, day, known=None, watch=(),
+                   location_watch=()):
+    """The per-broadcast charts: {"followers", "likes", "weekday", "location",
+    "watchtime", "watchrolling", "watchlocation"}.
 
     Any key may be absent, and on a normal channel most of them are: `rows` is
     one platform's broadcasts, so the followers chart draws for Twitch and the
@@ -1182,6 +1209,12 @@ def render_streams(rows, groups, channel, platform, day, known=None, watch=()):
     `watch` is store.watch_totals()' list, and adds the trailing-total chart when
     it is passed. Optional because it comes from a different query than `rows`
     and a caller that could not run it should still get the rest.
+
+    `location_watch` is store.location_watch()' list and adds the watch-hours-by-
+    venue chart, optional for the same reason. It draws through the same renderer
+    as the followers-by-location chart, with the metric and the window being the
+    only difference -- which is what STREAM_METRICS and GROUPINGS being data
+    rather than renderers buys.
 
     Deliberately not folded into render_from(). That function's signature is
     load-bearing -- the parity harness drives the Python and SQL aggregate
@@ -1209,4 +1242,14 @@ def render_streams(rows, groups, channel, platform, day, known=None, watch=()):
             target=YPP_TARGET_HOURS if platform == "youtube" else None)
         if drawn:
             charts["watchrolling"] = drawn
+    if location_watch:
+        # All-time, so it says so: this is the one chart on the page whose window
+        # is not a flag, and a subtitle claiming "last N" would be wrong.
+        drawn = render_stream_groups(
+            location_watch, channel, platform, day, "watchtime", "location",
+            width=SIZES["watchlocation"][0], height=SIZES["watchlocation"][1],
+            span_label="all {} on record".format(
+                sum(row["streams"] for row in location_watch)))
+        if drawn:
+            charts["watchlocation"] = drawn
     return charts

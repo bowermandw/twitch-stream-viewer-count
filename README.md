@@ -149,7 +149,8 @@ installed, and a database that will not answer.
 kind of staleness. `store.ensure_reports()` judges a window by how many **dates**
 `tm.report_daily_peak` holds — so a schema change that adds a **column** leaves
 every one of those dates present and every new column `NULL`, and the refresh
-would touch only the tail of the window for ever. It is idempotent and takes a
+would touch only the tail of the window for ever. A new **table** is the same
+blind spot, only total: nothing it probes would ever mention one. It is idempotent and takes a
 fraction of a second per channel, so the answer to "are the report tables right?"
 is to run it rather than to reason about it. `--dry-run` prints the spans it
 would recompute and writes nothing.
@@ -756,6 +757,9 @@ answer *which park*.
 - **Peak likes per stream**, YouTube, the same ten.
 - **Estimated watch hours per stream**, both platforms — see
   [Estimated watch time](#estimated-watch-time).
+- **Estimated watch hours by location**, both platforms — every broadcast on
+  record averaged per venue, which is the one chart here whose window is not
+  `--stream-count`. See [Estimated watch time](#estimated-watch-time).
 - **Followers by day of week**, and **by location** — the same broadcasts
   averaged, which is the pair that answers "when is it worth going out".
 
@@ -829,18 +833,34 @@ A trapezoid rather than "viewers × the poll interval", because the interval is
 not a guarantee — a restart, a slow API call and a spooled backfill all make
 gaps of their own, and the trapezoid is right for any of them.
 
-It appears in four places:
+It appears in five places:
 
 - a **headline tile** on every per-day graph, and a line in `graph`'s summary;
 - **estimated watch hours per stream**, one bar per broadcast, both platforms;
 - **estimated watch hours, trailing 365 days**, a rolling total per day;
-- `tm.report_stream_trend.watch_minutes` and `tm.report_daily_peak.watch_minutes`,
-  if you would rather query it than look at it.
+- **estimated watch hours by location**, all-time, averaged per broadcast at each
+  venue — the answer to "which of these places is worth going back to";
+- `tm.report_stream_trend.watch_minutes`, `tm.report_daily_peak.watch_minutes`
+  and `tm.report_location_watch`, if you would rather query it than look at it.
+
+The venue chart is **all-time**, and alone among the per-broadcast charts it
+ignores `--stream-count` and `--lookback`. `007_stream_trends.sql` rolled weekday
+and location up with a read function precisely *because* a stored rollup keyed
+without N would be wrong the first time somebody changed N — and this table
+answers that by having no N at all. A venue's worth accumulates over years; the
+last ten broadcasts tell you where the channel has been lately, which is the
+question the followers-by-location chart already answers. Both charts are on the
+page, drawn by the same renderer from two different windows.
 
 #### What it is not
 
 Three limits, all structural, and named here because a figure like this gets
-quoted.
+quoted. A fourth belongs to the by-location chart specifically: **the average is
+over broadcasts that have an estimate.** A broadcast nobody's viewer count was
+sampled during is absent from it rather than counted as a zero — so a venue whose
+early streams predate viewer sampling reads on its later ones, and reads *high*
+rather than low. The bar's tooltip gives the number of broadcasts behind it, and
+the chart's subtitle gives the share of them a running poller actually saw.
 
 **It is live only.** Watch time accumulated on the archived broadcast after the
 stream ends is invisible to a poller sampling `concurrentViewers`, and on a

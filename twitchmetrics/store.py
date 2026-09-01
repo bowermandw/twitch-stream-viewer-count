@@ -999,6 +999,61 @@ def watch_totals(channel, platform, day, days=trends.WATCH_DAYS,
     return out
 
 
+LOCATION_WATCH_SQL = """
+SELECT group_key, streams, total, average, best, best_stream_id,
+       covered_seconds, span_seconds, first_local_date, last_local_date
+  FROM tm.location_watch(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s)
+ ORDER BY group_key
+"""
+
+
+def location_watch(channel, platform, timezone_name=None):
+    """Estimated watch hours per location, over every broadcast on record.
+
+    [{"key", "streams", "total", "average", "best", "best_stream_id",
+      "covered", "span", "coverage", "first_day", "last_day"}, ...]
+
+    The first six keys are stream_groups()' six, so trends.render_stream_groups()
+    draws this and the followers-by-location chart with the same code. Hours, like
+    stream_groups() with metric="watchtime" -- converted in the SQL so the
+    renderers cannot each remember it differently.
+
+    ALL-TIME, and that is the whole reason this exists rather than another
+    stream_groups() call: that function is windowed by "the last N broadcasts",
+    and a venue's worth is not. 009_location_watch.sql argues it at length.
+
+    Sparse, like stream_groups(): a location with no estimable broadcast has no
+    row. An unmatched location arrives as "" and is left that way -- the renderer
+    owns the word shown for it.
+
+    "coverage" is covered/span, the share of these broadcasts a running poller
+    actually saw, or None when nothing recorded it. trends._coverage_note() turns
+    it into the caveat on the chart, and None prints nothing rather than 0%.
+    """
+    rows = db.execute(LOCATION_WATCH_SQL,
+                      (config.channel_slug(channel), platform,
+                       timezone_name or config.resolve_db_timezone()), fetch=True)
+    # float, not Decimal, for stream_groups()' reason: nice_axis() divides by 4.0
+    # and Decimal / float raises rather than coercing.
+    out = []
+    for (key, streams, total, average, best, best_stream_id,
+         covered, span, first_day, last_day) in rows:
+        out.append({
+            "key": key, "streams": int(streams),
+            "total": float(total) if total is not None else 0.0,
+            "average": float(average),
+            "best": float(best) if best is not None else None,
+            "best_stream_id": best_stream_id,
+            "covered": int(covered) if covered is not None else None,
+            "span": int(span) if span is not None else None,
+            "coverage": (float(covered) / float(span)
+                         if covered is not None and span else None),
+            "first_day": first_day, "last_day": last_day,
+        })
+    return out
+
+
 COVERAGE_SQL = """
 SELECT c.channel_id,
        (SELECT count(DISTINCT p.local_date)
