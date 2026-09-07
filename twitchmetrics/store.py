@@ -836,6 +836,43 @@ def compare_slots(channel, platform, day, days=trends.COMPARE_DAYS,
 # check to hold them to, and none is missing: the SQL is tested directly.
 
 
+def _stream_row(row):
+    """One broadcast, as both stream_trends() and location_streams() return it.
+
+    Shared rather than duplicated because the two queries return the identical
+    column list on purpose -- tm.location_streams() is tm.stream_trends() with a
+    venue predicate inside the LIMIT -- and trends.render_stream_bars() draws
+    either without knowing which it was handed. Two copies of this would be two
+    chances for a location chart to disagree with the channel-wide one about what
+    "watchtime" means.
+
+    float, not Decimal: nice_axis() divides by 4.0 and every renderer divides by
+    the top value, and Decimal / float raises rather than coercing.
+    """
+    return {"stream_id": row[0], "day": row[1],
+            "started": row[2].astimezone(timezone.utc) if row[2] else None,
+            "weekday": int(row[3]), "title": row[4], "location": row[5],
+            "followers": row[6], "likes": row[7], "peak": row[8],
+            "watch_minutes": float(row[9]) if row[9] is not None else None,
+            "watchtime": float(row[9]) / 60.0 if row[9] is not None else None,
+            "covered": row[10], "span": row[11],
+            "coverage": (float(row[10]) / row[11]
+                         if row[10] is not None and row[11] else None)}
+
+
+def _group_row(row):
+    """One rolled-up group, as stream_groups() and location_groups() return it.
+
+    Six columns, which is the contract 009 established so that one renderer can
+    draw every by-group chart on the site. float for _stream_row()'s reason.
+    """
+    return {"key": row[0], "streams": int(row[1]),
+            "total": float(row[2]) if row[2] is not None else 0.0,
+            "average": float(row[3]),
+            "best": float(row[4]) if row[4] is not None else None,
+            "best_stream_id": row[5]}
+
+
 STREAM_TRENDS_SQL = """
 SELECT stream_id, local_date, started_at, weekday, title, location,
        follower_delta, likes_peak, peak_viewers,
@@ -843,14 +880,16 @@ SELECT stream_id, local_date, started_at, weekday, title, location,
   FROM tm.stream_trends(
       (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
       -- ::integer for DAILY_PEAKS_SQL's reason: psycopg sends a small Python
-      -- int as int2, and overload resolution will not widen it.
-      %s::integer, %s::integer, %s)
+      -- int as int2, and overload resolution will not widen it. A None goes
+      -- through as a typed NULL, which is how "unbounded" is spelled.
+      %s::integer, %s::integer, %s, %s)
  ORDER BY started_at
 """
 
 
 def stream_trends(channel, platform, day, count=trends.STREAM_COUNT,
-                  lookback=trends.LOOKBACK_DAYS, timezone_name=None):
+                  lookback=trends.LOOKBACK_DAYS, timezone_name=None,
+                  location=None):
     """The last `count` broadcasts on or before `day`, oldest first.
 
     [{"stream_id", "day", "started", "weekday", "title", "location",
@@ -873,75 +912,82 @@ def stream_trends(channel, platform, day, count=trends.STREAM_COUNT,
     time only -- see 008_watchtime.sql for what it cannot be used for -- and
     "coverage" is the share of the broadcast that was actually integrated, which
     is what keeps a low figure from an outage readable as one.
+
+    `location` filters to one venue. None is every venue -- what every caller
+    meant before there were location pages -- and "" is the venue that is no
+    venue, the broadcasts whose title matched no rule. Those are different
+    questions and both are askable; "" is the spelling stream_groups() and
+    location_watch() already hand back for the unmatched ones.
+
+    THE FILTER IS APPLIED BEFORE THE LIMIT, in the SQL. Filtering these rows
+    afterwards would keep whichever of the channel's last ten happened to be at
+    the venue -- three bars, or none -- and label it "the last ten at Epcot".
+
+    `count=None` and `lookback=None` mean unbounded, which is what the
+    venue-history chart wants: "is this place getting better or worse" is a
+    question about the whole record. Passing a huge number instead would state a
+    window this does not mean, and has a cliff in it -- the date arithmetic
+    overflows long before an int does.
     """
-    if count <= 0:
+    if count is not None and count <= 0:
         # The SQL clamps with greatest(0, p_streams) and would agree, but the
         # guard keeps `--stream-count 0` from making a round trip to say so.
         return []
     rows = db.execute(STREAM_TRENDS_SQL,
                       (config.channel_slug(channel), platform, day,
-                       max(1, int(count)), max(1, int(lookback)),
-                       timezone_name or config.resolve_db_timezone()), fetch=True)
-    # float, not Decimal, for stream_groups()' reason: nice_axis() divides by
-    # 4.0 and every renderer divides by the top value, and Decimal / float
-    # raises rather than coercing.
-    return [{"stream_id": row[0], "day": row[1],
-             "started": row[2].astimezone(timezone.utc) if row[2] else None,
-             "weekday": int(row[3]), "title": row[4], "location": row[5],
-             "followers": row[6], "likes": row[7], "peak": row[8],
-             "watch_minutes": float(row[9]) if row[9] is not None else None,
-             "watchtime": float(row[9]) / 60.0 if row[9] is not None else None,
-             "covered": row[10], "span": row[11],
-             "coverage": (float(row[10]) / row[11]
-                          if row[10] is not None and row[11] else None)}
-            for row in rows]
+                       None if count is None else max(1, int(count)),
+                       None if lookback is None else max(1, int(lookback)),
+                       timezone_name or config.resolve_db_timezone(),
+                       location), fetch=True)
+    return [_stream_row(row) for row in rows]
 
 
 STREAM_GROUPS_SQL = """
 SELECT group_key, streams, total, average, best, best_stream_id
   FROM tm.stream_groups(
       (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s, %s, %s,
-      %s::integer, %s::integer, %s)
+      %s::integer, %s::integer, %s, %s)
  ORDER BY group_key
 """
 
 
 def stream_groups(channel, platform, metric, grouping, day,
                   count=trends.STREAM_COUNT, lookback=trends.LOOKBACK_DAYS,
-                  timezone_name=None):
+                  timezone_name=None, location=None):
     """One row per weekday or per location over the same window, sparse.
 
     [{"key", "streams", "total", "average", "best", "best_stream_id"}, ...]
 
     `grouping` is "weekday" or "location"; the SQL raises on anything else
     rather than returning nothing, which would read as a channel that gained no
-    followers. `metric` is "followers", "likes" or "watchtime" -- and watchtime
-    arrives in HOURS, converted in the SQL so the three renderers cannot each
-    remember it differently.
+    followers. `metric` is "followers", "likes", "watchtime" or "peak" -- and
+    watchtime arrives in HOURS, converted in the SQL so the renderers cannot
+    each remember it differently.
 
     Sparse on purpose, like compare_slots(): a weekday nobody streamed on has no
     row at all. The renderer builds the Mon..Sun axis and fills it from this.
 
     An unmatched location arrives as "" and is left that way -- the renderer
     owns the word shown for it, so there is one place that decides.
+
+    `location` restricts the window to one venue, and is stream_trends()'
+    argument forwarded rather than a second implementation -- this function is
+    built ON that one, so a weekday rollup scoped to a venue summarises exactly
+    the broadcasts that venue's own bars draw and cannot drift from them.
     """
-    if count <= 0:
+    if count is not None and count <= 0:
         return []
     rows = db.execute(STREAM_GROUPS_SQL,
                       (config.channel_slug(channel), platform, metric, grouping,
-                       day, max(1, int(count)), max(1, int(lookback)),
-                       timezone_name or config.resolve_db_timezone()), fetch=True)
-    # float, not Decimal: nice_axis() divides by 4.0 and the renderers divide by
-    # the top value, and Decimal / float raises rather than coercing.
-    # "total" and "best" are numeric now rather than integers: watchtime is
-    # fractional, and one shape for all three metrics beats a cast that depends
-    # on which was asked for.
-    return [{"key": row[0], "streams": int(row[1]),
-             "total": float(row[2]) if row[2] is not None else 0.0,
-             "average": float(row[3]),
-             "best": float(row[4]) if row[4] is not None else None,
-             "best_stream_id": row[5]}
-            for row in rows]
+                       day,
+                       None if count is None else max(1, int(count)),
+                       None if lookback is None else max(1, int(lookback)),
+                       timezone_name or config.resolve_db_timezone(),
+                       location), fetch=True)
+    # "total" and "best" are numeric rather than integers: watchtime is
+    # fractional, and one shape for all four metrics beats a cast that depends
+    # on which was asked for. _group_row() has the rest of the reasoning.
+    return [_group_row(row) for row in rows]
 
 
 # --------------------------------------------------------------------------
@@ -1052,6 +1098,81 @@ def location_watch(channel, platform, timezone_name=None):
             "first_day": first_day, "last_day": last_day,
         })
     return out
+
+
+# --------------------------------------------------------------------------
+# one venue at a time
+# --------------------------------------------------------------------------
+#
+# The reads above compare the channel to itself. These support comparing ONE
+# VENUE to its own history, which the by-location charts cannot: they draw a mean
+# per venue, and a mean is exactly what the peaks chart refuses to draw for days.
+#
+# There are only two functions here, and that is the point. The venue filter
+# itself lives on stream_trends() and stream_groups() as an argument, because
+# stream_groups() is built on stream_trends() and a filter at the bottom of the
+# stack cannot disagree with the rollups above it. 010_location_trends.sql argues
+# it at length.
+
+
+def location_history(channel, platform, location, day, count=None,
+                     lookback=None, timezone_name=None):
+    """Every broadcast at one venue, oldest first -- the venue's whole record.
+
+    stream_trends() with the window taken off, given a name of its own so the
+    caller states which question it asked. The two windows draw different charts
+    and want different headings: "last 10 broadcast(s)" against "all 41 on
+    record", and a renderer cannot tell which it was handed.
+
+    `count` caps the axis for a venue with years of history -- see
+    trends.LABEL_LIMIT for why an unbounded axis is a legibility problem before
+    it is a performance one. None means every broadcast on record.
+
+    "On record" is doing real work in that phrase: this reads
+    tm.report_stream_trend, so it shows what the report tables hold rather than
+    everything that ever happened. A channel imported before 007 has whatever
+    `db --rebuild` refreshed. The chart says "on record" for that reason.
+    """
+    return stream_trends(channel, platform, day, count=count, lookback=lookback,
+                         timezone_name=timezone_name, location=location or "")
+
+
+STREAM_LOCATIONS_SQL = """
+SELECT location, streams, first_local_date, last_local_date, platforms
+  FROM tm.stream_locations(
+      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s)
+"""
+
+
+def stream_locations(channel, timezone_name=None):
+    """Every location the channel has streamed from, busiest first.
+
+    [{"key", "name", "streams", "first_day", "last_day", "platforms"}, ...]
+
+    ACROSS BOTH PLATFORMS, unlike every other read here. Those take a platform
+    because they draw a chart and a chart is per-platform; this answers "which
+    pages does this channel need", and a venue visited only on YouTube needs one
+    exactly as much as a venue visited on both. Taking a platform would give the
+    site two different pickers. "platforms" says which it was streamed on, so a
+    caller can still skip a panel that would be empty.
+
+    "key" is the venue as the database spells it, "" for the broadcasts no rule
+    matched. "name" is the same thing with trends.UNKNOWN_LOCATION substituted
+    for "", so a caller building a picker does not have to know the convention.
+
+    Ordering is the SQL's, and it is deliberately NOT the charts' ordering: this
+    counts broadcasts where every chart axis sorts by the average of whichever
+    metric it draws. One picker serving every panel cannot follow a per-panel
+    order, and one that reshuffled itself when the reader changed charts would be
+    worse than useless.
+    """
+    rows = db.execute(STREAM_LOCATIONS_SQL,
+                      (config.channel_slug(channel),
+                       timezone_name or config.resolve_db_timezone()), fetch=True)
+    return [{"key": row[0], "name": row[0] or trends.UNKNOWN_LOCATION,
+             "streams": int(row[1]), "first_day": row[2], "last_day": row[3],
+             "platforms": list(row[4] or ())}
+            for row in rows]
 
 
 COVERAGE_SQL = """

@@ -104,6 +104,14 @@ def add_arguments(parser):
                         help="days the trailing watch-time total sums over "
                              "(default {}, a twelve-month window)".format(
                                  trends.ROLLING_DAYS))
+    parser.add_argument("--no-locations", action="store_true",
+                        help="skip the per-location pages and their charts "
+                             "(already implied by --no-trends)")
+    parser.add_argument("--location-history", type=int,
+                        default=trends.LOCATION_HISTORY, metavar="N",
+                        help="broadcasts on a venue's whole-history chart "
+                             "(default {}, 0 for every one on record)".format(
+                                 trends.LOCATION_HISTORY))
     parser.add_argument("--calendar-days", action="store_true",
                         help="count calendar days rather than days with a stream, "
                              "so a day off takes a slot and draws a dash")
@@ -347,7 +355,7 @@ def render_cross_platform(channel, day, live_points):
     return out
 
 
-def render_trend_charts(channel, day, args, known=None):
+def render_trend_charts(channel, day, args, known=None, known_locations=None):
     """The multi-day charts for every platform with history; [(kind, platform, path)].
 
     Reads the window out of the report tables rather than re-deriving it from
@@ -414,6 +422,13 @@ def render_trend_charts(channel, day, args, known=None):
                           channel, platform, "followers", grouping, day,
                           args.stream_count, lookback=args.lookback)
                       for grouping in trends.GROUPINGS}
+            # Peak viewers by venue, over the same window as the followers
+            # rollup beside it. Its own key rather than a fourth GROUPINGS
+            # entry, because "location" is a grouping and this is a second
+            # metric along it.
+            groups["peaklocation"] = store.stream_groups(
+                channel, platform, "peak", "location", day,
+                args.stream_count, lookback=args.lookback)
             # A window of DAYS, not of broadcasts, and a different query for
             # that reason: the trailing total moves on days nobody streamed as
             # older days drop out of the back of it, so a broadcast axis has no
@@ -428,9 +443,9 @@ def render_trend_charts(channel, day, args, known=None):
             log("WARN     {} {} — no per-stream charts: {}".format(
                 channel, platform, str(exc).splitlines()[0]))
         else:
-            charts.update(trends.render_streams(rows, groups, channel, platform,
-                                                day, known=known, watch=watch,
-                                                location_watch=location_watch))
+            charts.update(trends.render_streams(
+                rows, groups, channel, platform, day, known=known, watch=watch,
+                location_watch=location_watch, known_locations=known_locations))
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))
             os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -440,6 +455,79 @@ def render_trend_charts(channel, day, args, known=None):
                                                os.path.getsize(out) // 1024,
                                                os.path.basename(out)))
             made.append((kind, platform, out))
+    return made
+
+
+def render_location_charts(channel, day, args, known=None, known_locations=None):
+    """[(slug, name, streams, kind, platform, path)] for every venue on record.
+
+    `streams` rides along so the publisher can write the picker's counts without
+    running the venue query a second time -- it is what orders the picker, and
+    the two must not be able to disagree about it.
+
+    Its own function rather than a branch inside render_trend_charts(), so a
+    venue whose charts will not build cannot take the Trends page down with it
+    -- the same courtesy that function already extends to a platform whose
+    per-stream charts failed while its siblings drew.
+
+    A channel with no location rules lists no venues and returns [] without a
+    WARN. That is not a failure; it is a channel nobody has run
+    `db --location-rule` for yet, and an unpolled platform already falls out of
+    render_trend_charts() the same silent way.
+    """
+    from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
+
+    try:
+        places = store.stream_locations(channel)
+    except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+        log("WARN     {} — no location charts: {}".format(
+            channel, str(exc).splitlines()[0]))
+        return []
+    if not places:
+        return []
+
+    # 0 means every broadcast on record; store reads None as "no window".
+    history_count = args.location_history or None
+    ordered = s3.picker_order(places)
+    # picker_order() returns (slug, display name, count); the reads below want
+    # the venue as the DATABASE spells it, which is "" for the unmatched ones
+    # where the display name is "Unknown". Zipping the two here means exactly one
+    # place knows both spellings.
+    by_name = {place["name"]: place["key"] for place in places}
+
+    made = []
+    for slug, name, streams in ordered:
+        where = by_name.get(name, name)
+        for platform in PLATFORMS:
+            try:
+                rows = store.stream_trends(
+                    channel, platform, day, args.stream_count,
+                    lookback=args.lookback, location=where)
+                history = store.location_history(
+                    channel, platform, where, day, count=history_count)
+                weekday = store.stream_groups(
+                    channel, platform, "peak", "weekday", day,
+                    args.stream_count, lookback=args.lookback, location=where)
+                # No location filter: this is the chart that puts the venue
+                # among the others, so it has to see the others.
+                compare = store.stream_groups(
+                    channel, platform, "peak", "location", day,
+                    args.stream_count, lookback=args.lookback)
+            except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+                log("WARN     {} {} {} — no venue charts: {}".format(
+                    channel, slug, platform, str(exc).splitlines()[0]))
+                continue
+            charts = trends.render_location(
+                rows, history, weekday, compare, channel, platform, day,
+                where, label=name, known=known,
+                known_locations=known_locations)
+            for kind, svg in charts.items():
+                out = config.chart_path(
+                    channel, "_loc_{}_{}_{}".format(slug, kind, platform))
+                os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+                with open(out, "w", encoding="utf-8") as handle:
+                    handle.write(svg)
+                made.append((slug, name, streams, kind, platform, out))
     return made
 
 
@@ -469,6 +557,43 @@ def warn_exit(channel, exc):
     log("WARN     {} — {}".format(channel, lines[0]))
     for line in lines[1:]:
         log("WARN     {}   {}".format(channel, line))
+
+
+def _publish_locations(channel, day, work):
+    """Upload the venue charts and rebuild every venue page; True if any exist.
+
+    Failure is logged and swallowed, for _publish_trends()' reason: today's page
+    is what the run exists to produce, and a venue chart that would not build
+    must neither stop it nor turn a good run red.
+
+    Runs BEFORE _publish_trends() for the reason publish_index() runs
+    publish_days() before the index: the Trends page is about to draw bars that
+    link here, and the pages they point at should already resolve.
+    """
+    from .. import s3  # noqa: PLC0415 - lazy on purpose; see the module comment
+
+    try:
+        if not work:
+            # Nothing new to upload, but an earlier run's pages may still be
+            # there and the picker's links should keep working.
+            return bool(s3.list_location_pages(channel))
+        places = []
+        for slug, name, streams, kind, platform, path in work:
+            s3.upload_location_chart(channel, path, slug, kind, platform)
+            if (slug, name, streams) not in places:
+                # Order preserved from render_location_charts(), which is
+                # picker_order()'s -- so the manifest it writes IS the picker.
+                places.append((slug, name, streams))
+        written = s3.publish_locations(channel, day, places)
+        log("{}  {} location page(s) rebuilt from {} chart(s)".format(
+            channel, written, len(work)))
+        return written > 0
+    except SystemExit as exc:
+        warn_exit(channel, exc)
+        return False
+    except Exception as exc:  # noqa: BLE001 - the day's page still has to go out
+        log("WARN     {} — locations not published: {}".format(channel, exc))
+        return False
 
 
 def _publish_trends(channel, day, charts):
@@ -581,12 +706,42 @@ def report_channel(channel, day, args):
             log("WARN     {} — day pages not listed, linking every bar: {}".format(
                 channel, exc))
 
+    # What the by-location bars are allowed to link to. Taken from the database
+    # rather than from a bucket listing, because unlike a day page -- which may
+    # remember a date from before this bucket existed -- every venue on record
+    # gets a page in this same run, a few lines below.
+    #
+    # None means LINK NOTHING, which is the opposite of `known`'s None above.
+    # The asymmetry is deliberate: a day page can be inferred to exist from the
+    # date having data, and a venue page cannot, so the safe default differs.
+    known_locations = None
+    # NOT gated on --no-upload, unlike `known` above. That flag means "render
+    # but do not publish", and it exists so the charts can be looked at before
+    # they go out -- so it has to render these too. `known_locations` comes from
+    # the database rather than from a bucket listing, so there is nothing to
+    # stop it working with no credentials at all.
+    skip_locations = args.no_trends or args.no_locations
+    if not skip_locations:
+        try:
+            known_locations = {slug for slug, _, _ in s3.picker_order(
+                store.stream_locations(channel))}
+        except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
+            log("WARN     {} — venues not listed, drawing plain bars: {}".format(
+                channel, str(exc).splitlines()[0]))
+        except Exception as exc:  # noqa: BLE001 - unlinked bars beat no charts
+            log("WARN     {} — venues not listed, drawing plain bars: {}".format(
+                channel, exc))
+
     trend_charts = ([] if args.no_trends else
-                    render_trend_charts(channel, day, args, known=known))
+                    render_trend_charts(channel, day, args, known=known,
+                                        known_locations=known_locations))
+    location_charts = ([] if skip_locations else
+                       render_location_charts(channel, day, args, known=known,
+                                              known_locations=known_locations))
 
     if args.no_upload:
         log("{}  {} chart(s) rendered, not published".format(
-            channel, len(rendered) + len(trend_charts)))
+            channel, len(rendered) + len(trend_charts) + len(location_charts)))
         return "failed" if "failed" in outcomes else "rendered"
 
     try:
@@ -596,6 +751,8 @@ def report_channel(channel, day, args):
         # Ahead of the index, and swallowing its own errors: the index needs to
         # know whether there is a Trends page to link to, and must go out either
         # way.
+        # Ahead of the Trends page, whose by-location bars link to these.
+        _publish_locations(channel, day, location_charts)
         has_trends = _publish_trends(channel, day, trend_charts)
         page = s3.publish_index(channel, day, titles, trends=has_trends)
     except SystemExit as exc:

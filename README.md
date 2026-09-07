@@ -674,6 +674,9 @@ trends/followers-twitch.svg  per broadcast, not per day
 trends/likes-youtube.svg
 trends/weekday-twitch.svg
 trends/location-twitch.svg
+location/magic-kingdom.html  one venue, rebuilt every run
+location/magic-kingdom-peakstream-twitch.svg
+locations.json               which venues have a page, and what to call them
 ```
 
 ### Day pages
@@ -810,6 +813,126 @@ would be no symptom at all.
 the only way to notice that a reworded title has quietly stopped matching.
 Changing a rule rewrites history, so both commands re-file every broadcast
 before they return.
+
+### Location Trends
+
+Everything above draws **one bar per venue**, and a bar is a mean. That is the
+same trade the peaks chart refuses for days — five bars rather than a five-day
+average, because "an average hides its own spread; one freak evening drags
+normal up and nothing on the chart says so" — and until now there was no way to
+look underneath it. Clicking Magic Kingdom did nothing, because there was
+nothing to click.
+
+Every venue now gets a page of its own:
+
+```
+location/magic-kingdom.html              the page
+location/magic-kingdom-peakstream-twitch.svg
+location/magic-kingdom-history-twitch.svg
+locations.json                           slug -> name and broadcast count
+```
+
+**The by-location bars on the Trends page are links into it**, exactly as the
+peaks bars link to day pages, with the same rule: a bar is a link only when the
+bucket actually holds that page, so a venue that never published stays plain
+rather than becoming a 404.
+
+Per venue, per platform, each renderer selecting itself by drawing nothing when
+the metric is absent:
+
+- **Peak viewers**, **followers gained**, **peak likes** and **estimated watch
+  hours** per broadcast — the last `--stream-count` visits *to that venue*.
+- **Estimated watch hours, every stream here** — the venue's whole record, one
+  bar per visit, so a place that is fading or improving shows as a slope rather
+  than as a single all-time average.
+- **Peak viewers by day of week, here.** The channel-wide weekday chart asks
+  "when is it worth going out"; at one venue the question is "when is this place
+  busy", and a channel at one park on weekends and another on weeknights has a
+  channel-wide chart describing its diary rather than either place.
+- **Peak viewers here against every location** — every venue's bar, this one lit
+  and the rest dimmed, with the channel's own average across all of them drawn
+  as a dashed reference line. A bar on its own cannot say whether it is good.
+
+That last one is why the comparison is not a two-bar "here vs elsewhere" chart.
+Putting the venue among the others answers *am I above my own average* **and**
+*which place should I go to instead*, and the second is the actionable half.
+The line is **weighted by broadcast**, not averaged over the venues: a park with
+thirty visits and one with two must not have equal say in where it sits.
+
+Brightness and outline mean different things and are both kept. Brightness says
+**which venue you are reading**; the outline still says **which venue won**. A
+venue that is both reads as both, where recolouring would have collapsed two
+questions into one mark.
+
+#### The picker
+
+A row of links across the top of every venue page, **busiest first, with each
+venue's broadcast count under it** — so the row ranks as well as navigates, and
+a reader sees where the channel actually spends its time before clicking
+anything. The venue being read is marked by weight and a rule rather than being
+a link to itself.
+
+"Busiest" here counts **broadcasts**, deliberately not the average of whichever
+metric a panel happens to draw. One picker serves every panel on the page, and
+one that reshuffled itself when the reader looked at a different chart would be
+worse than useless.
+
+**Unknown is always last**, however many broadcasts it has. It is not a venue,
+it is a to-do — a title has drifted out of its rule — and a picker leading with
+it would be a page claiming the channel's most valuable place is a bug.
+
+There is **no JavaScript**, here or anywhere else on the site. The picker is
+plain `<a>`s to sibling static pages, which is the same shape the day pages
+already are, and it is why every venue has an address you can send someone.
+
+#### Slugs, and the manifest
+
+A venue's name comes out of a stream title, so the page needs a path-safe slug:
+`Hollywood Studios` becomes `hollywood-studios`, and the unmatched broadcasts
+become `unknown`.
+
+Slugging is **lossy** — "EPCOT", "Epcot" and "epcot" are one slug — so the whole
+set is decided at once and, when two names collide, **every member of the clash
+is suffixed** rather than just the loser. Suffixing only the loser would leave
+the bare slug owned by whoever sorted first, so a third venue arriving tomorrow
+could take it and move the other two; a moved slug is a page that quietly
+changes address. `unknown` is reserved, so a venue actually called "Unknown"
+cannot take the to-do list's page.
+
+It is also **not reversible** — `dhs` could be "DHS" or "Dhs" — which is what
+`locations.json` is for. That is not a retreat from "every page is built from a
+bucket listing": the listing still decides **what exists**, and the manifest only
+says what each one is **called** and in what order. It is exactly the split
+`titles.json` already makes. A venue whose rule was dropped leaves the manifest
+on the next run and stops being linked immediately, without anything being
+deleted — nothing here ever deletes from a bucket.
+
+Charts sit **flat beside the page** rather than in a directory per venue, and
+the depth is load-bearing: every SVG on this site lives exactly one level down,
+which is why a link out of one is always `../`. Nesting these would have made
+them the only exception.
+
+#### Flags
+
+`--no-locations` skips the family; `--no-trends` already implies it, since these
+are multi-day charts too. `--location-history N` caps the whole-record chart at
+N broadcasts, 120 by default — a venue visited weekly for three years is 150
+bars on a 1300px axis, and eight pixels each is a texture rather than a reading.
+`0` means every broadcast on record.
+
+The per-broadcast charts reuse `--stream-count` and `--lookback` rather than
+taking their own. A second N for the same question would let a venue page and
+the Trends page disagree about what "recent" means.
+
+Labels thin themselves when the bars get tight, and the rule is **pixels per
+bar** rather than a bar count: how many labels fit is a question about width,
+and a fixed "thin above twenty" overlaps at twenty-one anyway, because
+twenty-one bars have no more room than twenty did. Every bar keeps its tooltip
+whatever the stride, so nothing thinning drops is unreachable.
+
+"On record" is doing real work in that chart's heading. It shows the broadcasts
+**the report tables hold**, which for a channel imported before `007` is
+whatever `db --rebuild` has refreshed — not everything that ever happened.
 
 ### Estimated watch time
 

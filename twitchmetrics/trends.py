@@ -84,6 +84,19 @@ DIVIDER_ZERO = "#5a5a5a"
 # Where a bar sends the reader. Relative, and one level up, because the browser
 # resolves it against the SVG's own URL -- these charts live under trends/.
 DAY_PREFIX = "day/"
+# The venue pages, and the charts that sit flat beside them. One directory, not
+# one per venue: see location_link() for why the depth is load-bearing.
+LOCATION_PREFIX = "location/"
+
+# The longest a venue slug may be. A stream title can be any length and a rule
+# names a location freely, so without a cap a chatty venue name becomes a
+# 300-character filename -- past the 255-byte limit a filename component has on
+# every common filesystem, which would break the first person to sync the bucket
+# to disk. S3 itself would take it; the person copying it out would not.
+#
+# Truncating makes two long names likelier to collide, and that is handled
+# rather than avoided: s3.location_slugs() suffixes a whole colliding class.
+MAX_SLUG = 60
 
 # The size each chart renders at, in one place because the page needs it too:
 # an <object> has to be told its aspect ratio, where an <img> works it out.
@@ -91,7 +104,42 @@ SIZES = {"peaks": (1300, 380), "typical": (1300, 430),
          "followers": (1300, 400), "likes": (1300, 400),
          "weekday": (1300, 360), "location": (1300, 360),
          "watchtime": (1300, 400), "watchrolling": (1300, 400),
-         "watchlocation": (1300, 360)}
+         "watchlocation": (1300, 360),
+         # Peak viewers, per broadcast and rolled up by venue. Named
+         # "peakstream" rather than "peak" so it cannot be confused with the
+         # by-day "peaks" chart sitting in the same directory.
+         "peakstream": (1300, 400), "peaklocation": (1300, 360),
+         # The venue pages. "compare" is this venue against every other, so it
+         # is a rollup and takes the rollups' height; "history" is one bar per
+         # visit across a whole record and takes the per-broadcast one.
+         "compare": (1300, 360), "history": (1300, 400)}
+
+# The room a date label needs under a bar, in pixels. "Sun 10 May" at 12px is
+# about seventy, so eighty leaves a gap rather than letting two labels touch.
+#
+# A WIDTH AND NOT A BAR COUNT, which is the whole of the rule: how many labels
+# fit is a question about pixels per bar, and a chart drawn narrower or a venue
+# with three years of visits both change that. A fixed "thin above N bars" gets
+# the common case right and then overlaps anyway at N+1, because N+1 bars still
+# have no more room than N did.
+#
+# Below the threshold every bar keeps all three of its lines, which is what
+# leaves every chart already on the site byte-identical: ten bars on a 1300px
+# axis are 116px each, comfortably clear.
+#
+# The tooltips carry every figure whatever the stride, so nothing thinning drops
+# is unreachable -- the same bargain render_watch_rolling() strikes when it draws
+# no bar per day.
+LABEL_WIDTH = 80
+
+# Bars on a venue's whole-history chart. 0 means every broadcast on record.
+#
+# A ceiling rather than no ceiling, because a venue visited weekly for three
+# years is 150 bars on a 1300px axis -- eight pixels each, which is a texture and
+# not a reading, and no amount of label thinning fixes a bar too narrow to see.
+# 120 is roughly two years of weekly visits, which is long enough for the slope
+# the chart exists to show.
+LOCATION_HISTORY = 120
 
 # --- layout ---------------------------------------------------------------
 HEAD_H = 118            # shorter than chart.HEADER_H: no in-stream tiles to fit
@@ -324,6 +372,53 @@ def day_link(day, known=None):
     if known is not None and stamp not in known:
         return None
     return "../{}{}.html".format(DAY_PREFIX, stamp)
+
+
+def slugify(name):
+    """A venue's name as a URL segment: 'Hollywood Studios' -> 'hollywood-studios'.
+
+    Lives here rather than in s3.py because day_link() already builds a URL here
+    and s3.py already imports from this module -- putting it the other way round
+    would be the import cycle smoke.py's "no dependencies" section exists to
+    prevent.
+
+    The unmatched location is "" and slugs to "unknown", which is
+    UNKNOWN_LOCATION lowercased and the one venue name a reader will see that no
+    rule produced.
+
+    NOT REVERSIBLE, and callers must not try: "DHS" and "dhs" slug alike, and
+    unslugging 'dhs' gives "Dhs". s3.save_locations() writes the mapping into the
+    bucket for the same reason titles.json exists -- so a page can be rebuilt
+    from the bucket without guessing.
+    """
+    out = []
+    for char in (name or "").strip().casefold():
+        out.append(char if char.isalnum() and char.isascii() else "-")
+    slug = "-".join(part for part in "".join(out).split("-") if part)
+    # Cut back to a word boundary where there is one in reach, so a truncated
+    # slug still reads as words rather than ending mid-syllable.
+    if len(slug) > MAX_SLUG:
+        slug = slug[:MAX_SLUG]
+        if "-" in slug[MAX_SLUG // 2:]:
+            slug = slug[:slug.rindex("-")]
+    return slug.strip("-") or "unknown"
+
+
+def location_link(slug, known=None):
+    """The location page's href for `slug`, or None when there is no page for it.
+
+    day_link()'s rule, for the same reason: a bar pointing at a page nobody
+    uploaded is a 404, and `known` is the set of slugs the bucket actually
+    holds. None means "link everything", which is the --no-upload case.
+
+    The "../" is day_link()'s "../" and is correct for the same reason -- every
+    SVG on this site lives exactly one directory down, so a link out of one is
+    always one level up. That invariant is why the location charts sit flat
+    under location/ rather than nested in a directory per venue.
+    """
+    if known is not None and slug not in known:
+        return None
+    return "../{}{}.html".format(LOCATION_PREFIX, slug)
 
 
 def _open_link(href, tip):
@@ -588,6 +683,28 @@ def render_typical(slots, per_day, channel, platform, day, minutes=BUCKET_MINUTE
 # metric is an entry here rather than a third renderer -- which is the same
 # reason tm.report_stream_metric is stored long.
 STREAM_METRICS = {
+    # First because it is the metric a reader looks for first, and because it is
+    # the only one both platforms always carry -- followers are Twitch's and
+    # likes are YouTube's, so on any one page the other two are half absent.
+    #
+    # The key is "peak" because store.stream_trends() calls the field "peak" and
+    # render_stream_bars() indexes a row by the metric's own name. The chart KIND
+    # is "peakstream", which is not the same string and must not be: the by-day
+    # chart is already "peaks", and trends/peak-twitch.svg sitting beside
+    # trends/peaks-twitch.svg would be two charts one letter apart in one
+    # directory, telling a reader nothing about which is which. "kind" is how a
+    # metric says its chart is named something other than itself.
+    #
+    # There has been a peak-viewers chart since the beginning, but per DAY. A
+    # Saturday spent at two parks is one bar there and two here, and only the
+    # second can be grouped by venue -- which is the whole reason this axis
+    # exists beside that one rather than instead of it.
+    # No "color": it falls through to the platform's, which is what render_peaks()
+    # already uses. The two peak charts sit on one page and should read as the
+    # same measurement at two grains rather than as two different metrics.
+    "peak": {"title": "Peak viewers per stream", "kind": "peakstream",
+             "best": "Best stream", "average": "Average peak",
+             "noun": "watching", "signed": False},
     "followers": {"title": "Followers gained per stream",
                   "best": "Best stream", "average": "Average gain",
                   "noun": "gained", "signed": True},
@@ -753,7 +870,7 @@ def _tip(inner, tip):
 
 def render_stream_bars(entries, channel, platform, day, metric,
                        width=SIZES["followers"][0], height=SIZES["followers"][1],
-                       known=None):
+                       known=None, span_label=None, where=None):
     """One bar per broadcast: followers gained, or likes peaked.
 
     `entries` is store.stream_trends()' list, oldest first. `metric` picks both
@@ -769,6 +886,14 @@ def render_stream_bars(entries, channel, platform, day, metric,
 
     The axis counts BROADCASTS. Two on one day are two bars, which is the whole
     reason this exists next to the peaks chart rather than instead of it.
+
+    `span_label` names the window in the heading, for the caller whose rows did
+    not come from a "last N broadcasts" query -- the venue-history chart draws a
+    venue's whole record, and "last 41 broadcast(s)" would be a plain untruth
+    about it. `where` names the venue in the subtitle, so a chart opened on its
+    own still says which place it is about. Both default None and keep the
+    existing wording byte for byte, which is what lets the four charts that
+    already use this go on being compared against their fixtures.
     """
     present = [e for e in entries if e.get(metric) is not None]
     if not present:
@@ -793,15 +918,24 @@ def render_stream_bars(entries, channel, platform, day, metric,
     dated = [e["day"] for e in entries]
     with_month = spans_months(dated)
     out = _open_svg(width, height,
-                    "{}, last {} broadcast(s)".format(words["title"], len(present)),
-                    "{} · {} · to {}".format(channel, spec["label"],
-                                             day.strftime("%a %-d %b %Y")))
+                    "{}, {}".format(
+                        words["title"],
+                        span_label or "last {} broadcast(s)".format(len(present))),
+                    "{} · {} · {}to {}".format(
+                        channel, spec["label"],
+                        "{} · ".format(where) if where else "",
+                        day.strftime("%a %-d %b %Y")))
 
     best = max(present, key=lambda e: e[metric])
     average = sum(e[metric] for e in present) / len(present)
     tile_x = width - PAD_R + 84
+    # The venue names the best broadcast when a chart spans several; when the
+    # whole chart is one venue it names nothing, so the date does the job it was
+    # brought in for -- saying WHICH broadcast this was.
     _tile(out, tile_x, _fmt_value(metric, best[metric]), words["best"],
-          best.get("location") or fmt_day(best["day"], True), colour=colour)
+          (fmt_day(best["day"], True) if where
+           else best.get("location") or fmt_day(best["day"], True)),
+          colour=colour)
     # The span, because a broadcast axis is not contiguous and the reader
     # cannot infer how long ten of them took from the labels.
     _tile(out, tile_x - 175, _fmt_mean(metric, average), words["average"],
@@ -813,6 +947,17 @@ def render_stream_bars(entries, channel, platform, day, metric,
     slot_width = (right - left) / len(entries)
     bar_width = slot_width * (1 - GROUP_GAP)
     newest = entries[-1] if entries else None
+    # A venue's whole record can be a hundred broadcasts, and a hundred bars on
+    # a 1300px axis leave thirteen pixels each -- not room for a date, let alone
+    # a venue and a figure stacked under it. Label every `stride`th bar, where
+    # the stride is however many bars it takes to clear LABEL_WIDTH.
+    #
+    # One rule for all three lines rather than three thresholds: a bar is either
+    # labelled or it is not, and a chart where the dates thin at one rate and the
+    # figures at another reads as two charts overlaid. stride == 1 is every bar
+    # labelled, which is every chart already on the site.
+    stride = max(1, math.ceil(LABEL_WIDTH / slot_width)) if slot_width else 1
+    crowded = stride > 1
     for index, entry in enumerate(entries):
         centre = left + slot_width * (index + 0.5)
         x = centre - bar_width / 2
@@ -822,10 +967,21 @@ def render_stream_bars(entries, channel, platform, day, metric,
         # Two bars can share a date, so the date alone is not a label. The
         # location says which of the two this was; the clock does when there is
         # no location to say it with.
-        second = entry.get("location") or clock
-        out.append(text(centre, bottom + 22, fmt_day(entry["day"], with_month),
-                        size=12, fill=FG if latest else MUTED, anchor="middle"))
-        if second:
+        #
+        # `where` means the whole chart is already about one venue -- it is in
+        # the subtitle -- so repeating it under every bar says nothing and
+        # crowds out the thing that does distinguish two visits on one day.
+        second = (clock if where else entry.get("location") or clock)
+        # Counted from the NEWEST bar rather than the oldest, so the right-hand
+        # end is always labelled and the ragged gap, if the count does not divide,
+        # falls at the left where the oldest visit is. The newest is the one a
+        # reader looks for first.
+        dated_here = (len(entries) - 1 - index) % stride == 0
+        if dated_here:
+            out.append(text(centre, bottom + 22, fmt_day(entry["day"], with_month),
+                            size=12, fill=FG if latest else MUTED,
+                            anchor="middle"))
+        if second and not crowded:
             out.append(text(centre, bottom + 38, second[:18], size=10,
                             fill=MUTED if latest else DIM, anchor="middle"))
 
@@ -855,11 +1011,14 @@ def render_stream_bars(entries, channel, platform, day, metric,
         out.append(_bar(x, y, bar_width, depth, colour,
                         1.0 if latest else 0.72, outline=FG if latest else None))
         # Above the bar when it grows, below when it shrinks -- a label inside
-        # the axis either way.
-        label_y = y - 9 if value >= 0 else y_of(value) + 18
-        out.append(text(centre, label_y, _fmt_value(metric, value), size=12,
-                        fill=FG if latest else MUTED,
-                        weight="600" if latest else "normal", anchor="middle"))
+        # the axis either way. On a crowded axis only the newest keeps its
+        # figure; the rest are in the tooltips, which is the bargain
+        # render_watch_rolling() already strikes by drawing no bar per day.
+        if dated_here:
+            label_y = y - 9 if value >= 0 else y_of(value) + 18
+            out.append(text(centre, label_y, _fmt_value(metric, value), size=12,
+                            fill=FG if latest else MUTED,
+                            weight="600" if latest else "normal", anchor="middle"))
         if href:
             out.append("</a>")
 
@@ -878,7 +1037,8 @@ def render_stream_bars(entries, channel, platform, day, metric,
 
 def render_stream_groups(groups, channel, platform, day, metric, grouping,
                          width=SIZES["weekday"][0], height=SIZES["weekday"][1],
-                         count=STREAM_COUNT, span_label=None):
+                         count=STREAM_COUNT, span_label=None, links=None,
+                         highlight=None, baseline=None, where=None):
     """Average per broadcast, grouped by weekday or by location.
 
     `groups` is store.stream_groups()' list and is SPARSE -- a weekday nobody
@@ -900,6 +1060,28 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
     printed per bar: a venue's bars are already labelled, and the one thing a
     reader needs before trusting the height of all of them is what share of the
     broadcasts behind them a poller actually saw.
+
+    `links` maps a group key to an href and turns that bar into an anchor. Only
+    the location grouping is ever given one, and the comment further down says
+    why a weekday still is not.
+
+    `highlight` is the one group key this drawing is *about* -- the venue whose
+    page the chart is on. It dims the others rather than recolouring itself, and
+    it deliberately leaves the best-bar outline alone: brightness answers "which
+    one am I looking at" and the outline answers "which one won", so a venue
+    that is both still reads as both. Recolouring would have collapsed the two
+    questions into one mark.
+
+    `where` names the venue this rollup is restricted to, so a chart opened on
+    its own says which place it is about rather than reading as the whole
+    channel's. It is NOT passed to the venue-comparison chart, which is about
+    every venue by construction.
+
+    `baseline` draws a dashed reference line at a value, the way
+    render_watch_rolling() draws the YPP line. On a location page it is the
+    channel's own average across every venue, which is what turns "4.2 hours"
+    into "above where this channel usually lands" -- a bar on its own cannot say
+    that, and neither can a page of bars all drawn to their own axis.
     """
     if not groups:
         return None
@@ -938,8 +1120,9 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
     spanned = sum(row.get("span") or 0 for row in drawn)
     out = _open_svg(width, height,
                     shape["title"].format(words["title"].replace(" per stream", "")),
-                    "{} · {} · average per broadcast, {}{}".format(
+                    "{} · {} · {}average per broadcast, {}{}".format(
                         channel, spec["label"],
+                        "{} · ".format(where) if where else "",
                         span_label or "last {} of them".format(streams),
                         _coverage_note({"coverage": covered / float(spanned)
                                         if spanned else None},
@@ -976,19 +1159,56 @@ def render_stream_groups(groups, channel, platform, day, metric, grouping,
         y = y_of(max(value, 0))
         depth = abs(base - y_of(value))
         top_bar = row is best
-        # No link: a weekday is not a date and a location is not a page. The
-        # count and the best single broadcast go in the tooltip instead, which
-        # is what stops an average being read as a certainty.
-        out.append(_tip(
-            _bar(x, y, bar_width, depth, colour, 1.0 if top_bar else 0.72,
-                 outline=FG if top_bar else None),
-            "{} · {} broadcast(s) · {} avg · best {}".format(
-                label, row["streams"], _fmt_mean(metric, value),
-                _fmt_value(metric, row["best"]))))
+        here = highlight is not None and key == highlight
+        # A weekday is still not a date and still has no page, so it is never
+        # given a link -- enforced here rather than left to the caller, because
+        # the key for Saturday is "5" and a map that happened to hold "5" would
+        # otherwise send a reader somewhere arbitrary. A location now does have
+        # a page, which is what `links` carries. The count and the best single
+        # broadcast stay in the tooltip either way, because that is what stops
+        # an average being read as a certainty.
+        href = (links or {}).get(key) if grouping == "location" else None
+        tip = "{} · {} broadcast(s) · {} avg · best {}".format(
+            label, row["streams"], _fmt_mean(metric, value),
+            _fmt_value(metric, row["best"]))
+        if href:
+            out.append(_open_link(href, tip))
+            out.append(_hit(x, top, bar_width, bottom - top + 44))
+        # Brightness says "you are here", the outline says "this one won". When
+        # nothing is highlighted the first term is the original 1.0/0.72 and
+        # every existing chart is unchanged.
+        if highlight is None:
+            opacity = 1.0 if top_bar else 0.72
+        else:
+            opacity = 1.0 if here else 0.34
+        bar = _bar(x, y, bar_width, depth, colour, opacity,
+                   outline=FG if top_bar else None)
+        out.append(bar if href else _tip(bar, tip))
         label_y = y - 9 if value >= 0 else y_of(value) + 18
+        lit = here if highlight is not None else top_bar
         out.append(text(centre, label_y, _fmt_mean(metric, value), size=12,
-                        fill=FG if top_bar else MUTED,
-                        weight="600" if top_bar else "normal", anchor="middle"))
+                        fill=FG if lit else MUTED,
+                        weight="600" if lit else "normal", anchor="middle"))
+        if href:
+            out.append("</a>")
+
+    # After the bars, not before: a reference the bars drew over would be a
+    # reference nobody could read against the one bar it matters most for.
+    # Clamped to the axis for render_watch_rolling()'s reason -- a line off the
+    # top would stretch nothing and say less than the number in the label.
+    if baseline is not None and low_value <= baseline <= top_value:
+        y = y_of(baseline)
+        out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" '
+                   'stroke="{}" stroke-width="1.4" stroke-dasharray="6 4" '
+                   'opacity="0.8"/>'.format(left, y, right, y, FG))
+        # Right-aligned, unlike render_watch_rolling()'s, and the axis ordering
+        # is why: these bars are sorted busiest-first, so the tallest is always
+        # at the left and the right end is the one place a label is not over a
+        # bar. On a line chart the left is the safe end; here it is the worst.
+        out.append(text(right - 6, y - 7,
+                        "{} across every location".format(
+                            _fmt_mean(metric, baseline)),
+                        size=11, fill=DIM, anchor="end"))
 
     out.append('<line x1="{:.1f}" y1="{:.1f}" x2="{:.1f}" y2="{:.1f}" stroke="{}" '
                'stroke-width="1"/>'.format(left, base, right, base, GRID))
@@ -1190,10 +1410,28 @@ def render_from(peaks, slots, per_day, channel, platform, day,
     return charts
 
 
+def location_links(rows, known=None):
+    """{group key: href} for the venue bars of a chart living under trends/.
+
+    Built from the rows the chart is about rather than from a list of venues, so
+    a bar can only ever link to a page for the venue that bar is: the key going
+    in is the key coming out, and slugify() is applied in exactly one place.
+
+    A venue with no page is simply absent, which is how render_stream_groups()
+    tells a link from a plain bar -- day_link()'s rule, and for the same reason.
+    """
+    out = {}
+    for row in rows or ():
+        href = location_link(slugify(row["key"]), known)
+        if href:
+            out[row["key"]] = href
+    return out
+
+
 def render_streams(rows, groups, channel, platform, day, known=None, watch=(),
-                   location_watch=()):
-    """The per-broadcast charts: {"followers", "likes", "weekday", "location",
-    "watchtime", "watchrolling", "watchlocation"}.
+                   location_watch=(), known_locations=None):
+    """The per-broadcast charts: {"peakstream", "followers", "likes", "weekday",
+    "location", "peaklocation", "watchtime", "watchrolling", "watchlocation"}.
 
     Any key may be absent, and on a normal channel most of them are: `rows` is
     one platform's broadcasts, so the followers chart draws for Twitch and the
@@ -1216,6 +1454,13 @@ def render_streams(rows, groups, channel, platform, day, known=None, watch=(),
     only difference -- which is what STREAM_METRICS and GROUPINGS being data
     rather than renderers buys.
 
+    `known_locations` is the set of venue slugs the bucket holds a page for, and
+    turns every by-location bar into a link to that venue's page. None means no
+    page exists and every bar stays plain -- the OPPOSITE of `known`'s None,
+    which means "link every day". The asymmetry is deliberate: a day page can be
+    inferred to exist from the date having data, and a location page cannot, so
+    the safe default differs. Getting this backwards produces a page of 404s.
+
     Deliberately not folded into render_from(). That function's signature is
     load-bearing -- the parity harness drives the Python and SQL aggregate
     paths through it and compares the SVG byte for byte -- and these aggregates
@@ -1223,16 +1468,31 @@ def render_streams(rows, groups, channel, platform, day, known=None, watch=(),
     that could produce them.
     """
     charts = {}
-    for metric in STREAM_METRICS:
+    for metric, words in STREAM_METRICS.items():
         drawn = render_stream_bars(rows, channel, platform, day, metric,
                                    known=known)
         if drawn:
-            charts[metric] = drawn
+            # A metric may name its chart something other than itself; see
+            # STREAM_METRICS["peak"], which must not collide with "peaks".
+            charts[words.get("kind", metric)] = drawn
     for grouping in GROUPINGS:
-        drawn = render_stream_groups(groups.get(grouping) or [], channel,
-                                     platform, day, "followers", grouping)
+        rolled = groups.get(grouping) or []
+        drawn = render_stream_groups(
+            rolled, channel, platform, day, "followers", grouping,
+            links=location_links(rolled, known_locations))
         if drawn:
             charts[grouping] = drawn
+    # Peak viewers by venue, which is the chart the location pages are most
+    # often reached from: "where do most people watch me" is the question a
+    # reader has before "and what happened on each visit".
+    peaks_by_place = groups.get("peaklocation") or []
+    if peaks_by_place:
+        drawn = render_stream_groups(
+            peaks_by_place, channel, platform, day, "peak", "location",
+            width=SIZES["peaklocation"][0], height=SIZES["peaklocation"][1],
+            links=location_links(peaks_by_place, known_locations))
+        if drawn:
+            charts["peaklocation"] = drawn
     if watch:
         # Only YouTube gets the reference line. Twitch has no watch-hour
         # threshold to be near, and drawing one there would invent a target the
@@ -1249,7 +1509,113 @@ def render_streams(rows, groups, channel, platform, day, known=None, watch=(),
             location_watch, channel, platform, day, "watchtime", "location",
             width=SIZES["watchlocation"][0], height=SIZES["watchlocation"][1],
             span_label="all {} on record".format(
-                sum(row["streams"] for row in location_watch)))
+                sum(row["streams"] for row in location_watch)),
+            links=location_links(location_watch, known_locations))
         if drawn:
             charts["watchlocation"] = drawn
+    return charts
+
+
+# --------------------------------------------------------------------------
+# one venue's page
+# --------------------------------------------------------------------------
+
+# The charts a location page carries, in the order it shows them. Each is one
+# lowercase word, because s3.location_chart_key() puts it in front of a hyphen
+# and the key regex will not take a second one.
+#
+# The order is the reading order the front page already uses: how many watched,
+# then how many stayed, then when and against what. "compare" is last of the
+# rollups because it is the only chart on the page about somewhere else.
+LOCATION_KINDS = ("peakstream", "followers", "likes", "watchtime",
+                  "history", "weekday", "compare")
+
+
+def render_location(rows, history, weekday, compare, channel, platform, day,
+                    location, label=None, known=None, known_locations=None):
+    """Every chart for one venue: a subset of LOCATION_KINDS.
+
+    The sibling of render_streams(), and deliberately a separate function for
+    the reason that one is separate from render_from(): a venue's charts have no
+    Python twin to be held to a parity harness, and folding them in would put a
+    load-bearing signature under pressure for no gain.
+
+    Any key may be absent, and on a normal channel most are. `rows` is one
+    platform's broadcasts AT THIS VENUE, so the followers chart draws for Twitch
+    and the likes chart for YouTube and each returns None for the other --
+    nothing here tests a platform's name, exactly as in render_streams().
+
+    `rows` is store.stream_trends(location=...) -- the venue's last N -- and
+    `history` is store.location_history(), the venue's whole record. Two queries
+    and not one, because they answer different questions and a chart cannot tell
+    which window it was handed: "the last ten visits" and "every visit ever" want
+    different headings, and one of them would be a lie.
+
+    `weekday` is store.stream_groups(grouping="weekday", location=...), which
+    rolls up PEAK VIEWERS rather than followers. The channel-wide weekday chart
+    asks "when is it worth going out" and answers it with the audience you keep;
+    at one venue the question is "when is this place busy", and that is a
+    question about the audience you get.
+
+    `compare` is store.stream_groups(grouping="location") with NO venue filter --
+    every venue, so this one can be seen among them. It is the only chart here
+    drawn from rows that are not all about this place, which is the point: a bar
+    on its own cannot say whether it is good.
+
+    `location` is the venue as the DATABASE spells it -- "" for the broadcasts no
+    rule matched -- and is what the compare chart highlights, because that is the
+    key its rows are grouped by. `label` is what a READER should see, and
+    defaults to UNKNOWN_LOCATION when `location` is empty. Two arguments and not
+    one, because "" is the right thing to match on and the wrong thing to print.
+    """
+    label = label or location or UNKNOWN_LOCATION
+    charts = {}
+    for metric, words in STREAM_METRICS.items():
+        drawn = render_stream_bars(rows, channel, platform, day, metric,
+                                   known=known, where=label)
+        if drawn:
+            charts[words.get("kind", metric)] = drawn
+
+    if history:
+        # All-time, so the heading says so rather than claiming a window this
+        # does not have. "On record" and not "ever": these are the broadcasts the
+        # report tables hold, which for a channel imported before 007 is whatever
+        # db --rebuild refreshed. The same phrasing the by-venue watch chart uses,
+        # and for the same reason.
+        drawn = render_stream_bars(
+            history, channel, platform, day, "watchtime", known=known,
+            width=SIZES["history"][0], height=SIZES["history"][1],
+            span_label="all {} on record".format(len(history)),
+            where=label)
+        if drawn:
+            charts["history"] = drawn
+
+    if weekday:
+        drawn = render_stream_groups(
+            weekday, channel, platform, day, "peak", "weekday",
+            width=SIZES["weekday"][0], height=SIZES["weekday"][1],
+            where=label)
+        if drawn:
+            charts["weekday"] = drawn
+
+    if compare:
+        # Broadcast-weighted, NOT the mean of the venue averages. A venue with
+        # thirty broadcasts and one with two must not have equal say in where the
+        # line sits -- the same argument render_stream_groups() already makes
+        # about its coverage note, and an easy one to get wrong by writing the
+        # shorter expression.
+        streams = sum(row["streams"] for row in compare)
+        baseline = (sum(row["total"] for row in compare) / streams
+                    if streams else None)
+        drawn = render_stream_groups(
+            compare, channel, platform, day, "peak", "location",
+            width=SIZES["compare"][0], height=SIZES["compare"][1],
+            highlight=location or "", baseline=baseline,
+            # Siblings share a directory with this venue's page, so the link out
+            # of a chart under location/ climbs one level to reach them -- the
+            # same "../" every other chart on the site uses, because every chart
+            # on the site lives exactly one level down.
+            links=location_links(compare, known_locations))
+        if drawn:
+            charts["compare"] = drawn
     return charts

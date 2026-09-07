@@ -1,17 +1,20 @@
 """Publishing the daily charts to an S3 static website, one bucket per channel.
 
-Each channel gets its own bucket serving two pages: today's graph for every
-platform it is polled on with prior days as links, and a Trends page carrying
-the multi-day charts. The bucket holds nothing but those and the SVGs:
+Each channel gets its own bucket serving today's graph for every platform it is
+polled on with prior days as links, a Trends page carrying the multi-day charts,
+and a page per venue the channel has streamed from. The bucket holds nothing but
+those and the SVGs:
 
     index.html
     trends.html
     day/2026-08-24.html
+    location/magic-kingdom.html
     twitch/2026-08-24.svg
     youtube/2026-08-24.svg
     trends/peaks-twitch.svg
+    location/magic-kingdom-peakstream-twitch.svg
 
-Both pages are rebuilt from a listing of the bucket rather than from anything
+Every page is rebuilt from a listing of the bucket rather than from anything
 kept locally, so a run after a week's gap still produces a correct index, a
 chart uploaded by hand shows up in it, and neither page ever links an image that
 isn't there.
@@ -22,6 +25,7 @@ machine that only polls — and polling is meant to need nothing installed.
 """
 
 import html
+import hashlib
 import json
 import os
 import re
@@ -31,13 +35,20 @@ from datetime import date
 
 from . import config, retry
 from .logging import log
+from .trends import LOCATION_KINDS, UNKNOWN_LOCATION
 from .trends import SIZES as TREND_SIZES
+from .trends import slugify
 
 INDEX_KEY = "index.html"
 TRENDS_KEY = "trends.html"
 TITLES_KEY = "titles.json"
 TRENDS_PREFIX = "trends/"
 DAY_PREFIX = "day/"
+# The venue pages and their charts, flat in one directory. trends.LOCATION_PREFIX
+# is the same string seen from inside an SVG; it lives there because day_link()
+# does, and s3.py already imports from trends rather than the other way round.
+LOCATION_PREFIX = "location/"
+LOCATIONS_KEY = "locations.json"
 SVG_TYPE = "image/svg+xml"
 
 # Not `immutable`: re-running the report for today legitimately replaces today's
@@ -72,11 +83,18 @@ TITLE_PREFERENCE = ("twitch", "youtube")
 # count dates -- the page reads from "how many watched" down to "how many
 # stayed, and where". A kind is one lowercase word because trend_key() puts it
 # in front of a hyphen and TREND_KEY_RE will not take a second one.
-TREND_KINDS = ("peaks", "typical", "watchtime", "watchrolling", "watchlocation",
-               "followers", "likes", "weekday", "location")
+TREND_KINDS = ("peaks", "typical", "peakstream", "watchtime", "watchrolling",
+               "watchlocation", "peaklocation", "followers", "likes", "weekday",
+               "location")
 TREND_LABELS = {
     ("peaks", "twitch"): "Peak viewers by day · Twitch",
     ("peaks", "youtube"): "Peak viewers by day · YouTube",
+    # "per stream" against the two above's "by day", because that is the whole
+    # difference: a Saturday at two parks is one bar up there and two down here.
+    ("peakstream", "twitch"): "Peak viewers per stream · Twitch",
+    ("peakstream", "youtube"): "Peak viewers per stream · YouTube",
+    ("peaklocation", "twitch"): "Peak viewers by location · Twitch",
+    ("peaklocation", "youtube"): "Peak viewers by location · YouTube",
     ("typical", "twitch"): "Half-hour averages, today vs before · Twitch",
     ("typical", "youtube"): "Half-hour averages, today vs before · YouTube",
     ("followers", "twitch"): "Followers gained per stream · Twitch",
@@ -100,6 +118,20 @@ TREND_LABELS = {
     ("watchlocation", "youtube"): "Estimated watch hours by location · YouTube",
 }
 
+# What a venue page calls each of its panels. Separate from TREND_LABELS because
+# these charts are already about one place -- "Peak viewers by location" would be
+# a heading on a page about a location -- so the wording drops the venue and
+# keeps the window, which is the thing that differs between them.
+LOCATION_LABELS = {
+    "peakstream": "Peak viewers per stream · {}",
+    "followers": "Followers gained per stream · {}",
+    "likes": "Peak likes per stream · {}",
+    "watchtime": "Estimated watch hours per stream · {}",
+    "history": "Estimated watch hours, every stream here · {}",
+    "weekday": "Peak viewers by day of week, here · {}",
+    "compare": "Peak viewers here against every location · {}",
+}
+
 # These nine regions predate the dotted website endpoint and still answer on
 # s3-website-<region>; everything since uses s3-website.<region>. It is frozen
 # history rather than a rule, so it is a list and not an algorithm.
@@ -116,6 +148,23 @@ RETRY_CODES = ("SlowDown", "RequestTimeout", "RequestTimeoutException",
 
 KEY_RE = re.compile(r"^([a-z]+)/(\d{4}-\d{2}-\d{2})\.svg$")
 TREND_KEY_RE = re.compile(r"^" + TRENDS_PREFIX + r"([a-z]+)-([a-z]+)\.svg$")
+# A venue page, and a venue chart flat beside it.
+#
+# Both are safely disjoint from the three matchers above. KEY_RE needs exactly
+# one slash followed by a DATE, so "location/epcot.html" fails on the extension
+# and "location/epcot-peakstream-twitch.svg" fails because the segment after the
+# slash is not a date -- true even for a venue whose name slugs to one, which is
+# the case worth naming because it is the only one that looks dangerous.
+#
+# The slug is matched greedily and the kind and platform are not, which is what
+# makes the three-part name unambiguous: trend_key() already requires a kind to
+# be one lowercase word with no hyphen in it, and a platform is the same. So the
+# last two hyphen-separated groups are always kind and platform, and everything
+# before them is the slug however many hyphens it has.
+LOCATION_PAGE_RE = re.compile(r"^" + LOCATION_PREFIX + r"([a-z0-9][a-z0-9-]*)\.html$")
+LOCATION_CHART_RE = re.compile(
+    r"^" + LOCATION_PREFIX + r"([a-z0-9][a-z0-9-]*)-([a-z]+)-([a-z]+)\.svg$")
+
 # .html, not .svg, which is what keeps a day page out of KEY_RE and so out of
 # the Past days list -- the same property trend_key() is careful about.
 DAY_KEY_RE = re.compile(r"^" + DAY_PREFIX + r"(\d{4}-\d{2}-\d{2})\.html$")
@@ -270,6 +319,72 @@ def parse_trend_key(key):
     """(kind, platform) for a trend chart key, or None for anything else."""
     match = TREND_KEY_RE.match(str(key))
     return (match.group(1), match.group(2)) if match else None
+
+
+def location_key(slug):
+    """One venue's page: 'location/magic-kingdom.html'."""
+    return "{}{}.html".format(LOCATION_PREFIX, slug)
+
+
+def location_chart_key(slug, kind, platform):
+    """One venue's chart: 'location/magic-kingdom-peakstream-twitch.svg'.
+
+    FLAT beside the page rather than nested in a directory per venue, and the
+    depth is load-bearing rather than a matter of taste: trends.day_link() and
+    trends.location_link() both climb exactly one level, because every SVG on
+    this site lives exactly one level down. Nesting these would make them the
+    only exception and would put an "up two" parameter through three shared
+    renderers whose output the smoke suite compares byte for byte.
+    """
+    return "{}{}-{}-{}.svg".format(LOCATION_PREFIX, slug, kind, platform)
+
+
+def parse_location_key(key):
+    """The slug in a location page's key, or None if it isn't one."""
+    found = LOCATION_PAGE_RE.match(key or "")
+    return found.group(1) if found else None
+
+
+def parse_location_chart_key(key):
+    """(slug, kind, platform) for a location chart's key, or None."""
+    found = LOCATION_CHART_RE.match(key or "")
+    return (found.group(1), found.group(2), found.group(3)) if found else None
+
+
+def location_slugs(names):
+    """{name: slug} for a whole set of venues, collisions broken deterministically.
+
+    Slugging is lossy -- "EPCOT", "Epcot" and "epcot" are one slug -- so this
+    takes the whole set at once rather than one name at a time. It is the only
+    place a slug is decided.
+
+    WHEN TWO NAMES COLLIDE, EVERY MEMBER OF THE CLASH IS SUFFIXED, not just the
+    loser. Suffixing only the loser would mean the bare slug belongs to whoever
+    sorted first, so a third venue arriving tomorrow could take it and move the
+    other two -- and a moved slug is a page that quietly changes address. With
+    every member suffixed, the bare slug is owned by nobody and a new arrival
+    disturbs no one.
+
+    "unknown" IS RESERVED for the broadcasts no rule matched. A venue actually
+    called "Unknown" is treated as a clash and suffixed, so the to-do list keeps
+    one stable address for as long as the channel exists.
+    """
+    claimed = {}
+    for name in names:
+        claimed.setdefault(slugify(name), []).append(name)
+    out = {}
+    for slug, sharing in claimed.items():
+        reserved = slug == slugify("") and any(name for name in sharing)
+        if len(sharing) == 1 and not reserved:
+            out[sharing[0]] = slug
+            continue
+        for name in sharing:
+            if not name:
+                out[name] = slug          # the unmatched venue keeps "unknown"
+            else:
+                digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]
+                out[name] = "{}-{}".format(slug, digest)
+    return out
 
 
 def parse_key(key):
@@ -536,6 +651,11 @@ def upload_chart(channel, path, platform, day):
     return _upload_svg(channel, path, object_key(platform, day))
 
 
+def upload_location_chart(channel, path, slug, kind, platform):
+    """Upload one venue's chart. Returns {"key", "url"}."""
+    return _upload_svg(channel, path, location_chart_key(slug, kind, platform))
+
+
 def upload_trend(channel, path, kind, platform):
     """Put one multi-day chart at 'trends/<kind>-<platform>.svg', replacing it."""
     return _upload_svg(channel, path, trend_key(kind, platform))
@@ -632,6 +752,96 @@ def save_titles(channel, titles):
         ContentType="application/json; charset=utf-8", CacheControl="no-cache"))
 
 
+def list_location_pages(channel):
+    """{slug} for the venue pages the bucket actually holds."""
+    found = set()
+    for key in _keys(channel, LOCATION_PREFIX):
+        slug = parse_location_key(key)
+        if slug:
+            found.add(slug)
+    return found
+
+
+def list_location_charts(channel):
+    """{slug: [(kind, platform)]} for the venue charts in the bucket.
+
+    Ordered by LOCATION_KINDS x PLATFORMS, exactly as list_trends() orders its
+    own, so a page's panels come out in the order the module declares rather
+    than in whatever order S3 happened to list them.
+    """
+    found = {}
+    for key in _keys(channel, LOCATION_PREFIX):
+        parsed = parse_location_chart_key(key)
+        if parsed:
+            found.setdefault(parsed[0], set()).add(parsed[1:])
+    return {slug: [(kind, platform) for kind in LOCATION_KINDS
+                   for platform in PLATFORMS if (kind, platform) in charts]
+            for slug, charts in found.items()}
+
+
+def load_locations(channel):
+    """{slug: (name, streams)} out of the bucket, or {} if it isn't readable.
+
+    A manifest for load_titles()' reason, and it is not a retreat from "the page
+    is built from a bucket listing": the listing still decides WHAT EXISTS, and
+    this only says what each one is CALLED. It has to, because a slug is lossy --
+    "dhs" could be "DHS" or "Dhs" and only one of them is the streamer's own
+    word for the place.
+
+    A missing manifest degrades to {} rather than failing, so a bucket that
+    predates this fills itself in on the next run. A manifest whose values are
+    bare strings is read as a name with no count, which is what a bucket written
+    before the picker carried counts holds -- one run replaces it.
+    """
+    known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    try:
+        body = s3.get_object(Bucket=known["bucket"], Key=LOCATIONS_KEY)["Body"].read()
+        stored = json.loads(body.decode("utf-8"))
+    except Exception:  # noqa: BLE001 - absent, unreadable or malformed are all "none yet"
+        return {}
+    if not isinstance(stored, dict):
+        return {}
+    out = {}
+    for slug, value in stored.items():
+        if isinstance(value, str):
+            out[slug] = (value, 0)
+        elif isinstance(value, (list, tuple)) and value:
+            out[slug] = (str(value[0]), int(value[1]) if len(value) > 1 else 0)
+    return out
+
+
+def save_locations(channel, names):
+    """Write the venue index back. `names` is {slug: [name, streams]} in order.
+
+    NOT sort_keys, unlike save_titles(): the order is content here. The picker
+    reads busiest-venue-first out of this file, and sorting it alphabetically
+    would silently replace that ordering with a different one.
+    """
+    known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    _with_backoff("save locations for {}".format(channel), lambda: s3.put_object(
+        Bucket=known["bucket"], Key=LOCATIONS_KEY,
+        Body=json.dumps(names, indent=2).encode("utf-8"),
+        ContentType="application/json; charset=utf-8", CacheControl="no-cache"))
+
+
+def list_locations(channel):
+    """[(slug, name, streams)] for the venue pages that exist, in picker order.
+
+    The listing INTERSECTED with the manifest and ordered by the manifest, which
+    is list_trends()' rule: the bucket decides what exists so a page never links
+    something that isn't there, and the manifest decides what is named and in
+    what order. A venue whose rule was dropped leaves the manifest on the next
+    run and stops being linked immediately, without anything being deleted --
+    nothing in this module deletes from a bucket.
+    """
+    found = list_location_pages(channel)
+    return [(slug, name, streams)
+            for slug, (name, streams) in load_locations(channel).items()
+            if slug in found]
+
+
 def _publish_page(channel, key, page):
     """Upload one HTML page. Returns the site's URL."""
     known = require_bucket(channel)
@@ -703,6 +913,38 @@ def publish_index(channel, today, titles=None, trends=None):
             "pages": pages}
 
 
+def publish_locations(channel, today, places):
+    """Write every venue page from what is in the bucket. Returns the count.
+
+    `places` is picker_order()' list, which decides both which pages exist and
+    the order the picker shows them in. Uploading the charts is the caller's job
+    -- this only builds the pages around whatever is actually there, so a venue
+    whose charts failed gets a page with a picker and an "not yet" line rather
+    than a page of broken images.
+
+    EVERY PAGE IS REWRITTEN EVERY RUN, unlike day pages, which are written once
+    and left alone. A day is finished and its page is a record; a venue's charts
+    describe where it stands now, and every one of them moves when the channel
+    streams there again. There is also no backfill to do for the same reason --
+    nothing here is ever "missing", only stale.
+
+    The manifest goes up FIRST, so a page that renders can always be named: the
+    picker on every one of these pages is built from it.
+    """
+    if not places:
+        return 0
+    save_locations(channel, {slug: [name, streams]
+                             for slug, name, streams in places})
+    charts = list_location_charts(channel)
+    written = 0
+    for slug, name, _ in places:
+        _publish_page(channel, location_key(slug),
+                      render_location(channel, today, slug, name,
+                                      charts.get(slug) or [], locations=places))
+        written += 1
+    return written
+
+
 def publish_trends(channel, today):
     """Rebuild trends.html from the trend charts in the bucket and upload it.
 
@@ -711,7 +953,10 @@ def publish_trends(channel, today):
     ones gets a page with two panels rather than two broken images.
     """
     charts = list_trends(channel)
-    page = render_trends(channel, today, charts)
+    # Listed rather than passed: the Trends page is rebuilt from the bucket like
+    # every other page here, and its picker must not offer a venue whose page
+    # never landed.
+    page = render_trends(channel, today, charts, locations=list_locations(channel))
     return {"url": "{}/{}".format(_publish_page(channel, TRENDS_KEY, page), TRENDS_KEY),
             "charts": len(charts)}
 
@@ -767,6 +1012,37 @@ STYLE = """
     padding: 9px 0; border-bottom: 1px solid #1c1c1c;
   }
   .past li span { color: #f1f1f1; font-variant-numeric: tabular-nums; min-width: 6.5em; }
+  /* The venue picker. A row of links and a count under each, which makes it a
+     small ranking as well as a nav: the reader sees where the channel actually
+     spends its time before clicking anything. Ordered busiest-first, and the
+     count is what "busiest" means -- broadcasts, not the average of whichever
+     metric a panel happens to draw. */
+  .picker {
+    display: flex; flex-wrap: wrap; gap: 4px 26px;
+    margin: 18px 0 0; padding: 0; list-style: none;
+  }
+  .picker li { padding-bottom: 3px; }
+  .picker a, .picker strong {
+    display: block; font-size: 14px; font-weight: normal; line-height: 1.35;
+  }
+  .picker a { color: #aaaaaa; }
+  .picker a:hover { color: #4fb3e8; text-decoration: none; }
+  /* The venue being read is marked by weight and a rule rather than by a filled
+     pill, and is not a link to itself -- there is nowhere for it to go. */
+  .picker .here { color: #f1f1f1; font-weight: 600; }
+  .picker .here::after {
+    content: ""; display: block; height: 2px; margin-top: 3px;
+    background: #4fb3e8; border-radius: 1px;
+  }
+  .picker .n {
+    display: block; font-size: 11px; color: #717171;
+    font-variant-numeric: tabular-nums;
+  }
+  /* Last and dimmer however busy it is: the unfiled broadcasts are a to-do,
+     not a place, and sorting the to-do list first would read as a claim about
+     where the channel does best. */
+  .picker .unfiled a, .picker .unfiled .here { color: #717171; }
+
   a { color: #4fb3e8; text-decoration: none; }
   a:hover { text-decoration: underline; }
   .empty { color: #717171; margin: 0; }
@@ -810,6 +1086,7 @@ TRENDS_BODY = """</style>
     <h1>{channel}</h1>
     <p class="today">Trends · to {date}</p>
     <p class="nav"><a href="{index}">← Today</a></p>
+{picker}
   </header>
 {panels}
   <footer>Updated {date}</footer>
@@ -834,6 +1111,25 @@ TREND_PANEL = """  <section class="panel">
     <object type="image/svg+xml" data="{key}" aria-label="{label}"
             style="aspect-ratio: {ratio}"><img src="{key}" alt="{label}"></object>
   </section>"""
+
+# One venue's page. The picker sits under the heading rather than in the nav
+# line, because it is the page's subject and not a way off it.
+LOCATION_BODY = """</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>{channel}</h1>
+    <p class="today">{place} · to {date}</p>
+    <p class="nav"><a href="{index}">← Today</a> · <a href="{trends}">Trends</a></p>
+{picker}
+  </header>
+{panels}
+  <footer>Updated {date}</footer>
+</main>
+</body>
+</html>
+"""
 
 # One day's page. No Past days list -- the index has it, and this page is one
 # of its entries -- but links both ways out, since a reader who arrived from a
@@ -969,11 +1265,101 @@ def render_index(channel, today, days, titles=None, trends=False):
                           count=len(days)))
 
 
-def render_trends(channel, today, charts):
+def _picker(locations, current=None, prefix=""):
+    """The venue picker, or "" when there is nothing to pick between.
+
+    `locations` is [(slug, name, streams)] in the order to show them, and this
+    only renders -- picker_order() decides the order, one function above.
+
+    `current` is the slug being read, marked with a <strong> rather than being a
+    link to itself: there is nowhere for it to go, and a self-link is a trap for
+    anyone navigating by keyboard.
+
+    `prefix` is what a sibling's href needs in front of it: "" from a location
+    page, which shares their directory, and LOCATION_PREFIX from the Trends
+    page, which sits above it.
+    """
+    if not locations:
+        return ""
+    rows = []
+    for slug, name, streams in locations:
+        unfiled = ' class="unfiled"' if name == UNKNOWN_LOCATION else ""
+        count = ('<span class="n">{} stream(s)</span>'.format(streams)
+                 if streams else "")
+        if slug == current:
+            body = '<strong class="here" aria-current="page">{}</strong>{}'.format(
+                html.escape(name), count)
+        else:
+            body = '<a href="{}">{}</a>{}'.format(
+                html.escape("{}{}.html".format(prefix, slug)),
+                html.escape(name), count)
+        rows.append("      <li{}>{}</li>".format(unfiled, body))
+    return '    <ul class="picker">\n{}\n    </ul>'.format("\n".join(rows))
+
+
+def picker_order(places):
+    """[(slug, name, streams)] in the order the picker shows them.
+
+    `places` is store.stream_locations()' list, already busiest-first out of the
+    SQL. This adds the one rule that is a presentation choice rather than a
+    query: THE UNFILED BROADCASTS GO LAST however many there are.
+
+    They are not a venue, they are a to-do -- a title has drifted out of its
+    rule and wants fixing -- and a picker that led with them would be saying the
+    channel's most valuable place is a bug.
+    """
+    slugs = location_slugs([place["key"] for place in places])
+    ordered = sorted(places, key=lambda place: place["key"] == "")
+    return [(slugs[place["key"]], place["name"], place.get("streams", 0))
+            for place in ordered]
+
+
+def render_location(channel, today, slug, name, charts, locations=()):
+    """One venue's page: its charts, and the picker to reach the others.
+
+    `charts` is list_location_charts()[slug] -- [(kind, platform)] -- so the page
+    is built from what the bucket actually holds and never links an image that
+    isn't there, exactly as render_trends() is.
+
+    It lives a directory down, so it reaches the index and the Trends page with
+    "../" and its SIBLINGS with nothing at all: they share this directory. Its
+    own charts are flat beside it, which is why they need no prefix either.
+    """
+    pretty = today.strftime("%a %d %b %Y")
+    panels = [TREND_PANEL.format(
+        label=html.escape(LOCATION_LABELS.get(
+            kind, "{} · {{}}".format(kind)).format(
+                PLATFORM_LABELS.get(platform, platform))),
+        key=html.escape(location_chart_key(slug, kind, platform)[len(LOCATION_PREFIX):]),
+        ratio="{} / {}".format(*TREND_SIZES.get(kind, TREND_SIZES["peaks"])))
+        for kind, platform in charts]
+    if not panels:
+        panels.append('  <p class="empty">No charts for this location yet — they '
+                      'appear once the daily report has run.</p>')
+
+    return (HEAD.format(channel=html.escape(str(channel)),
+                        page=html.escape(str(name)))
+            + STYLE
+            + LOCATION_BODY.format(channel=html.escape(str(channel)),
+                                   place=html.escape(str(name)),
+                                   date=html.escape(pretty),
+                                   index=html.escape("../" + INDEX_KEY),
+                                   trends=html.escape("../" + TRENDS_KEY),
+                                   picker=_picker(locations, current=slug),
+                                   panels="\n".join(panels)))
+
+
+def render_trends(channel, today, charts, locations=()):
     """The Trends page: the multi-day charts, one panel each.
 
     `charts` is list_trends()' [(kind, platform)], so the page is built from
     what the bucket actually holds and never links an image that isn't there.
+
+    `locations` is list_locations()' [(slug, name, streams)] and adds the picker.
+    The by-location bars on this page already link to those pages, but a bar is
+    only a link when the chart could be drawn -- so the picker is the route that
+    survives a platform with no location data, and the only one a reader who
+    never hovers a bar will find.
     """
     pretty = today.strftime("%a %d %b %Y")
     panels = [TREND_PANEL.format(
@@ -991,4 +1377,6 @@ def render_trends(channel, today, charts):
             + TRENDS_BODY.format(channel=html.escape(str(channel)),
                                  date=html.escape(pretty),
                                  index=html.escape(INDEX_KEY),
+                                 picker=_picker(locations,
+                                                prefix=LOCATION_PREFIX),
                                  panels="\n".join(panels)))

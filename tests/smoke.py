@@ -1289,7 +1289,15 @@ check("and zero is always on a gridline",
 
 check("render_streams returns only what it could draw",
       set(trends.render_streams(_streams, {"weekday": _groups}, "t", "twitch",
-                                date(2026, 8, 22))) == {"followers", "weekday"})
+                                date(2026, 8, 22)))
+      == {"peakstream", "followers", "weekday"})
+# The by-day peaks chart and this one are one letter apart as metric names and
+# must not be as KEYS: trends/peak-twitch.svg beside trends/peaks-twitch.svg
+# would be two charts in one directory telling a reader nothing about which is
+# which. This is the check that keeps them apart.
+check("peak viewers per broadcast has a kind of its own, not the by-day chart's",
+      trends.STREAM_METRICS["peak"]["kind"] == "peakstream"
+      and "peakstream" in s3.TREND_KINDS and "peak" not in s3.TREND_KINDS)
 check("and nothing at all for a platform with neither",
       trends.render_streams([], {}, "t", "youtube", date(2026, 8, 22)) == {})
 
@@ -1572,6 +1580,149 @@ check("its kind survives a round trip through the bucket key",
 check("no script anywhere", "<script" not in _wplacesvg.lower())
 
 
+# --- one venue at a time --------------------------------------------------
+section("location trends")
+_lstreams = [{"stream_id": n, "day": date(2026, 8, 1) + timedelta(days=n * 3),
+              "started": datetime(2026, 8, 1, 18, tzinfo=timezone.utc),
+              "weekday": 5, "title": "t", "location": "EPCOT",
+              "followers": n, "likes": None, "peak": 40 + n,
+              "watch_minutes": 60.0 * n, "watchtime": float(n),
+              "covered": 100, "span": 100, "coverage": 1.0}
+             for n in range(1, 7)]
+
+# Peak viewers per BROADCAST. The by-day chart collapses a Saturday spent at two
+# parks into one bar; this is the axis that can be grouped by venue.
+_pk = trends.render_stream_bars(_lstreams, "t", "twitch", date(2026, 8, 22), "peak")
+check("peak viewers draw one bar per broadcast", "Peak viewers per stream" in _pk)
+check("a peak cannot go backwards, so it is never signed", "+4" not in _pk)
+check("both platforms carry it, like watch time and unlike followers",
+      trends.render_stream_bars(_lstreams, "t", "youtube", date(2026, 8, 22),
+                                "peak") is not None)
+check("it has a label on every platform",
+      all(("peakstream", p) in s3.TREND_LABELS for p in ("twitch", "youtube")))
+check("and an aspect ratio, or the page cannot size the <object>",
+      "peakstream" in trends.SIZES)
+check("its kind survives a round trip through the bucket key",
+      s3.trend_key("peakstream", "twitch") == "trends/peakstream-twitch.svg")
+
+# A venue's whole record, which is not a "last N" window and must not say it is.
+_lhist = [dict(_lstreams[0], stream_id=n, day=date(2026, 1, 1) + timedelta(days=n * 4))
+          for n in range(60)]
+_hsvg = trends.render_stream_bars(_lhist, "t", "twitch", date(2026, 8, 22),
+                                  "watchtime", span_label="all 60 on record",
+                                  where="EPCOT")
+check("an all-time axis stops claiming a window it does not have",
+      "all 60 on record" in _hsvg and "last 60 broadcast(s)" not in _hsvg)
+check("and names the venue, so a chart opened on its own still says where",
+      "EPCOT ·" in _hsvg)
+# Sixty bars on a 1300px axis is 21px each; three text elements stacked under
+# every one is a smear rather than a reading.
+check("a crowded axis thins its labels rather than overprinting them",
+      _hsvg.count("</text>") < 60)
+check("but keeps enough to anchor itself", _hsvg.count("</text>") >= 10)
+check("and every bar keeps its figure reachable as a tooltip",
+      _hsvg.count("<title>") >= 60)
+
+# This venue against the others: the chart that turns a number into a judgement.
+_cmp_rows = [{"key": "Magic Kingdom", "streams": 30, "total": 1500.0,
+              "average": 50.0, "best": 80.0, "best_stream_id": 1},
+             {"key": "EPCOT", "streams": 2, "total": 80.0, "average": 40.0,
+              "best": 45.0, "best_stream_id": 2}]
+_weighted = (sum(r["total"] for r in _cmp_rows)
+             / sum(r["streams"] for r in _cmp_rows))
+_cmp = trends.render_stream_groups(
+    _cmp_rows, "t", "twitch", date(2026, 8, 22), "peak", "location",
+    highlight="EPCOT", baseline=_weighted,
+    links={"EPCOT": "../epcot.html", "Magic Kingdom": "../magic-kingdom.html"})
+check("the baseline is a dashed reference line, like the YPP one",
+      "stroke-dasharray" in _cmp)
+# A venue with thirty broadcasts and one with two must not have equal say -- the
+# same argument this renderer already makes about its coverage note. The two
+# spellings differ on these rows on purpose: 49.4 against 45.
+check("and it is weighted by broadcast, not averaged over the venues",
+      "{} across every location".format(
+          trends._fmt_mean("peak", _weighted)) in _cmp)
+check("a venue bar is a link to that venue's page",
+      'href="../epcot.html" target="_top"' in _cmp)
+check("brightness says which venue is being read",
+      'opacity="1.00"' in _cmp and 'opacity="0.34"' in _cmp)
+# Two orthogonal marks: the outline still means "best", so a venue that is both
+# reads as both rather than the two cues collapsing into one.
+check("while the outline still says which venue won",
+      'stroke="{}"'.format(trends.FG) in _cmp)
+check("a venue with no page stays a plain bar rather than a dead link",
+      "magic-kingdom.html" not in trends.render_stream_groups(
+          _cmp_rows, "t", "twitch", date(2026, 8, 22), "peak", "location",
+          links=trends.location_links(_cmp_rows, known={"epcot"})))
+# The key for Saturday is "5", and a links map that happened to hold "5" would
+# otherwise send a reader somewhere arbitrary. Enforced in the renderer rather
+# than left to the caller.
+check("a weekday is still never a link, whatever the caller passes",
+      "<a href" not in trends.render_stream_groups(
+          [{"key": "5", "streams": 2, "total": 10.0, "average": 5.0,
+            "best": 7.0, "best_stream_id": 1}],
+          "t", "twitch", date(2026, 8, 22), "followers", "weekday",
+          links={"5": "/anywhere.html"}))
+
+check("a venue page's charts are drawn from one call",
+      {"peakstream", "followers", "watchtime", "history", "weekday", "compare"}
+      <= set(trends.render_location(
+          _lstreams, _lhist,
+          [{"key": "5", "streams": 2, "total": 90.0, "average": 45.0,
+            "best": 50.0, "best_stream_id": 1}],
+          _cmp_rows, "t", "twitch", date(2026, 8, 22), "EPCOT",
+          known_locations={"epcot", "magic-kingdom"})))
+# Twitch rows carry no likes, so the likes chart selects itself out by drawing
+# nothing -- nothing here tests a platform's name.
+check("and a metric the platform does not carry simply does not draw",
+      "likes" not in trends.render_location(
+          _lstreams, _lhist, [], _cmp_rows, "t", "twitch",
+          date(2026, 8, 22), "EPCOT"))
+# "" is the right thing to group on and the wrong thing to print.
+check("the unfiled venue matches on \"\" and still prints as a word",
+      "{} ·".format(trends.UNKNOWN_LOCATION) in trends.render_location(
+          _lstreams, [], [], _cmp_rows, "t", "twitch",
+          date(2026, 8, 22), "")["peakstream"])
+check("a venue with no page linked from a chart is a plain bar",
+      trends.location_link("epcot", known=set()) is None)
+check("and one with a page climbs one level, like every other chart link",
+      trends.location_link("epcot") == "../location/epcot.html")
+check("no script anywhere", "<script" not in _cmp.lower())
+
+# The half that protects everything already on the site: every new argument
+# defaults to the old behaviour, byte for byte.
+check("a caller passing no span_label gets the old heading byte for byte",
+      trends.render_stream_bars(_lstreams, "t", "twitch", date(2026, 8, 22),
+                                "followers", span_label=None, where=None)
+      == trends.render_stream_bars(_lstreams, "t", "twitch", date(2026, 8, 22),
+                                   "followers"))
+_small = trends.render_stream_bars(_lstreams, "t", "twitch", date(2026, 8, 22),
+                                   "followers")
+# Three lines under every bar -- date, venue, figure -- plus the chart's own
+# chrome, so comfortably more than three per bar.
+check("a chart with room keeps all three lines on every bar",
+      _small.count("</text>") > 3 * len(_lstreams))
+# The thinning is what makes the venue-history chart legible, and the limit is
+# what keeps it away from every chart already on the site.
+check("and the crowded one drops to well under one label per bar",
+      _hsvg.count("</text>") < len(_lhist))
+# The rule is pixels per bar, not a bar count: 21 bars have barely more room
+# than 22 do, so a fixed "thin above N" overlaps at N+1 anyway.
+_twenty_one = [dict(_lstreams[0], stream_id=n,
+                    day=date(2026, 1, 1) + timedelta(days=n * 5))
+               for n in range(21)]
+check("thinning follows the room a label needs, not a fixed bar count",
+      trends.render_stream_bars(_twenty_one, "t", "twitch", date(2026, 8, 22),
+                                "followers").count("</text>")
+      < 3 * len(_twenty_one))
+check("and a group chart passing none of the three new arguments is unchanged",
+      trends.render_stream_groups(_cmp_rows, "t", "twitch", date(2026, 8, 22),
+                                  "peak", "location", links=None,
+                                  highlight=None, baseline=None)
+      == trends.render_stream_groups(_cmp_rows, "t", "twitch",
+                                     date(2026, 8, 22), "peak", "location"))
+
+
 # --- s3 the day page ------------------------------------------------------
 section("s3 day page")
 check("a day page has its own key", s3.day_key("2026-08-24") == "day/2026-08-24.html")
@@ -1606,6 +1757,142 @@ check("a date with no charts says so rather than showing broken images",
 check("the channel name is escaped",
       "&lt;script&gt;" in s3.render_day("<script>", "2026-08-24", ["twitch"]))
 check("no script anywhere", "<script" not in _day_page.lower())
+
+# --- location slugs and keys ----------------------------------------------
+section("location slugs and keys")
+check("a venue becomes a path-safe slug",
+      trends.slugify("Magic Kingdom") == "magic-kingdom")
+check("punctuation and case collapse rather than escaping",
+      trends.slugify("Tony's  Town Square!") == "tony-s-town-square")
+check("the venue that is no venue has a slug of its own",
+      trends.slugify("") == "unknown")
+# A rule names a location freely and a title has no length limit, so without a
+# cap a chatty venue becomes a filename past the 255 bytes every common
+# filesystem allows a component -- fine in S3, broken for anyone syncing it out.
+check("a very long venue name is capped rather than becoming a 300-char file",
+      len(trends.slugify("Magic Kingdom " * 40)) <= trends.MAX_SLUG)
+check("and is cut at a word boundary, not mid-syllable",
+      not trends.slugify("Magic Kingdom " * 40).endswith("-"))
+# Path traversal and separators cannot survive: a slug becomes a bucket key.
+check("a venue name cannot walk out of its own directory",
+      all("/" not in trends.slugify(_n) and ".." not in trends.slugify(_n)
+          for _n in ("../../etc/passwd", "a/b/c", "..", ".", "%2e%2e%2f")))
+check("and a name that is nothing but punctuation still gets a usable slug",
+      trends.slugify("...") == "unknown" and trends.slugify("///") == "unknown")
+# Slugging is lossy, so the whole set is decided at once.
+_dupes = s3.location_slugs(["EPCOT", "Epcot", "Magic Kingdom"])
+check("two venues that slug alike are BOTH suffixed, not just the loser",
+      _dupes["EPCOT"] != _dupes["Epcot"]
+      and "epcot" not in (_dupes["EPCOT"], _dupes["Epcot"]))
+# Suffixing only the loser would leave the bare slug owned by whoever sorted
+# first, so a third arrival could take it and move the other two -- and a moved
+# slug is a page that quietly changes address.
+check("so a third arrival cannot move the first two",
+      s3.location_slugs(["EPCOT", "Epcot", "epcot"])["EPCOT"] == _dupes["EPCOT"])
+check("an untroubled venue keeps its bare slug",
+      _dupes["Magic Kingdom"] == "magic-kingdom")
+check("and a venue actually called Unknown cannot take the unfiled page",
+      s3.location_slugs(["Unknown", ""])[""] == "unknown"
+      and s3.location_slugs(["Unknown", ""])["Unknown"] != "unknown")
+
+_lkey = s3.location_key("magic-kingdom")
+_lchart = s3.location_chart_key("magic-kingdom", "peakstream", "twitch")
+check("a venue page has a key of its own",
+      _lkey == "location/magic-kingdom.html")
+check("and its charts sit flat beside it, one level down like every other SVG",
+      _lchart == "location/magic-kingdom-peakstream-twitch.svg")
+check("both round-trip",
+      s3.parse_location_key(_lkey) == "magic-kingdom"
+      and s3.parse_location_chart_key(_lchart)
+      == ("magic-kingdom", "peakstream", "twitch"))
+# Four key namespaces in one bucket, none of them overlapping. The chart matcher
+# is the one that matters most: a location key it accepted would become a row in
+# Past days.
+check("the chart matcher ignores both",
+      s3.parse_key(_lkey) is None and s3.parse_key(_lchart) is None)
+check("the trend matcher ignores both",
+      s3.parse_trend_key(_lkey) is None and s3.parse_trend_key(_lchart) is None)
+check("the day matcher ignores both",
+      s3.parse_day_key(_lkey) is None and s3.parse_day_key(_lchart) is None)
+check("and the location matchers ignore every key that came before them",
+      all(s3.parse_location_key(_k) is None
+          and s3.parse_location_chart_key(_k) is None
+          for _k in ("index.html", "trends.html", "titles.json",
+                     "twitch/2026-08-24.svg", "trends/peaks-twitch.svg",
+                     "day/2026-08-24.html")))
+check("a page and a chart cannot be mistaken for each other",
+      s3.parse_location_chart_key(_lkey) is None
+      and s3.parse_location_key(_lchart) is None)
+# The case that looks dangerous and is not: a venue whose name slugs to a date.
+check("a venue that slugs to a date is still not a day chart",
+      s3.parse_key(s3.location_key("2026-08-24")) is None
+      and s3.parse_day_key(s3.location_key("2026-08-24")) is None)
+# The slug is matched greedily and the kind and platform are not, which is what
+# makes a three-part name with hyphens in the slug read back correctly.
+check("every venue chart kind survives a round trip, hyphenated slug and all",
+      all(s3.parse_location_chart_key(
+          s3.location_chart_key("hollywood-studios", _k, "twitch"))
+          == ("hollywood-studios", _k, "twitch")
+          for _k in trends.LOCATION_KINDS))
+
+# --- s3 location page -----------------------------------------------------
+section("s3 location page")
+_places = [{"key": "Magic Kingdom", "name": "Magic Kingdom", "streams": 62},
+           {"key": "", "name": trends.UNKNOWN_LOCATION, "streams": 3},
+           {"key": "EPCOT", "name": "EPCOT", "streams": 41}]
+_order = s3.picker_order(_places)
+check("the picker leads with the busiest venue, counted in broadcasts",
+      _order[0][1] == "Magic Kingdom")
+# Not a venue but a to-do: a title has drifted out of its rule. A picker leading
+# with it would read as a claim about where the channel does best.
+check("and puts the unfiled broadcasts last however many there are",
+      _order[-1][1] == trends.UNKNOWN_LOCATION)
+
+_loc_page = s3.render_location("testchannel", date(2026, 9, 7), "epcot", "EPCOT",
+                               [("peakstream", "twitch"), ("history", "twitch")],
+                               locations=_order)
+check("the location page is a whole document",
+      _loc_page.startswith("<!doctype html>")
+      and _loc_page.rstrip().endswith("</html>"))
+check("it shows every chart the bucket holds for that venue",
+      _loc_page.count("<object") == 2)
+check("reached flat beside the page, not through a directory of their own",
+      'data="epcot-peakstream-twitch.svg"' in _loc_page)
+check("the picker reaches a sibling with no path at all, since they share a dir",
+      'href="magic-kingdom.html"' in _loc_page
+      and "../location/" not in _loc_page)
+check("the venue being read is marked rather than linked to itself",
+      'aria-current="page"' in _loc_page and 'href="epcot.html"' not in _loc_page)
+check("the picker carries each venue's count, so the row ranks as well as navigates",
+      "62 stream(s)" in _loc_page)
+check("and links both ways out, for a reader who arrived from a trend bar",
+      'href="../index.html"' in _loc_page and 'href="../trends.html"' in _loc_page)
+check("a venue with no charts says so rather than showing broken images",
+      "<object" not in s3.render_location("t", date(2026, 9, 7), "epcot",
+                                          "EPCOT", [], _order))
+check("the channel name is escaped",
+      "&lt;script&gt;" in s3.render_location("<script>", date(2026, 9, 7),
+                                             "epcot", "EPCOT", [], []))
+# The venue's name came out of a stream title, which is the least trusted string
+# on the site: the streamer typed it and a rule only matched a substring of it.
+check("and so is the venue's own name, which came from a stream title",
+      "&lt;b&gt;" in s3.render_location("t", date(2026, 9, 7), "x", "<b>", [],
+                                        [("x", "<b>", 1)]))
+check("no script anywhere", "<script" not in _loc_page.lower())
+
+_trends_pick = s3.render_trends("t", date(2026, 9, 7), [],
+                                locations=[("epcot", "EPCOT", 18)])
+check("the Trends page carries the picker too, reaching down into location/",
+      'href="location/epcot.html"' in _trends_pick)
+# The same component on both pages, so it must rank the same way on both -- a
+# picker with counts on one page and without on the other reads as two things.
+check("and it ranks there too, rather than being a bare list of names",
+      "18 stream(s)" in _trends_pick)
+# A bar is only a link when its chart could be drawn at all, so the picker is
+# the route that survives a platform with no location data.
+check("and a channel with no venues gets no picker rather than an empty one",
+      '<ul class="picker">' not in s3.render_trends("t", date(2026, 9, 7), []))
+check("no script anywhere", "<script" not in _trends_pick.lower())
 
 # --- s3 the bucket registry -----------------------------------------------
 section("s3 bucket registry")
@@ -2851,6 +3138,108 @@ else:
         check("but the stored one is all-time and does not move with it",
               sum(g["streams"] for g in store.location_watch(
                   _lslug, "twitch", timezone_name=_zone_name)) == 3)
+
+        # --- one venue at a time ------------------------------------------
+        # THE CLAIM THIS WHOLE FEATURE RESTS ON: "the last N broadcasts at this
+        # venue" is not "the last N broadcasts, then keep the ones here". The
+        # fixture is built to tell them apart -- the channel's most recent
+        # broadcast is at Magic Kingdom, so a filter applied after the LIMIT
+        # would return nothing at all for EPCOT at count=1.
+        check("a venue filter keeps only that venue's broadcasts",
+              [r["location"] for r in store.stream_trends(
+                  _lslug, "twitch", date(2026, 8, 31), location="Magic Kingdom",
+                  timezone_name=_zone_name)] == ["Magic Kingdom", "Magic Kingdom"])
+        check("and it is applied BEFORE the limit, not after it",
+              [r["location"] for r in store.stream_trends(
+                  _lslug, "twitch", date(2026, 8, 31), count=1, location="EPCOT",
+                  timezone_name=_zone_name)] == ["EPCOT"])
+        check("passing no venue is the unfiltered read, unchanged",
+              len(store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                      timezone_name=_zone_name)) == 3)
+        check("the columns are the same either way, so one renderer draws both",
+              set(store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                      location="EPCOT",
+                                      timezone_name=_zone_name)[0])
+              == set(store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                         timezone_name=_zone_name)[0]))
+        # "" is the venue that is no venue, and is a different question from
+        # "every venue". Every title in this fixture matches a rule, so it is
+        # empty here -- and must be empty rather than everything.
+        check('"" asks for the unfiled broadcasts, which is not "every venue"',
+              store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                  location="", timezone_name=_zone_name) == [])
+
+        # greatest() IGNORES NULLS: greatest(0, NULL) is 0 and greatest(1, NULL)
+        # is 1. So an unbounded window written the obvious way returns no rows at
+        # all, or one day of them. Either reads as a channel that never streamed,
+        # which is why both NULL branches are spelled out in the SQL.
+        _all_mk = store.location_history(_lslug, "twitch", "Magic Kingdom",
+                                         date(2026, 8, 31),
+                                         timezone_name=_zone_name)
+        check("an unbounded read returns rows rather than none at all",
+              len(_all_mk) == 2, str(len(_all_mk)))
+        check("and reaches past the default lookback rather than collapsing to a day",
+              _all_mk[0]["day"] == date(2026, 8, 15), str(_all_mk[0]["day"]))
+        check("while a bounded read of the same venue still narrows",
+              len(store.location_history(_lslug, "twitch", "Magic Kingdom",
+                                         date(2026, 8, 31), count=1,
+                                         timezone_name=_zone_name)) == 1)
+
+        # Peak viewers as a rollup metric. The fixture holds its viewer count
+        # still at 40, so the peak IS 40 and this is exact rather than close.
+        _by_peak = {g["key"]: g for g in store.stream_groups(
+            _lslug, "twitch", "peak", "location", date(2026, 8, 31),
+            timezone_name=_zone_name)}
+        check("peak viewers roll up by venue",
+              set(_by_peak) == {"EPCOT", "Magic Kingdom"}, str(sorted(_by_peak)))
+        check("and land on what the per-broadcast rows already said",
+              abs(_by_peak["Magic Kingdom"]["average"] - 40.0) < _TOL
+              and abs(_by_peak["Magic Kingdom"]["best"] - 40.0) < _TOL,
+              str(_by_peak["Magic Kingdom"]))
+        _refused_metric = refusal(lambda: db.execute(
+            "SELECT * FROM tm.stream_groups(%s,'twitch','banana','location',"
+            "%s,10,90,%s,NULL)", (_lcid, date(2026, 8, 31), _zone_name),
+            fetch=True))
+        check("an unknown metric still raises rather than returning nothing",
+              "banana" in _refused_metric, _refused_metric.splitlines()[0][:80])
+
+        # A weekday rollup scoped to one venue. The parity oracle in 009's shape:
+        # the rollup must summarise EXACTLY the broadcasts that venue's own bars
+        # draw, which is guaranteed only because both come out of one window.
+        _mk_rows = store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
+                                       location="Magic Kingdom",
+                                       timezone_name=_zone_name)
+        _mk_week = {g["key"]: g for g in store.stream_groups(
+            _lslug, "twitch", "followers", "weekday", date(2026, 8, 31),
+            location="Magic Kingdom", timezone_name=_zone_name)}
+        check("a venue-scoped weekday rollup counts only that venue",
+              sum(g["streams"] for g in _mk_week.values()) == len(_mk_rows) == 2)
+        check("and totals exactly what that venue's own bars show",
+              abs(sum(g["total"] for g in _mk_week.values())
+                  - sum(r["followers"] for r in _mk_rows)) < _TOL)
+        check("while the unscoped rollup still sees every venue",
+              sum(g["streams"] for g in store.stream_groups(
+                  _lslug, "twitch", "followers", "weekday", date(2026, 8, 31),
+                  timezone_name=_zone_name)) == 3)
+
+        # Which venues exist at all -- what decides which pages get written.
+        _places_db = {p["key"]: p for p in store.stream_locations(
+            _lslug, timezone_name=_zone_name)}
+        check("the lister names every venue on record",
+              set(_places_db) == {"EPCOT", "Magic Kingdom"},
+              str(sorted(_places_db)))
+        check("with the broadcast count that orders the picker",
+              _places_db["Magic Kingdom"]["streams"] == 2
+              and _places_db["EPCOT"]["streams"] == 1)
+        check("busiest first, which is the order the picker reads",
+              [p["key"] for p in store.stream_locations(
+                  _lslug, timezone_name=_zone_name)][0] == "Magic Kingdom")
+        check("and the dates each venue spans",
+              _places_db["Magic Kingdom"]["first_day"] == date(2026, 8, 15)
+              and _places_db["Magic Kingdom"]["last_day"] == date(2026, 8, 22))
+        check("it names the platforms, so a page can skip an empty panel",
+              _places_db["EPCOT"]["platforms"] == ["twitch"],
+              str(_places_db["EPCOT"]["platforms"]))
 
         # The invariants the CHECKs encode, enforced by the database rather than
         # by whoever writes the next refresh function -- the same argument
