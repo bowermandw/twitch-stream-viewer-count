@@ -1138,7 +1138,7 @@ def location_history(channel, platform, location, day, count=None,
 
 
 STREAM_LOCATIONS_SQL = """
-SELECT location, streams, first_local_date, last_local_date, platforms
+SELECT location, broadcasts, streams, first_local_date, last_local_date, platforms
   FROM tm.stream_locations(
       (SELECT channel_id FROM tm.channel WHERE slug = %s), %s)
 """
@@ -1147,7 +1147,8 @@ SELECT location, streams, first_local_date, last_local_date, platforms
 def stream_locations(channel, timezone_name=None):
     """Every location the channel has streamed from, busiest first.
 
-    [{"key", "name", "streams", "first_day", "last_day", "platforms"}, ...]
+    [{"key", "name", "broadcasts", "streams", "first_day", "last_day",
+      "platforms"}, ...]
 
     ACROSS BOTH PLATFORMS, unlike every other read here. Those take a platform
     because they draw a chart and a chart is per-platform; this answers "which
@@ -1155,6 +1156,14 @@ def stream_locations(channel, timezone_name=None):
     exactly as much as a venue visited on both. Taking a platform would give the
     site two different pickers. "platforms" says which it was streamed on, so a
     caller can still skip a panel that would be empty.
+
+    TWO COUNTS, because grouping across platforms makes them different numbers.
+    "streams" is rows -- one per stream per platform, which is what the
+    per-platform charts draw. "broadcasts" LINKS THE SIMULCASTS: rows whose live
+    windows overlap at one venue are one afternoon the streamer spent there, not
+    two. It is the count a picker wants, and the difference is not marginal for a
+    channel that simulcasts everything -- there it is exactly double.
+    011_location_broadcasts.sql argues the linking rule.
 
     "key" is the venue as the database spells it, "" for the broadcasts no rule
     matched. "name" is the same thing with trends.UNKNOWN_LOCATION substituted
@@ -1170,8 +1179,9 @@ def stream_locations(channel, timezone_name=None):
                       (config.channel_slug(channel),
                        timezone_name or config.resolve_db_timezone()), fetch=True)
     return [{"key": row[0], "name": row[0] or trends.UNKNOWN_LOCATION,
-             "streams": int(row[1]), "first_day": row[2], "last_day": row[3],
-             "platforms": list(row[4] or ())}
+             "broadcasts": int(row[1]), "streams": int(row[2]),
+             "first_day": row[3], "last_day": row[4],
+             "platforms": list(row[5] or ())}
             for row in rows]
 
 

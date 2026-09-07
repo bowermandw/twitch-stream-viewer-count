@@ -780,7 +780,7 @@ def list_location_charts(channel):
 
 
 def load_locations(channel):
-    """{slug: (name, streams)} out of the bucket, or {} if it isn't readable.
+    """{slug: (name, broadcasts, platforms)} out of the bucket, or {}.
 
     A manifest for load_titles()' reason, and it is not a retreat from "the page
     is built from a bucket listing": the listing still decides WHAT EXISTS, and
@@ -789,9 +789,13 @@ def load_locations(channel):
     word for the place.
 
     A missing manifest degrades to {} rather than failing, so a bucket that
-    predates this fills itself in on the next run. A manifest whose values are
-    bare strings is read as a name with no count, which is what a bucket written
-    before the picker carried counts holds -- one run replaces it.
+    predates this fills itself in on the next run. EVERY OLDER SHAPE STILL READS:
+    a bare string is a name with no count, from before the picker counted at all;
+    a two-element list is a name and a count with no platforms, from before the
+    count meant broadcasts rather than rows. Both degrade to something the picker
+    can draw, and one run replaces them -- which is the whole reason this is
+    tolerant rather than strict. A bucket is not a database and cannot be
+    migrated.
     """
     known = require_bucket(channel)
     s3 = _client("s3", known["region"])
@@ -805,14 +809,17 @@ def load_locations(channel):
     out = {}
     for slug, value in stored.items():
         if isinstance(value, str):
-            out[slug] = (value, 0)
+            out[slug] = (value, 0, ())
         elif isinstance(value, (list, tuple)) and value:
-            out[slug] = (str(value[0]), int(value[1]) if len(value) > 1 else 0)
+            out[slug] = (str(value[0]),
+                         int(value[1]) if len(value) > 1 else 0,
+                         tuple(str(name) for name in (value[2] or ()))
+                         if len(value) > 2 else ())
     return out
 
 
 def save_locations(channel, names):
-    """Write the venue index back. `names` is {slug: [name, streams]} in order.
+    """Write the venue index back. `names` is {slug: [...]} in picker order.
 
     NOT sort_keys, unlike save_titles(): the order is content here. The picker
     reads busiest-venue-first out of this file, and sorting it alphabetically
@@ -827,18 +834,19 @@ def save_locations(channel, names):
 
 
 def list_locations(channel):
-    """[(slug, name, streams)] for the venue pages that exist, in picker order.
+    """[(slug, name, broadcasts, platforms)] for the venue pages that exist.
 
-    The listing INTERSECTED with the manifest and ordered by the manifest, which
-    is list_trends()' rule: the bucket decides what exists so a page never links
-    something that isn't there, and the manifest decides what is named and in
-    what order. A venue whose rule was dropped leaves the manifest on the next
-    run and stops being linked immediately, without anything being deleted --
-    nothing in this module deletes from a bucket.
+    In picker order: the listing INTERSECTED with the manifest and ordered by
+    the manifest, which is list_trends()' rule -- the bucket decides what exists
+    so a page never links something that isn't there, and the manifest decides
+    what is named and in what order. A venue whose rule was dropped leaves the
+    manifest on the next run and stops being linked immediately, without
+    anything being deleted -- nothing in this module deletes from a bucket.
     """
     found = list_location_pages(channel)
-    return [(slug, name, streams)
-            for slug, (name, streams) in load_locations(channel).items()
+    return [(slug, name, broadcasts, platforms)
+            for slug, (name, broadcasts, platforms)
+            in load_locations(channel).items()
             if slug in found]
 
 
@@ -933,11 +941,11 @@ def publish_locations(channel, today, places):
     """
     if not places:
         return 0
-    save_locations(channel, {slug: [name, streams]
-                             for slug, name, streams in places})
+    save_locations(channel, {slug: [name, broadcasts, list(platforms)]
+                             for slug, name, broadcasts, platforms in places})
     charts = list_location_charts(channel)
     written = 0
-    for slug, name, _ in places:
+    for slug, name, _, _ in places:
         _publish_page(channel, location_key(slug),
                       render_location(channel, today, slug, name,
                                       charts.get(slug) or [], locations=places))
@@ -1016,7 +1024,9 @@ STYLE = """
      small ranking as well as a nav: the reader sees where the channel actually
      spends its time before clicking anything. Ordered busiest-first, and the
      count is what "busiest" means -- broadcasts, not the average of whichever
-     metric a panel happens to draw. */
+     metric a panel happens to draw, and not the number of STREAMS either: a
+     simulcast afternoon is one broadcast on two platforms, which the line under
+     the count names. */
   .picker {
     display: flex; flex-wrap: wrap; gap: 4px 26px;
     margin: 18px 0 0; padding: 0; list-style: none;
@@ -1265,11 +1275,32 @@ def render_index(channel, today, days, titles=None, trends=False):
                           count=len(days)))
 
 
+def _platform_line(platforms):
+    """' · Twitch · YouTube' for a venue's row, or "" when nothing is known.
+
+    Named in the site's own platform order rather than the array's, which
+    arrives alphabetically out of the SQL -- every other list of platforms on
+    this site reads Twitch before YouTube, and a picker that read the other way
+    would be the one place that looks sorted rather than ordered.
+    """
+    named = [PLATFORM_LABELS.get(platform, platform) for platform in PLATFORMS
+             if platform in set(platforms or ())]
+    return " · " + " · ".join(named) if named else ""
+
+
 def _picker(locations, current=None, prefix=""):
     """The venue picker, or "" when there is nothing to pick between.
 
-    `locations` is [(slug, name, streams)] in the order to show them, and this
-    only renders -- picker_order() decides the order, one function above.
+    `locations` is [(slug, name, broadcasts, platforms)] in the order to show
+    them, and this only renders -- picker_order() decides the order, one
+    function above.
+
+    THE COUNT IS BROADCASTS AND SAYS SO. It used to say "stream(s)" over a
+    number that was rows in tm.report_stream_trend, which is one per platform:
+    a venue visited once and simulcast read "2 stream(s)" directly above a chart
+    headed "last 1 broadcast(s)". The platforms are named beside the count
+    instead, which is the thing that number was accidentally carrying and is
+    worth saying outright -- one afternoon, two encoders.
 
     `current` is the slug being read, marked with a <strong> rather than being a
     link to itself: there is nowhere for it to go, and a self-link is a trap for
@@ -1282,10 +1313,11 @@ def _picker(locations, current=None, prefix=""):
     if not locations:
         return ""
     rows = []
-    for slug, name, streams in locations:
+    for slug, name, broadcasts, platforms in locations:
         unfiled = ' class="unfiled"' if name == UNKNOWN_LOCATION else ""
-        count = ('<span class="n">{} stream(s)</span>'.format(streams)
-                 if streams else "")
+        count = ('<span class="n">{} broadcast(s){}</span>'.format(
+            broadcasts, html.escape(_platform_line(platforms)))
+            if broadcasts else "")
         if slug == current:
             body = '<strong class="here" aria-current="page">{}</strong>{}'.format(
                 html.escape(name), count)
@@ -1298,7 +1330,7 @@ def _picker(locations, current=None, prefix=""):
 
 
 def picker_order(places):
-    """[(slug, name, streams)] in the order the picker shows them.
+    """[(slug, name, broadcasts, platforms)] in the order the picker shows them.
 
     `places` is store.stream_locations()' list, already busiest-first out of the
     SQL. This adds the one rule that is a presentation choice rather than a
@@ -1307,10 +1339,19 @@ def picker_order(places):
     They are not a venue, they are a to-do -- a title has drifted out of its
     rule and wants fixing -- and a picker that led with them would be saying the
     channel's most valuable place is a bug.
+
+    "broadcasts" and not "streams": the two differ by exactly the simulcasts,
+    and this is the cross-platform view where that matters. store's docstring
+    has the distinction; 011_location_broadcasts.sql has the argument. The
+    fallback is the row count rather than 0, so a manifest written by an older
+    run still ranks -- doubled, until the next run rewrites it, which is better
+    than every venue silently dropping its count.
     """
     slugs = location_slugs([place["key"] for place in places])
     ordered = sorted(places, key=lambda place: place["key"] == "")
-    return [(slugs[place["key"]], place["name"], place.get("streams", 0))
+    return [(slugs[place["key"]], place["name"],
+             place.get("broadcasts", place.get("streams", 0)),
+             tuple(place.get("platforms") or ()))
             for place in ordered]
 
 
@@ -1355,7 +1396,8 @@ def render_trends(channel, today, charts, locations=()):
     `charts` is list_trends()' [(kind, platform)], so the page is built from
     what the bucket actually holds and never links an image that isn't there.
 
-    `locations` is list_locations()' [(slug, name, streams)] and adds the picker.
+    `locations` is list_locations()' [(slug, name, broadcasts, platforms)] and
+    adds the picker.
     The by-location bars on this page already link to those pages, but a bar is
     only a link when the chart could be drawn -- so the picker is the route that
     survives a platform with no location data, and the only one a reader who

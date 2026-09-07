@@ -1837,16 +1837,34 @@ check("every venue chart kind survives a round trip, hyphenated slug and all",
 
 # --- s3 location page -----------------------------------------------------
 section("s3 location page")
-_places = [{"key": "Magic Kingdom", "name": "Magic Kingdom", "streams": 62},
-           {"key": "", "name": trends.UNKNOWN_LOCATION, "streams": 3},
-           {"key": "EPCOT", "name": "EPCOT", "streams": 41}]
+# Simulcast throughout, which is why "broadcasts" is half of "streams" here:
+# the picker counts the afternoons, not the encoders pointed at them.
+_places = [{"key": "Magic Kingdom", "name": "Magic Kingdom", "broadcasts": 62,
+            "streams": 124, "platforms": ["twitch", "youtube"]},
+           {"key": "", "name": trends.UNKNOWN_LOCATION, "broadcasts": 3,
+            "streams": 3, "platforms": ["twitch"]},
+           {"key": "EPCOT", "name": "EPCOT", "broadcasts": 41, "streams": 78,
+            "platforms": ["twitch", "youtube"]}]
 _order = s3.picker_order(_places)
 check("the picker leads with the busiest venue, counted in broadcasts",
       _order[0][1] == "Magic Kingdom")
+# The whole of the fix: the picker used to print the row count, so a channel
+# that simulcasts read "124 stream(s)" above a chart headed "last 62
+# broadcast(s)" and the page contradicted itself.
+check("and carries broadcasts rather than streams, so simulcasts count once",
+      _order[0][2] == 62)
+check("with the platforms it went out on, in the site's own order",
+      _order[0][3] == ("twitch", "youtube"))
 # Not a venue but a to-do: a title has drifted out of its rule. A picker leading
 # with it would read as a claim about where the channel does best.
 check("and puts the unfiled broadcasts last however many there are",
       _order[-1][1] == trends.UNKNOWN_LOCATION)
+# A bucket written before 011 has [name, streams] and no platforms at all. It
+# must still rank rather than dropping every count to nothing -- doubled until
+# the next run rewrites it, which is a stale number and not a broken page.
+check("a venue from an older manifest still ranks, by whatever count it has",
+      s3.picker_order([{"key": "EPCOT", "name": "EPCOT", "streams": 41}])
+      == [("epcot", "EPCOT", 41, ())])
 
 _loc_page = s3.render_location("testchannel", date(2026, 9, 7), "epcot", "EPCOT",
                                [("peakstream", "twitch"), ("history", "twitch")],
@@ -1864,7 +1882,9 @@ check("the picker reaches a sibling with no path at all, since they share a dir"
 check("the venue being read is marked rather than linked to itself",
       'aria-current="page"' in _loc_page and 'href="epcot.html"' not in _loc_page)
 check("the picker carries each venue's count, so the row ranks as well as navigates",
-      "62 stream(s)" in _loc_page)
+      "62 broadcast(s)" in _loc_page)
+check("and names the platforms the venue went out on, beside the count",
+      "62 broadcast(s) \u00b7 Twitch \u00b7 YouTube" in _loc_page)
 check("and links both ways out, for a reader who arrived from a trend bar",
       'href="../index.html"' in _loc_page and 'href="../trends.html"' in _loc_page)
 check("a venue with no charts says so rather than showing broken images",
@@ -1877,22 +1897,55 @@ check("the channel name is escaped",
 # on the site: the streamer typed it and a rule only matched a substring of it.
 check("and so is the venue's own name, which came from a stream title",
       "&lt;b&gt;" in s3.render_location("t", date(2026, 9, 7), "x", "<b>", [],
-                                        [("x", "<b>", 1)]))
+                                        [("x", "<b>", 1, ("twitch",))]))
 check("no script anywhere", "<script" not in _loc_page.lower())
 
 _trends_pick = s3.render_trends("t", date(2026, 9, 7), [],
-                                locations=[("epcot", "EPCOT", 18)])
+                                locations=[("epcot", "EPCOT", 18,
+                                            ("twitch", "youtube"))])
 check("the Trends page carries the picker too, reaching down into location/",
       'href="location/epcot.html"' in _trends_pick)
 # The same component on both pages, so it must rank the same way on both -- a
 # picker with counts on one page and without on the other reads as two things.
 check("and it ranks there too, rather than being a bare list of names",
-      "18 stream(s)" in _trends_pick)
+      "18 broadcast(s)" in _trends_pick)
 # A bar is only a link when its chart could be drawn at all, so the picker is
 # the route that survives a platform with no location data.
 check("and a channel with no venues gets no picker rather than an empty one",
       '<ul class="picker">' not in s3.render_trends("t", date(2026, 9, 7), []))
 check("no script anywhere", "<script" not in _trends_pick.lower())
+
+# The handoff from the renderer to the publisher, which is the one place a
+# venue's count crosses a module boundary: render_location_charts() carries
+# picker_order()'s entry WHOLE so the manifest cannot disagree with the picker
+# about what it counted. Stubbed rather than credentialled -- the claim is about
+# the shape that travels, not about S3.
+_sent = {}
+
+
+def _fake_publish(channel, day, places):
+    _sent["places"] = places
+    return len(places)
+
+
+_stubs = {"upload_location_chart": lambda *a, **k: None,
+          "publish_locations": _fake_publish,
+          "list_location_pages": lambda channel: {}}
+_saved = {name: getattr(s3, name) for name in _stubs}
+try:
+    for _name, _fn in _stubs.items():
+        setattr(s3, _name, _fn)
+    # Two charts for one venue, exactly as the renderer emits them: the place
+    # entry repeats and must collapse to one manifest row, not two.
+    _place = ("epcot", "EPCOT", 41, ("twitch", "youtube"))
+    daily._publish_locations("t", date(2026, 9, 7), [
+        (_place, "peakstream", "twitch", "a.svg"),
+        (_place, "peakstream", "youtube", "b.svg")])
+finally:
+    for _name, _fn in _saved.items():
+        setattr(s3, _name, _fn)
+check("the publisher is handed the picker's own entry, once per venue",
+      _sent.get("places") == [_place], str(_sent.get("places")))
 
 # --- s3 the bucket registry -----------------------------------------------
 section("s3 bucket registry")
@@ -3017,14 +3070,50 @@ else:
                 "follower_count": str(_followers), "title": "", "game": "",
                 "started_at": "", "stream_id": ""}, source="fixture", refresh=False)
 
+        # --- the same afternoon, on two platforms -------------------------
+        # The 22 August Magic Kingdom broadcast again, five seconds later on
+        # YouTube and running just as long. One afternoon at one park with two
+        # encoders pointed at it, which is the case 011 exists for: it is one
+        # row per platform in tm.report_stream_trend, and the picker used to
+        # count those rows and call the park twice-visited.
+        _lyacct = store.account_id(_lslug, "youtube", timezone_name=_zone_name)
+        check("both platforms hang off one channel, or there is nothing to link",
+              db.execute("SELECT count(DISTINCT channel_id) FROM "
+                         "tm.platform_account WHERE account_id IN (%s, %s)",
+                         (_lacct, _lyacct), fetch=True)[0][0] == 1)
+        _sim = _at("2026-08-22 22:00") + timedelta(seconds=5)
+        for _i in range(17):                    # 16 gaps x 15min = the same 4h
+            _when = _sim + timedelta(minutes=15 * _i)
+            store.record("youtube", _lyacct, {
+                "timestamp_utc": _when.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "is_live": "true", "viewer_count": "40",
+                "subscriber_count": "5000", "like_count": str(100 + _i),
+                "title": "LIVE: Magic Kingdom day",
+                "started_at": _sim.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "video_id": "sim22aug",
+            }, source="fixture", refresh=False)
+        store.record("youtube", _lyacct, {
+            "timestamp_utc": (_sim + timedelta(hours=4, minutes=30)).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "is_live": "false", "viewer_count": "", "subscriber_count": "5000",
+            "like_count": "", "title": "", "started_at": "", "video_id": ""},
+            source="fixture", refresh=False)
+
         db.execute("SELECT tm.refresh_range(%s, %s, %s, %s, 30)",
                    (_lcid, date(2026, 8, 1), date(2026, 8, 31), _zone_name))
         # The gap 005 had to close for report_stream_metric, closed here too:
         # refresh_range() must fill this table, or an imported archive never
         # produces a per-broadcast row at all.
+        #
+        # FOUR ROWS FOR THREE BROADCASTS, which is the distinction the rest of
+        # this block turns on: three afternoons, one of them simulcast.
         check("refresh_range fills the stream trends",
               db.execute("SELECT count(*) FROM tm.report_stream_trend "
-                         "WHERE channel_id = %s", (_lcid,), fetch=True)[0][0] == 3)
+                         "WHERE channel_id = %s", (_lcid,), fetch=True)[0][0] == 4)
+        check("and files the simulcast on its own platform, not onto the twitch row",
+              db.execute("SELECT count(*) FROM tm.report_stream_trend WHERE "
+                         "channel_id = %s AND platform = 'youtube'",
+                         (_lcid,), fetch=True)[0][0] == 1)
 
         _rows = store.stream_trends(_lslug, "twitch", date(2026, 8, 31),
                                     timezone_name=_zone_name)
@@ -3228,8 +3317,18 @@ else:
         check("the lister names every venue on record",
               set(_places_db) == {"EPCOT", "Magic Kingdom"},
               str(sorted(_places_db)))
-        check("with the broadcast count that orders the picker",
-              _places_db["Magic Kingdom"]["streams"] == 2
+        # THE COUNT THE PICKER PRINTS. Magic Kingdom is three rows -- two twitch
+        # afternoons, one of them simulcast -- and two afternoons. Counting rows
+        # here is what made a venue visited once read "2 stream(s)" above a chart
+        # headed "last 1 broadcast(s)".
+        check("the broadcast count links the simulcast rather than doubling it",
+              _places_db["Magic Kingdom"]["broadcasts"] == 2,
+              str(_places_db["Magic Kingdom"]["broadcasts"]))
+        check("while the row count is still there for the per-platform charts",
+              _places_db["Magic Kingdom"]["streams"] == 3,
+              str(_places_db["Magic Kingdom"]["streams"]))
+        check("and a venue nobody simulcast counts the same either way",
+              _places_db["EPCOT"]["broadcasts"] == 1
               and _places_db["EPCOT"]["streams"] == 1)
         check("busiest first, which is the order the picker reads",
               [p["key"] for p in store.stream_locations(
@@ -3240,6 +3339,25 @@ else:
         check("it names the platforms, so a page can skip an empty panel",
               _places_db["EPCOT"]["platforms"] == ["twitch"],
               str(_places_db["EPCOT"]["platforms"]))
+        check("and names both where the venue was simulcast",
+              _places_db["Magic Kingdom"]["platforms"] == ["twitch", "youtube"],
+              str(_places_db["Magic Kingdom"]["platforms"]))
+        # The other half of the linking rule, and the reason it is overlap
+        # rather than max() of the per-platform counts: two visits that never
+        # shared an afternoon are two broadcasts however few platforms each used.
+        # Moving the YouTube row a week clear of the twitch one must UNLINK it.
+        db.execute("UPDATE tm.report_stream_trend SET started_at = started_at "
+                   "+ interval '7 days', local_date = local_date + 7 "
+                   "WHERE channel_id = %s AND platform = 'youtube'", (_lcid,))
+        check("two visits that never overlapped stay two broadcasts",
+              {p["key"]: p["broadcasts"] for p in store.stream_locations(
+                  _lslug, timezone_name=_zone_name)}["Magic Kingdom"] == 3)
+        db.execute("UPDATE tm.report_stream_trend SET started_at = started_at "
+                   "- interval '7 days', local_date = local_date - 7 "
+                   "WHERE channel_id = %s AND platform = 'youtube'", (_lcid,))
+        check("and link again once they do",
+              {p["key"]: p["broadcasts"] for p in store.stream_locations(
+                  _lslug, timezone_name=_zone_name)}["Magic Kingdom"] == 2)
 
         # The invariants the CHECKs encode, enforced by the database rather than
         # by whoever writes the next refresh function -- the same argument

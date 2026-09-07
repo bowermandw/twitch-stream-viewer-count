@@ -459,11 +459,14 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
 
 
 def render_location_charts(channel, day, args, known=None, known_locations=None):
-    """[(slug, name, streams, kind, platform, path)] for every venue on record.
+    """[(place, kind, platform, path)] for every venue on record.
 
-    `streams` rides along so the publisher can write the picker's counts without
-    running the venue query a second time -- it is what orders the picker, and
-    the two must not be able to disagree about it.
+    `place` is one of picker_order()'s entries whole -- (slug, name, broadcasts,
+    platforms) -- riding along so the publisher can write the picker's counts
+    without running the venue query a second time. It is what orders the picker,
+    and the two must not be able to disagree about it. Passed as one item rather
+    than spread, so a fifth thing the picker needs does not widen every tuple
+    between here and _publish_locations().
 
     Its own function rather than a branch inside render_trend_charts(), so a
     venue whose charts will not build cannot take the Trends page down with it
@@ -489,14 +492,15 @@ def render_location_charts(channel, day, args, known=None, known_locations=None)
     # 0 means every broadcast on record; store reads None as "no window".
     history_count = args.location_history or None
     ordered = s3.picker_order(places)
-    # picker_order() returns (slug, display name, count); the reads below want
-    # the venue as the DATABASE spells it, which is "" for the unmatched ones
-    # where the display name is "Unknown". Zipping the two here means exactly one
-    # place knows both spellings.
+    # picker_order() returns the venue by its DISPLAY name; the reads below want
+    # it as the DATABASE spells it, which is "" for the unmatched ones where the
+    # display name is "Unknown". Zipping the two here means exactly one place
+    # knows both spellings.
     by_name = {place["name"]: place["key"] for place in places}
 
     made = []
-    for slug, name, streams in ordered:
+    for place in ordered:
+        slug, name = place[0], place[1]
         where = by_name.get(name, name)
         for platform in PLATFORMS:
             try:
@@ -527,7 +531,7 @@ def render_location_charts(channel, day, args, known=None, known_locations=None)
                 os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
                 with open(out, "w", encoding="utf-8") as handle:
                     handle.write(svg)
-                made.append((slug, name, streams, kind, platform, out))
+                made.append((place, kind, platform, out))
     return made
 
 
@@ -578,12 +582,12 @@ def _publish_locations(channel, day, work):
             # there and the picker's links should keep working.
             return bool(s3.list_location_pages(channel))
         places = []
-        for slug, name, streams, kind, platform, path in work:
-            s3.upload_location_chart(channel, path, slug, kind, platform)
-            if (slug, name, streams) not in places:
+        for place, kind, platform, path in work:
+            s3.upload_location_chart(channel, path, place[0], kind, platform)
+            if place not in places:
                 # Order preserved from render_location_charts(), which is
                 # picker_order()'s -- so the manifest it writes IS the picker.
-                places.append((slug, name, streams))
+                places.append(place)
         written = s3.publish_locations(channel, day, places)
         log("{}  {} location page(s) rebuilt from {} chart(s)".format(
             channel, written, len(work)))
@@ -723,7 +727,7 @@ def report_channel(channel, day, args):
     skip_locations = args.no_trends or args.no_locations
     if not skip_locations:
         try:
-            known_locations = {slug for slug, _, _ in s3.picker_order(
+            known_locations = {place[0] for place in s3.picker_order(
                 store.stream_locations(channel))}
         except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
             log("WARN     {} — venues not listed, drawing plain bars: {}".format(

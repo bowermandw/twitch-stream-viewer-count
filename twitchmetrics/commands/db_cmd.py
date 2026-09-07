@@ -408,7 +408,7 @@ def add_location_rules(channel, rules, dry_run=False):
                    (channel_id, seq, pattern, name or pattern))
         print("added      {:>4}  {!r} -> {}".format(seq, pattern, name or pattern))
     if not dry_run:
-        print("re-filed {} broadcast(s)".format(_refresh_locations(channel_id)))
+        print("re-filed {} stream(s)".format(_refresh_locations(channel_id)))
     return 0
 
 
@@ -428,7 +428,7 @@ def drop_location_rules(channel, seqs, dry_run=False):
         print("dropped    {:>4}  {!r}".format(seq, gone[0][0]) if gone
               else "no rule with seq {}".format(seq))
     if not dry_run:
-        print("re-filed {} broadcast(s)".format(_refresh_locations(channel_id)))
+        print("re-filed {} stream(s)".format(_refresh_locations(channel_id)))
     return 0
 
 
@@ -463,7 +463,12 @@ def list_locations(channel):
             seq, pattern[:32], location[:21], claimed.get(location, 0)))
     unknown = claimed.get("", 0)
     total = sum(claimed.values())
-    print("  {} of {} broadcast(s) matched; {} unknown".format(
+    # "stream(s)", not "broadcast(s)": this counts tm.report_stream_trend rows,
+    # which is one per stream PER PLATFORM, and a rule matches a title on one
+    # platform at a time -- so rows are the thing a rule can be said to claim.
+    # The picker's count is the other number, one per simulcast rather than two;
+    # 011_location_broadcasts.sql keeps the two words apart.
+    print("  {} of {} stream(s) matched; {} unknown".format(
         total - unknown, total, unknown))
     return 0
 
