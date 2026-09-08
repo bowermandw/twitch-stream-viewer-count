@@ -8,6 +8,10 @@ because bucket names are global.
 There is no login flow here. An access key is a pair of strings in .env, or
 boto3 finds one in ~/.aws/credentials or an instance role, so the browser dance
 the Drive command needed has no equivalent.
+
+`--prune-trends` is the one mode that removes anything: the objects a retired
+chart kind left behind, which the Trends page already stops linking but nothing
+else deletes. It lists them unless told `--yes`.
 """
 
 import sys
@@ -32,6 +36,11 @@ def add_arguments(parser):
                         help="rebuild index.html from the bucket, uploading nothing else")
     parser.add_argument("--list", dest="list_all", action="store_true",
                         help="list every channel that has a bucket, then exit")
+    parser.add_argument("--prune-trends", dest="prune_trends", action="store_true",
+                        help="list the trend charts left behind by a retired "
+                             "chart kind; add --yes to delete them")
+    parser.add_argument("--yes", action="store_true",
+                        help="with --prune-trends, actually delete rather than list")
     parser.add_argument("--dry-run", action="store_true",
                         help="say what would happen, touch no network")
 
@@ -95,6 +104,58 @@ def _check(args, channel):
     return 0
 
 
+def _prune_trends(args, channel):
+    """Delete the trends/ charts whose kind nothing renders any more.
+
+    A one-off after a chart is retired, not part of any run. The Trends page is
+    built from a listing filtered by TREND_KINDS, so a retired kind stops being
+    shown the moment the code lands -- the objects simply stay in the bucket,
+    reachable by anyone who kept the URL. This is what removes them.
+
+    Two steps on purpose. Without --yes it lists and exits 0, which is the
+    preview; the deletion needs the flag spelled out, because this is the one
+    command here that destroys anything. A run with nothing to do says so and
+    deletes nothing, so it is safe to repeat.
+
+    The registry lives on the machine that created the buckets, so this has to
+    run there -- from somewhere else, require_bucket() will simply not know the
+    channel.
+    """
+    if args.dry_run:
+        print("Would list {} in {} and delete the charts whose kind is retired."
+              .format(s3.TRENDS_PREFIX, s3.require_bucket(channel)["bucket"]))
+        return 0
+
+    stale = s3.stale_trends(channel)
+    if not stale:
+        print("{}: no stale trend charts.".format(channel))
+        return 0
+
+    print("\n{}: {} stale trend chart(s) in {}:\n".format(
+        channel, len(stale), s3.require_bucket(channel)["bucket"]))
+    for key in stale:
+        print("  {}".format(key))
+    if not args.yes:
+        print("\nNothing deleted. To delete:\n  {} s3 {} --prune-trends --yes\n"
+              .format(config.invocation(), channel))
+        return 0
+
+    # Caught here and nowhere else in this module: every other mode either
+    # publishes something a later run will publish again, or is a read. This one
+    # is a person deleting things by hand, and "AccessDenied" is worth a sentence
+    # rather than a stack trace ending in botocore.
+    try:
+        results = s3.delete_trend_keys(channel, stale)
+    except s3.S3Error as exc:
+        sys.exit("Nothing deleted — {}".format(exc))
+    failed = [(key, why) for key, why in results if why]
+    for key, why in failed:
+        log("WARN     {} — {} not deleted: {}".format(channel, key, why))
+    log("s3       {} stale trend chart(s) deleted for {}".format(
+        len(results) - len(failed), channel))
+    return 1 if failed else 0
+
+
 def run(args):
     config.ensure_dirs()
 
@@ -118,6 +179,9 @@ def run(args):
 
     if args.check:
         return _check(args, channel)
+
+    if args.prune_trends:
+        return _prune_trends(args, channel)
 
     if args.publish_index:
         if args.dry_run:

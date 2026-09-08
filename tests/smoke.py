@@ -808,16 +808,6 @@ _end = date(2026, 8, 25)
 # Streamed today and three days ago, nothing in between.
 _history = (_day_samples(_end, 19, 120, lambda i: 100 + i)
             + _day_samples(_end - timedelta(days=3), 19, 120, lambda i: 300 + i))
-_peaks = trends.daily_peaks(_history, _end, 10, calendar=True)
-check("a ten-day calendar window has ten entries", len(_peaks) == 10)
-check("oldest first, ending today",
-      _peaks[0]["day"] == _end - timedelta(days=9) and _peaks[-1]["day"] == _end)
-check("a day never streamed has no peak, not a zero",
-      _peaks[-2]["peak"] is None)
-check("a day that streamed carries its highest count",
-      _peaks[-1]["peak"] == 219 and _peaks[-4]["peak"] == 419)
-check("and when it happened", _peaks[-1]["at"] is not None)
-
 # The whole reason this isn't chart.bucket_averages(): two streams that started
 # an hour apart must still line their 8pm samples up in the same block.
 _late = _day_samples(_end, 20, 60, lambda i: 10)
@@ -845,22 +835,6 @@ check("a twenty-hour day is trimmed to half a day of slots",
 check("and what is kept is contiguous, not the fullest slots scattered about",
       _kept == list(range(_kept[0], _kept[0] + len(_kept))))
 
-_peaks_svg = trends.render_peaks(_peaks, "testchannel", "twitch", _end)   # calendar
-check("the peaks chart renders",
-      _peaks_svg.startswith("<svg") and _peaks_svg.endswith("</svg>"))
-check("it names the best day and its figure",
-      "Best day" in _peaks_svg and "419" in _peaks_svg)
-check("a day with no stream is drawn as absent, not as nobody watching",
-      trends.DASH in _peaks_svg)
-check("one day of history is still a chart",
-      trends.render_peaks(trends.daily_peaks(_day_samples(_end, 19, 60, lambda i: 5),
-                                             _end, 10), "t", "twitch", _end) is not None)
-check("no history at all is not a chart",
-      trends.render_peaks(trends.daily_peaks([], _end, 10), "t", "twitch", _end) is None)
-check("and neither is a calendar window with nothing in it",
-      trends.render_peaks(trends.daily_peaks([], _end, 10, calendar=True),
-                          "t", "twitch", _end) is None)
-
 _typical_svg = trends.render_typical(_slots, _per_day, "testchannel", "twitch", _end)
 check("the comparison chart renders",
       _typical_svg.startswith("<svg") and _typical_svg.endswith("</svg>"))
@@ -873,48 +847,39 @@ check("no data at all is not a chart",
                             "t", "twitch", _end) is None)
 check("a platform with nothing gets no charts at all",
       trends.render_all([], "t", "twitch", _end) == {})
-check("and one with history gets both",
-      sorted(trends.render_all(_history, "t", "twitch", _end)) == ["peaks", "typical"])
+check("and one with history gets the day-axis chart",
+      sorted(trends.render_all(_history, "t", "twitch", _end)) == ["typical"])
 check("the channel name is escaped into the chart",
-      "&lt;b&gt;" in trends.render_peaks(_peaks, "<b>", "twitch", _end))
+      "&lt;b&gt;" in trends.render_typical(_slots, _per_day, "<b>", "twitch", _end))
 
 # The bars are links. An <img>-embedded SVG is inert down to its tooltips,
 # which is why trends.html embeds these with <object> instead: that is what
 # makes an <a> inside one clickable at all, and target="_top" is what stops the
 # click replacing the chart rather than the page around it.
-_streamed = next(e["day"] for e in _peaks if e["peak"] is not None)
-_dark = next(e["day"] for e in _peaks if e["peak"] is None)
 check("a bar links to its own day page, a directory up from trends/",
-      'href="../day/{}.html"'.format(_streamed.isoformat()) in _peaks_svg)
+      'href="../day/{}.html"'.format((_end - timedelta(days=3)).isoformat())
+      in _typical_svg)
 check("aimed at the page, not at the frame the chart sits in",
-      'target="_top"' in _peaks_svg)
-check("with the figure repeated as hover text", "peak</title>" in _peaks_svg)
-check("a day with no stream is not a link to a page that was never written",
-      'href="../day/{}.html"'.format(_dark.isoformat()) not in _peaks_svg)
+      'target="_top"' in _typical_svg)
 check("the comparison chart links from its bars and from its legend",
       "avg</title>" in _typical_svg and "<title>Open " in _typical_svg)
 check("known= suppresses every bar the bucket has no page for",
-      'href="../day/' not in trends.render_peaks(_peaks, "t", "twitch", _end,
-                                                 known=set()))
-_one = trends.render_peaks(_peaks, "t", "twitch", _end,
-                           known={_streamed.isoformat()})
-check("and the bars it suppresses still draw, just unlinked",
-      _one.count('href="../day/') == 1 and _one.count("<rect") > 2)
+      'href="../day/' not in trends.render_typical(_slots, _per_day, "t", "twitch",
+                                                   _end, known=set()))
 
-# render_from() is the seam the daily report now goes through: same charts,
+# render_from() is the seam the daily report now goes through: the same chart,
 # from aggregates somebody else worked out. Byte-identical output is the whole
 # guarantee -- it is what says the split changed nothing, and it is the shape
 # the SQL path is held to over in the postgres section.
 check("render_from draws exactly what render_all draws",
-      trends.render_from(_peaks, _slots, _per_day, "t", "twitch", _end,
-                         dropped=_dropped)
+      trends.render_from(_slots, _per_day, "t", "twitch", _end, dropped=_dropped)
       == trends.render_all(_history, "t", "twitch", _end, calendar=True))
 check("and nothing at all still means no charts",
-      trends.render_from([], [], [], "t", "twitch", _end) == {})
+      trends.render_from([], [], "t", "twitch", _end) == {})
 # The links have to be on both sides of the seam or the parity check below
 # would pass on two charts that disagree about what is clickable.
-check("known= reaches both charts through render_from",
-      trends.render_from(_peaks, _slots, _per_day, "t", "twitch", _end,
+check("known= reaches the chart through render_from",
+      trends.render_from(_slots, _per_day, "t", "twitch", _end,
                          dropped=_dropped, known=set())
       == trends.render_all(_history, "t", "twitch", _end, calendar=True,
                            known=set()))
@@ -944,26 +909,16 @@ check("a stream older than the lookback is out of reach",
 check("and comes back when the lookback is widened",
       len(trends.streamed_window(_ancient, _end, 10, lookback=365)) == 3)
 
-_speaks = trends.daily_peaks(_history, _end, 10)
-check("the peaks chart draws streams, not dates", len(_speaks) == 2)
-check("so no entry on it can be a day off",
-      all(e["peak"] is not None for e in _speaks))
-check("and the figures are the same ones the calendar axis found",
-      [e["peak"] for e in _speaks] == [419, 219])
 _sslots, _sper, _sdrop = trends.compare_slots(_history, _end, 5)
-check("the comparison does the same", len(_sper) == 2)
+check("the comparison draws streams, not dates", len(_sper) == 2)
 check("with every day on it holding data",
       all(buckets for _, buckets in _sper))
 check("and the same slots as the calendar window found",
       _sslots == _slots)
+check("while the calendar axis still keeps a slot for each day off",
+      len(_per_day) == 6 and sum(1 for _, b in _per_day if b) == 2)
 
-_speaks_svg = trends.render_peaks(_speaks, "testchannel", "twitch", _end)
-check("a streamed axis draws no dashes at all", trends.DASH not in _speaks_svg)
-check("and says how many streams, not how many days",
-      "last 2 day(s) with a stream" in _speaks_svg)
-check("the calendar axis still draws its dashes", trends.DASH in _peaks_svg)
-
-# Labels. "Mon 18" cannot separate two Mondays six weeks apart, and a streamed
+# Labels. "Mon 18" cannot separate two Mondays six weeks apart, and a broadcast
 # axis routinely spans that far.
 check("a day is short when the axis stays inside a month",
       trends.fmt_day(date(2026, 8, 18)) == "Tue 18")
@@ -973,14 +928,22 @@ check("an axis inside one month needs no month",
       not trends.spans_months([date(2026, 8, 1), date(2026, 8, 31)]))
 check("one that crosses a month does",
       trends.spans_months([date(2026, 7, 30), date(2026, 8, 2)]))
-_across = (_day_samples(_end, 19, 60, lambda i: 5)
-           + _day_samples(date(2026, 7, 28), 19, 60, lambda i: 5))
+# The per-broadcast axis carries the labels now, so it is the one held to them.
+_across = [{"stream_id": 1, "day": date(2026, 7, 28), "weekday": 1, "title": "t",
+            "location": None, "peak": 5,
+            "started": datetime(2026, 7, 28, 19, tzinfo=timezone.utc)},
+           {"stream_id": 2, "day": _end, "weekday": _end.weekday(), "title": "t",
+            "location": None, "peak": 7,
+            "started": datetime(2026, 8, 25, 19, tzinfo=timezone.utc)}]
+_across_svg = trends.render_stream_bars(_across, "t", "twitch", _end, "peak")
 check("and a chart spanning one labels its bars with it",
-      "Tue 28 Jul" in trends.render_peaks(
-          trends.daily_peaks(_across, _end, 10), "t", "twitch", _end))
+      "Tue 28 Jul" in _across_svg)
 check("the span is named rather than left to be inferred",
-      "Tue 28 Jul – Tue 25 Aug" in trends.render_peaks(
-          trends.daily_peaks(_across, _end, 10), "t", "twitch", _end))
+      "Tue 28 Jul – Tue 25 Aug" in _across_svg)
+check("a broadcast axis says how many broadcasts, not how many days",
+      "last 2 broadcast(s)" in _across_svg)
+check("and draws no dashes, every bar on it having a reading",
+      trends.DASH not in _across_svg)
 
 # "Today" by date, not by position. On the platform a channel did NOT stream
 # today, the newest entry on the axis is not today -- and reading per_day[-1]
@@ -1121,9 +1084,9 @@ check("an unreadable titles.json is not fatal",
 # --- s3 trends page -------------------------------------------------------
 section("s3 trends page")
 check("a trend chart has a fixed key, no date in it",
-      s3.trend_key("peaks", "twitch") == "trends/peaks-twitch.svg")
-check("and it parses back", s3.parse_trend_key("trends/peaks-twitch.svg")
-      == ("peaks", "twitch"))
+      s3.trend_key("peakstream", "twitch") == "trends/peakstream-twitch.svg")
+check("and it parses back", s3.parse_trend_key("trends/peakstream-twitch.svg")
+      == ("peakstream", "twitch"))
 # The whole reason the filename is not a date: the index is built by matching
 # keys, and a trend chart mistaken for a platform would put a "trends" panel on
 # the front page and a nonsense row in Past days.
@@ -1135,19 +1098,19 @@ check("and the trend matcher ignores a day's chart",
 check("as it does the page itself", s3.parse_trend_key(s3.TRENDS_KEY) is None)
 
 _trends_page = s3.render_trends("testchannel", date(2026, 8, 25),
-                                [("peaks", "twitch"), ("typical", "youtube")])
+                                [("peakstream", "twitch"), ("typical", "youtube")])
 check("the trends page is a whole document",
       _trends_page.startswith("<!doctype html>")
       and _trends_page.rstrip().endswith("</html>"))
 check("it shows a panel per chart the bucket holds",
       _trends_page.count("<object") == 2)
 check("embedded as objects, or the links inside the SVG would be inert",
-      'data="trends/peaks-twitch.svg"' in _trends_page)
+      'data="trends/peakstream-twitch.svg"' in _trends_page)
 check("each with an <img> fallback for a browser that declines the object",
       _trends_page.count("<img") == 2)
-check("by relative key", 'src="trends/peaks-twitch.svg"' in _trends_page)
+check("by relative key", 'src="trends/peakstream-twitch.svg"' in _trends_page)
 check("and told its aspect ratio, which <object> will not work out",
-      "aspect-ratio: 1300 / 380" in _trends_page
+      "aspect-ratio: 1300 / 400" in _trends_page
       and "aspect-ratio: 1300 / 430" in _trends_page)
 check("it never links a chart that isn't there",
       "typical-twitch" not in _trends_page)
@@ -1291,11 +1254,10 @@ check("render_streams returns only what it could draw",
       set(trends.render_streams(_streams, {"weekday": _groups}, "t", "twitch",
                                 date(2026, 8, 22)))
       == {"peakstream", "followers", "weekday"})
-# The by-day peaks chart and this one are one letter apart as metric names and
-# must not be as KEYS: trends/peak-twitch.svg beside trends/peaks-twitch.svg
-# would be two charts in one directory telling a reader nothing about which is
-# which. This is the check that keeps them apart.
-check("peak viewers per broadcast has a kind of its own, not the by-day chart's",
+# The metric is "peak" and the published kind is "peakstream". They stay
+# different strings: the kind is a filename, and renaming it would orphan every
+# trends/peakstream-*.svg already sitting in a bucket.
+check("peak viewers per broadcast publishes under its own kind, not its metric",
       trends.STREAM_METRICS["peak"]["kind"] == "peakstream"
       and "peakstream" in s3.TREND_KINDS and "peak" not in s3.TREND_KINDS)
 check("and nothing at all for a platform with neither",
@@ -1435,62 +1397,27 @@ check("it draws for Twitch as readily as for YouTube",
       trends.render_stream_bars(_wstreams, "t", "twitch", date(2026, 8, 27),
                                 "watchtime") is not None)
 
-# --- the trailing total ---------------------------------------------------
-_wdays = [{"day": date(2026, 8, 20) + timedelta(days=n),
-           "status": "live" if n else "dark",
-           "watch_minutes": None if not n else n * 6000.0,
-           "watchtime": None if not n else n * 100.0,
-           "covered": 3600,
-           "rolling_minutes": None if not n else n * (n + 1) / 2 * 6000.0,
-           "rolling": None if not n else n * (n + 1) / 2 * 100.0}
-          for n in range(6)]
-_wroll = trends.render_watch_rolling(_wdays, "t", "youtube", date(2026, 8, 25),
-                                     target=trends.YPP_TARGET_HOURS)
-check("the rolling chart draws the trailing total", "1,500" in _wroll)
-check("it says what the estimate excludes, on the chart itself",
-      "excludes replay watch time" in _wroll)
-# Matched around the apostrophe: everything drawn goes through chart.esc(), so
-# the SVG holds "platform&#x27;s" and a literal search for the sentence fails.
-check("and that it is not the platform's own figure",
-      "Not the platform" in _wroll and "own figure" in _wroll)
-check("YouTube gets the 4,000-hour reference line",
-      "4,000 h reference" in _wroll)
-# The line is a reference and not a goal, because the estimate cannot support
-# being read as progress towards monetisation. The chart has to say so itself:
-# a caveat that lives only in a docstring is a caveat nobody reading it sees.
-check("labelled a reference rather than a target",
-      "reference" in _wroll and "not the YPP figure" in _wroll)
-check("Twitch has no such threshold, so it gets no line",
-      "reference" not in trends.render_watch_rolling(
-          _wdays, "t", "twitch", date(2026, 8, 25)))
-check("a day with no stream still moves the trailing total",
-      _wroll.count("<circle") >= 1)
-check("nothing to draw is None, not an empty chart",
-      trends.render_watch_rolling([], "t", "youtube", date(2026, 8, 25)) is None
-      and trends.render_watch_rolling(
-          [dict(d, rolling=None) for d in _wdays], "t", "youtube",
-          date(2026, 8, 25)) is None)
-check("no script anywhere", "<script" not in _wroll.lower())
-
-check("render_streams adds the rolling chart when it is given the days",
-      "watchrolling" in trends.render_streams(
-          _wstreams, {}, "t", "youtube", date(2026, 8, 27), watch=_wdays))
-check("and leaves it out when it is not",
-      "watchrolling" not in trends.render_streams(
-          _wstreams, {}, "t", "youtube", date(2026, 8, 27)))
-
-# Every kind the renderers can produce has to be publishable, or the chart is
-# written to charts/ every night and never reaches the page.
-check("both new charts are known to the publisher",
-      {"watchtime", "watchrolling"} <= set(s3.TREND_KINDS))
+# The watch-hour kinds have to be publishable, or a chart is written to charts/
+# every night and never reaches the page.
+check("the watch-hour charts are known to the publisher",
+      {"watchtime", "watchlocation"} <= set(s3.TREND_KINDS))
 check("both have a label on every platform",
       all((k, p) in s3.TREND_LABELS
-          for k in ("watchtime", "watchrolling") for p in ("twitch", "youtube")))
+          for k in ("watchtime", "watchlocation") for p in ("twitch", "youtube")))
 check("and an aspect ratio, or the page cannot size the <object>",
-      all(k in trends.SIZES for k in ("watchtime", "watchrolling")))
+      all(k in trends.SIZES for k in ("watchtime", "watchlocation")))
 check("the labels say the number is an estimate",
       all("Estimated" in s3.TREND_LABELS[(k, p)]
-          for k in ("watchtime", "watchrolling") for p in ("twitch", "youtube")))
+          for k in ("watchtime", "watchlocation") for p in ("twitch", "youtube")))
+# The trailing-365-day line chart used to sit here. It was the one chart on the
+# page reading a window of DAYS rather than of broadcasts, and the only one
+# inviting comparison with YouTube's 4,000-hour threshold -- which an integral
+# under the live viewer curve cannot support. Gone with its query and its flags.
+_store_src = open(os.path.join(root, "twitchmetrics/store.py")).read()
+check("no rolling watch-hours chart survives anywhere",
+      not hasattr(trends, "render_watch_rolling")
+      and "watchrolling" not in s3.TREND_KINDS
+      and "def watch_totals" not in _store_src)
 
 # --- watch hours by location ----------------------------------------------
 # The same renderer as the followers-by-location chart, fed a different metric
@@ -1634,7 +1561,7 @@ _cmp = trends.render_stream_groups(
     _cmp_rows, "t", "twitch", date(2026, 8, 22), "peak", "location",
     highlight="EPCOT", baseline=_weighted,
     links={"EPCOT": "../epcot.html", "Magic Kingdom": "../magic-kingdom.html"})
-check("the baseline is a dashed reference line, like the YPP one",
+check("the baseline is drawn as a dashed reference line",
       "stroke-dasharray" in _cmp)
 # A venue with thirty broadcasts and one with two must not have equal say -- the
 # same argument this renderer already makes about its coverage note. The two
@@ -1818,7 +1745,7 @@ check("and the location matchers ignore every key that came before them",
       all(s3.parse_location_key(_k) is None
           and s3.parse_location_chart_key(_k) is None
           for _k in ("index.html", "trends.html", "titles.json",
-                     "twitch/2026-08-24.svg", "trends/peaks-twitch.svg",
+                     "twitch/2026-08-24.svg", "trends/peakstream-twitch.svg",
                      "day/2026-08-24.html")))
 check("a page and a chart cannot be mistaken for each other",
       s3.parse_location_chart_key(_lkey) is None
@@ -2153,6 +2080,55 @@ with tempfile.TemporaryDirectory() as tmp:
     _r = subprocess.run([sys.executable, "-m", "twitchmetrics", "s3", "x", "--url"],
                         cwd=root, capture_output=True, text=True, env=_env)
     check("and points at --setup", "--setup" in (_r.stdout + _r.stderr))
+
+# --- pruning a retired chart ----------------------------------------------
+# What is stale is decided by a pure function, so it is decided here rather than
+# against a bucket. A retired kind leaves its objects behind: the Trends page
+# stops showing them the moment TREND_KINDS loses the kind, but nothing deletes
+# them, and the URL keeps working for anyone who kept it.
+_bucket_keys = ["index.html", "trends.html", "titles.json", "locations.json",
+                "day/2026-08-24.html", "twitch/2026-08-24.svg",
+                "trends/peakstream-twitch.svg", "trends/typical-youtube.svg",
+                "trends/peaks-twitch.svg", "trends/peaks-youtube.svg",
+                "trends/watchrolling-youtube.svg",
+                "location/magic-kingdom.html",
+                "location/magic-kingdom-peakstream-twitch.svg"]
+_stale = s3.orphan_trend_keys(_bucket_keys)
+check("the retired kinds are the stale ones",
+      _stale == ["trends/peaks-twitch.svg", "trends/peaks-youtube.svg",
+                 "trends/watchrolling-youtube.svg"], str(_stale))
+check("every kind still drawn is left alone",
+      not any(k in _stale for k in ("trends/peakstream-twitch.svg",
+                                    "trends/typical-youtube.svg")))
+# The two failure modes that would matter: sweeping up a page because it is not
+# a chart, and sweeping up a venue's charts because its rule was dropped. A
+# dropped venue is already unlinked by list_locations() and may come back.
+check("nothing outside trends/ is ever stale",
+      not any(k.startswith(("index", "day/", "twitch/", "location/", "titles",
+                            "locations")) for k in _stale))
+check("and a key the matcher does not recognise is not swept up",
+      s3.orphan_trend_keys(["trends/", "trends/notes.txt",
+                            "trends/peaks-twitch.svg.bak"]) == [])
+check("every trend kind in the registry round-trips as NOT stale",
+      s3.orphan_trend_keys([s3.trend_key(k, p) for k in s3.TREND_KINDS
+                            for p in ("twitch", "youtube")]) == [])
+# The guard is re-derived inside the delete rather than trusted from the
+# argument, which is what stops a caller's stale list -- computed against
+# another version of TREND_KINDS -- from removing a live chart.
+_del_src = (open(os.path.join(root, "twitchmetrics/s3.py")).read()
+            .split("def delete_trend_keys")[1].split("\ndef ")[0])
+check("the deletion re-checks its own list rather than trusting the caller",
+      "orphan_trend_keys(keys)" in _del_src)
+check("and it is the only thing in the module that deletes an object",
+      open(os.path.join(root, "twitchmetrics/s3.py")).read()
+      .count("s3.delete_objects(") == 1)
+# Listing is the preview and --yes is the deletion: a destructive one-off must
+# not be a single keystroke away from a typo.
+_s3cmd_src = open(os.path.join(root, "twitchmetrics/commands/s3_cmd.py")).read()
+check("pruning without --yes deletes nothing",
+      "if not args.yes:" in _s3cmd_src
+      and _s3cmd_src.index("if not args.yes:")
+      < _s3cmd_src.index("s3.delete_trend_keys"))
 
 # --- aws configuration ----------------------------------------------------
 section("aws configuration")
@@ -2645,6 +2621,34 @@ else:
         # and the only thing keeping them the same is this comparison. It runs
         # against the fixtures, which is why they are committed.
         _TOL = 1e-6      # both sides are decimal now; this is slack, not need
+
+        def _calendar_peaks(samples, end_day, days=10):
+            """The by-day peaks trends.py used to build, kept as the expectation
+            tm.daily_peaks() is held to.
+
+            No chart draws a bar per day any more, but store.streamed_days()
+            still reads that function -- a date reaches the broadcast axis by
+            having a peak there -- so the SQL stays under test. A day with no
+            live samples is None and never 0, which is the invariant the whole
+            migration had to preserve.
+            """
+            out = []
+            for local_date in trends.window(end_day, days):
+                live = trends._live_on(samples, local_date)
+                best = max(live, key=lambda s: s["viewers"]) if live else None
+                out.append({"day": local_date,
+                            "peak": best["viewers"] if best else None,
+                            "at": best["when"] if best else None})
+            return out
+
+        def _sql_peaks(cid, platform, end_day, zone, days=10):
+            # Cast for DAILY_PEAKS_SQL's reason: psycopg sends a small Python
+            # int as int2, and a NULL channel id as an untyped parameter.
+            return db.execute("SELECT local_date, peak_viewers, peak_at "
+                              "FROM tm.daily_peaks(%s::bigint,%s,%s,"
+                              "%s::integer,%s)",
+                              (cid, platform, end_day, days, zone), fetch=True)
+
         for _fixture, _platform in ((PLAIN, "twitch"), (YOUTUBE, "youtube")):
             _slug = "smoke_" + os.path.basename(_fixture)[:-4].split("_", 1)[1]
             _label = "{} {}".format(_slug, _platform)
@@ -2661,12 +2665,11 @@ else:
                        (_cid, _days[0], _end, _zone_name))
 
             # peak per day, including the days with no stream at all -- the
-            # invariant this whole migration had to preserve.
-            _want = trends.daily_peaks(_rows, _end, 10, calendar=True)
-            _got = db.execute("SELECT local_date, peak_viewers, peak_at "
-                              "FROM tm.daily_peaks(%s,%s,%s,10,%s)",
-                              (_cid, _platform, _end, _zone_name), fetch=True)
-            check("{}: SQL daily_peaks matches trends.daily_peaks".format(_label),
+            # invariant this whole migration had to preserve, and the one
+            # store.streamed_days() reads the function for.
+            _want = _calendar_peaks(_rows, _end)
+            _got = _sql_peaks(_cid, _platform, _end, _zone_name)
+            check("{}: SQL daily_peaks matches the samples".format(_label),
                   len(_want) == len(_got) and all(
                       w["day"] == g[0] and w["peak"] == g[1]
                       and (w["peak"] is None or w["at"] == g[2])
@@ -2711,11 +2714,6 @@ else:
             # that has to be right: same values, same shape, same types. A
             # result holding the right numbers under the wrong keys, or as
             # Decimals, draws no chart and raises no error.
-            _sp = store.daily_peaks(_slug, _platform, _end, 10, calendar=True,
-                                    timezone_name=_zone_name)
-            check("{}: store.daily_peaks matches trends.daily_peaks exactly".format(_label),
-                  _sp == _want, "{} vs {}".format(_sp[:2], _want[:2]))
-
             _ss, _sper, _sdrop = store.compare_slots(_slug, _platform, _end, 5, 30,
                                                      calendar=True,
                                                      timezone_name=_zone_name)
@@ -2738,20 +2736,17 @@ else:
             # Python rather than taken from the rows -- invisible on a fixture
             # whose window happens to end on a day that streamed.
             _future = _end + timedelta(days=3)
-            _fp = store.daily_peaks(_slug, _platform, _future, 10, calendar=True,
-                                    timezone_name=_zone_name)
-            check("{}: the peaks axis stays full past the last stream".format(_label),
-                  len(_fp) == 10 and [e["peak"] for e in _fp[-3:]] == [None] * 3)
             _, _fper, _ = store.compare_slots(_slug, _platform, _future, 5, 30,
                                               calendar=True,
                                               timezone_name=_zone_name)
-            check("{}: and so does the comparison axis".format(_label),
+            check("{}: the comparison axis stays full past the last stream".format(
+                      _label),
                   len(_fper) == 6 and all(not b for _, b in _fper[-3:]))
 
             # The acceptance test. Not "the numbers agree" but "the page is the
             # same page": the SQL path and the sample path draw identical SVG.
             check("{}: the SQL path renders the identical charts".format(_label),
-                  trends.render_from(_sp, _ss, _sper, _slug, _platform, _end,
+                  trends.render_from(_ss, _sper, _slug, _platform, _end,
                                      minutes=30, dropped=_sdrop)
                   == trends.render_all(_rows, _slug, _platform, _end, calendar=True))
 
@@ -2759,19 +2754,20 @@ else:
             # The default. Everything above pins the calendar behaviour behind
             # its flag; this is the axis the site actually draws, and it has to
             # agree between SQL and Python just as strictly.
-            _wstream = trends.daily_peaks(_rows, _end, 10)
-            _sstream = store.daily_peaks(_slug, _platform, _end, 10,
-                                         timezone_name=_zone_name)
-            check("{}: store.daily_peaks matches on the streamed axis".format(_label),
-                  _sstream == _wstream,
-                  "{} vs {}".format([e["peak"] for e in _sstream],
-                                    [e["peak"] for e in _wstream]))
-            check("{}: and no day on it is a day off".format(_label),
-                  all(e["peak"] is not None for e in _sstream))
+            # store.streamed_days() is what picks that axis, out of the same
+            # tm.daily_peaks() rows: a date qualifies by having a peak, never by
+            # its status. It is the one thing between the report tables and a
+            # broadcast axis, so it is held to trends.streamed_window()'s answer.
+            _wdates = trends.streamed_window(_rows, _end, 10)
+            _sdates = store.streamed_days(_slug, _platform, _end, 10,
+                                          timezone_name=_zone_name)
+            check("{}: store.streamed_days matches trends.streamed_window".format(
+                      _label),
+                  _sdates == _wdates, "{} vs {}".format(_sdates, _wdates))
             check("{}: and every date on it is one the calendar axis called live".format(
                       _label),
                   all(e["peak"] is not None
-                      for e in _want if e["day"] in {d["day"] for d in _sstream}))
+                      for e in _want if e["day"] in set(_sdates)))
 
             _cw, _cper, _cdrop = trends.compare_slots(_rows, _end, 5, 30)
             _dw, _dper, _ddrop = store.compare_slots(_slug, _platform, _end, 5, 30,
@@ -2792,7 +2788,7 @@ else:
             # by a day pulls in an extra stream, which reweights the busiest
             # stretch and moves bars the equality above would still allow.
             check("{}: the streamed SQL path renders identical charts".format(_label),
-                  trends.render_from(_sstream, _dw, _dper, _slug, _platform, _end,
+                  trends.render_from(_dw, _dper, _slug, _platform, _end,
                                      minutes=30, dropped=_ddrop)
                   == trends.render_all(_rows, _slug, _platform, _end))
 
@@ -2804,8 +2800,7 @@ else:
             db.execute("DELETE FROM tm.report_clock_bucket WHERE channel_id=%s", (_cid,))
             check("{}: a stripped window is noticed and rebuilt".format(_label),
                   store.ensure_reports(_slug, _end, 10, timezone_name=_zone_name)
-                  and store.daily_peaks(_slug, _platform, _end, 10, calendar=True,
-                                        timezone_name=_zone_name) == _want)
+                  and _sql_peaks(_cid, _platform, _end, _zone_name) == _got)
 
             # `daily --bucket` is a real knob: report_clock_bucket keys on the
             # width so two can coexist, and this is the check that they do.
@@ -2847,18 +2842,15 @@ else:
 
         # A slug the channel table has never heard of. tm.daily_peaks() answers
         # a NULL channel_id with a full axis of NULLs, so the danger is not an
-        # exception -- it is a chart that silently reads as "never streamed".
-        # A full axis of None peaks draws nothing, which is the honest answer.
-        check("an unknown channel draws nothing and raises nothing",
-              store.daily_peaks("nosuchchannel_smoke", "twitch", _end, 10,
-                                calendar=True, timezone_name=_zone_name)
-              == [{"day": _d, "peak": None, "at": None}
-                  for _d in trends.window(_end, 10)])
-        # On the streamed axis the honest answer is a shorter one: no dates
-        # streamed, so there is no axis, rather than ten days of nothing.
-        check("and on a streamed axis it is simply empty",
-              store.daily_peaks("nosuchchannel_smoke", "twitch", _end, 10,
-                                timezone_name=_zone_name) == [])
+        # exception -- it is an axis that silently reads as "streamed every day".
+        check("an unknown channel has no peak on any day, and raises nothing",
+              all(_r[1] is None for _r in _sql_peaks(
+                  None, "twitch", _end, _zone_name)))
+        # So the axis built from those rows is empty rather than ten days long:
+        # no date streamed, so there is nothing to draw a broadcast against.
+        check("and the axis it yields is simply empty",
+              store.streamed_days("nosuchchannel_smoke", "twitch", _end, 10,
+                                  timezone_name=_zone_name) == [])
         check("and there is nothing to refresh for it",
               store.ensure_reports("nosuchchannel_smoke", _end, 10,
                                    timezone_name=_zone_name) is False)
@@ -3120,7 +3112,7 @@ else:
         check("one row per broadcast, oldest first",
               len(_rows) == 3
               and [r["started"] for r in _rows] == sorted(r["started"] for r in _rows))
-        # The whole reason this axis exists next to the peaks chart.
+        # The whole reason the charts count broadcasts and not dates.
         _same_day = [r for r in _rows if r["day"] == date(2026, 8, 15)]
         check("two broadcasts on one date stay two rows", len(_same_day) == 2)
         check("and keep their own locations",
@@ -3424,7 +3416,7 @@ _rtc_src = inspect.getsource(daily.render_trend_charts)
 check("the trend charts no longer read the whole sample history",
       "store.load" not in _rtc_src)
 check("they read the report tables instead",
-      "store.daily_peaks" in _rtc_src and "store.compare_slots" in _rtc_src)
+      "store.compare_slots" in _rtc_src and "store.stream_trends" in _rtc_src)
 check("and something refreshes those tables first",
       "store.ensure_reports" in _rtc_src)
 

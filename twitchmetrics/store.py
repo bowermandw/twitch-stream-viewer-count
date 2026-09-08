@@ -692,17 +692,6 @@ def _peak_rows(channel, platform, day, days, zone):
                        zone), fetch=True)
 
 
-def _peak_entry(local_date, peak, at):
-    """One row as trends.daily_peaks() would have built it.
-
-    Normalised the way channel_minutes() normalises: the session zone is pinned
-    to UTC and trends.daily_peaks() carries sample timestamps that are UTC-aware,
-    so the two stay comparable in the parity check.
-    """
-    return {"day": local_date, "peak": peak,
-            "at": at.astimezone(timezone.utc) if (at and peak is not None) else None}
-
-
 def streamed_days(channel, platform, day, count, lookback=trends.LOOKBACK_DAYS,
                   timezone_name=None):
     """The last `count` dates on or before `day` that streamed, oldest first.
@@ -719,48 +708,6 @@ def streamed_days(channel, platform, day, count, lookback=trends.LOOKBACK_DAYS,
     rows = _peak_rows(channel, platform, day, max(1, int(lookback)),
                       timezone_name or config.resolve_db_timezone())
     return [row[0] for row in rows if row[1] is not None][-count:]
-
-
-def daily_peaks(channel, platform, day, days=trends.PEAK_DAYS, calendar=False,
-                lookback=trends.LOOKBACK_DAYS, timezone_name=None):
-    """[{"day", "peak", "at"}, ...] oldest first -- trends.daily_peaks()' shape.
-
-    `calendar` picks the axis, exactly as it does in trends.daily_peaks(): the
-    last `days` dates, or the last `days` dates that streamed.
-
-    On a calendar axis the days are built here rather than taken from the rows.
-    tm.daily_peaks() generates its own and normally returns one row per day, but
-    it returns NONE at all for a slug the channel table doesn't have -- so a
-    short list would not fail, it would quietly relabel the chart. Filling a
-    Python axis makes that impossible. On a streamed axis the rows ARE the axis,
-    because a date only reaches it by having a row.
-
-    A day with no live samples gets peak None and never 0, the same distinction
-    trends.daily_peaks() draws and the same one report_daily_peak_dark_is_null
-    enforces in the table. `status` is deliberately not consulted: the two CHECK
-    constraints already guarantee a non-live day carries no peak, so reading it
-    would add a branch that cannot be exercised.
-    """
-    if days <= 0:
-        # Python's window() is empty here and the SQL's
-        # generate_series(0, greatest(p_days,1)-1) is one row, so this guard is
-        # what keeps `--peak-days 0` from drawing a one-bar chart on one path
-        # and nothing on the other.
-        return []
-    zone = timezone_name or config.resolve_db_timezone()
-
-    if not calendar:
-        rows = [row for row in _peak_rows(channel, platform, day, lookback, zone)
-                if row[1] is not None][-days:]
-        return [_peak_entry(*row) for row in rows]
-
-    found = {row[0]: row for row in _peak_rows(channel, platform, day, days, zone)}
-    out = []
-    for local_date in trends.window(day, days):
-        row = found.get(local_date)
-        out.append(_peak_entry(local_date, row[1] if row else None,
-                               row[2] if row else None))
-    return out
 
 
 COMPARE_SLOTS_SQL = """
@@ -991,58 +938,8 @@ def stream_groups(channel, platform, metric, grouping, day,
 
 
 # --------------------------------------------------------------------------
-# watch time
+# watch time, by venue
 # --------------------------------------------------------------------------
-
-
-WATCH_TOTALS_SQL = """
-SELECT local_date, status::text, watch_minutes, covered_seconds, rolling_minutes
-  FROM tm.watch_totals(
-      (SELECT channel_id FROM tm.channel WHERE slug = %s), %s, %s,
-      %s::integer, %s::integer, %s)
- ORDER BY local_date
-"""
-
-
-def watch_totals(channel, platform, day, days=trends.WATCH_DAYS,
-                 rolling=trends.ROLLING_DAYS, timezone_name=None):
-    """Estimated watch time per local day, with the trailing total at each.
-
-    [{"day", "status", "watch_minutes", "watchtime", "covered",
-      "rolling_minutes", "rolling"}, ...] -- oldest first, one entry per day in
-    the window whether or not it was streamed.
-
-    DENSE, unlike stream_trends(): the underlying report table holds a row for
-    every day in a refreshed range, and a day off arrives with watch_minutes
-    None. The renderer draws that as a dash, which is the distinction the peaks
-    chart already makes -- "did not stream" is not "nobody watched".
-
-    "rolling" is the trailing `rolling`-day total in HOURS, that day inclusive,
-    so the newest entry is the past-twelve-months figure when rolling is 365.
-    It is an estimate of LIVE watch time and undercounts by however much of the
-    audience arrived after the broadcast ended; 008_watchtime.sql says why that
-    makes it unfit for judging the 4,000-hour Partner Programme threshold, and
-    trends.render_watch_rolling() repeats the warning where a reader will see it.
-    """
-    if days <= 0:
-        return []
-    rows = db.execute(WATCH_TOTALS_SQL,
-                      (config.channel_slug(channel), platform, day,
-                       max(1, int(days)), max(1, int(rolling)),
-                       timezone_name or config.resolve_db_timezone()), fetch=True)
-    out = []
-    for local_date, status, minutes, covered, rolling_minutes in rows:
-        minutes = float(minutes) if minutes is not None else None
-        rolled = float(rolling_minutes) if rolling_minutes is not None else None
-        out.append({
-            "day": local_date, "status": status,
-            "watch_minutes": minutes,
-            "watchtime": minutes / 60.0 if minutes is not None else None,
-            "covered": covered,
-            "rolling_minutes": rolled,
-            "rolling": rolled / 60.0 if rolled is not None else None,
-        })
-    return out
 
 
 LOCATION_WATCH_SQL = """
@@ -1106,7 +1003,7 @@ def location_watch(channel, platform, timezone_name=None):
 #
 # The reads above compare the channel to itself. These support comparing ONE
 # VENUE to its own history, which the by-location charts cannot: they draw a mean
-# per venue, and a mean is exactly what the peaks chart refuses to draw for days.
+# per venue, and a mean hides the one visit that made it.
 #
 # There are only two functions here, and that is the point. The venue filter
 # itself lives on stream_trends() and stream_groups() as an argument, because

@@ -169,8 +169,8 @@ the window, the bucket width and the timezone as parameters — so a new trend i
 a function call rather than new Python.
 
 The Trends charts read those tables. A `daily` run refreshes the window it is
-about to draw and then reads it back, so the ten-day peaks and the half-hour
-comparison never touch a raw sample — which is what puts `low_viewers`,
+about to draw and then reads it back, so the per-broadcast bars and the
+half-hour comparison never touch a raw sample — which is what puts `low_viewers`,
 `avg_viewers`, the follower and subscriber deltas, and the difference between a
 day off and a day nobody polled within reach of a chart rather than behind a
 rewrite. The day chart still reads samples, because sessions are a read-time
@@ -639,7 +639,38 @@ twitch-metrics s3 --setup testchannel   # create and configure the bucket
 twitch-metrics s3 --check testchannel   # prove the credentials, name the bucket
 twitch-metrics s3 --list                   # every channel that has one
 twitch-metrics s3 testchannel --url     # just the URL, for scripts
+twitch-metrics s3 testchannel --prune-trends   # what a retired chart left behind
 ```
+
+#### Pruning a retired chart
+
+Nothing else here ever deletes from a bucket, and the Trends page does not need
+it to: the page is built from a **listing filtered by the kinds that still
+exist**, so a retired chart stops being shown the moment the code lands. The
+objects stay, though, reachable by anyone who kept the URL — and `--prune-trends`
+is what removes them.
+
+```
+twitch-metrics s3 testchannel --prune-trends          # list, delete nothing
+twitch-metrics s3 testchannel --prune-trends --yes    # delete them
+```
+
+Stale means **the kind is gone**: a `trends/<kind>-<platform>.svg` whose kind is
+no longer one the renderers draw. Not the platform, not anything outside
+`trends/`, and not a key the matcher does not recognise — a hand-uploaded file
+under that prefix is left where it is. A **venue** whose location rule was
+dropped is likewise not stale: its page stops being linked on the next run
+because the manifest no longer names it, the rule may come back, and nothing
+about the chart itself became wrong.
+
+The list is re-derived inside the deletion rather than trusted from the caller,
+so a stale list computed against an older build cannot talk it into removing a
+live chart. Running it twice is harmless: S3 reports the delete of a key that
+has already gone as a success.
+
+**It has to run on the machine that owns the buckets** — the registry is
+`data/.s3_buckets.json`, which is per machine, so from anywhere else the channel
+is simply unknown.
 
 ```
 http://tm-<channel>-<suffix>.s3-website-<region>.amazonaws.com
@@ -668,7 +699,7 @@ combined/2026-08-24.svg      both platforms on one axis — leads the page
 twitch/2026-08-24.svg
 youtube/2026-08-24.svg
 twitch/2026-08-23.svg        …
-trends/peaks-twitch.svg      no date: replaced every run
+trends/peakstream-twitch.svg no date: replaced every run
 trends/typical-youtube.svg
 trends/followers-twitch.svg  per broadcast, not per day
 trends/likes-youtube.svg
@@ -697,11 +728,18 @@ than by anything remembered locally.
 `index.html` answers *what happened today*. Everything comparative lives on a
 second page, linked from under the date:
 
-- **Peak viewers by day**, the last ten days *that streamed* as one bar each,
-  Twitch and YouTube charted separately.
+- **Peak viewers per stream**, the last ten *broadcasts* as one bar each,
+  Twitch and YouTube charted separately — see
+  [Per broadcast](#per-broadcast-followers-likes-and-where-you-were).
 - **Half-hour averages, today vs before**, one bar per day per half hour of the
   clock — today beside each of the previous five days that streamed, oldest to
   newest.
+
+There used to be a **Peak viewers by day** chart above both of them, one bar per
+calendar day. It said the same thing as the per-broadcast chart at a coarser
+grain — a Saturday spent at two parks was one bar there and is two here — and
+only the broadcast axis can be grouped by venue, so it was removed rather than
+kept beside its own finer version.
 
 The second one is the reason there is a separate module rather than another
 function in `chart.py`. Every graph on the front page buckets by time *since the
@@ -725,7 +763,7 @@ The axis reaches back at most `--lookback` days, 90 by default, so a channel
 quiet since last year does not drag the whole of its history into every run.
 Finding fewer than ten is not a failure; the chart just has fewer bars.
 
-**The bars are links.** Clicking one opens that day's page, and hovering it
+**The bars are links.** Clicking one opens the day's page, and hovering it
 gives the date and the figure. There is no JavaScript involved: the anchors and
 the tooltips are the SVG's own, and `trends.html` embeds each chart with
 `<object>` rather than `<img>` because an SVG embedded as an image is a
@@ -733,11 +771,11 @@ picture — inert down to its tooltips — where one embedded as an object is a
 document. A bar is only a link when the bucket actually holds a page for that
 date, so a day the database remembers from before the site existed stays plain.
 
-`--calendar-days` restores the old view, dashes and all. A day you didn't stream
-is still a gap there and never a zero, for the same reason the combined chart
-leaves holes: 0 viewers is a real reading a stream that has just gone live
-genuinely has, and drawing a day off the same way would invent a catastrophe out
-of a rest. A channel that spans more than twelve hours has its busiest twelve
+`--calendar-days` restores the old view: six consecutive dates, so a day you
+didn't stream takes a slot on the axis and draws no bar at all. It stays a gap
+there and never a zero, for the same reason the combined chart leaves holes:
+0 viewers is a real reading a stream that has just gone live genuinely has, and
+drawing a day off the same way would invent a catastrophe out of a rest. A channel that spans more than twelve hours has its busiest twelve
 shown, and the chart says so rather than quietly cropping.
 
 The charts have no date in their key and are replaced on every run — they
@@ -746,18 +784,20 @@ page is still built from a **listing of the bucket**, like `index.html`, so it
 only ever links a chart that is actually there, and the front page's link only
 appears once there is something to link to.
 
-Ten and five are `--peak-days` and `--compare-days`, counted in days that
-streamed; the half-hour width is the same `--bucket` the per-day charts use.
+Five is `--compare-days`, counted in days that streamed; the half-hour width is
+the same `--bucket` the per-day charts use.
 
 ### Per broadcast: followers, likes, and where you were
 
-The charts above compare **dates**. The ones below them compare **broadcasts**,
-which is a different axis and not just a finer one: a Saturday spent at two
-parks is one bar up there and two bars down here, and only the second can
-answer *which park*.
+The half-hour chart compares **dates**. Everything else on the page compares
+**broadcasts**, which is a different axis and not just a finer one: a Saturday
+spent at two parks is one bar on a date axis and two here, and only the second
+can answer *which park*.
 
-- **Followers gained per stream**, Twitch, the last ten broadcasts.
-- **Peak likes per stream**, YouTube, the same ten.
+- **Peak viewers per stream**, both platforms, the last ten broadcasts — the
+  panel the page leads with.
+- **Followers gained per stream**, Twitch, the same ten.
+- **Peak likes per stream**, YouTube, the same ten again.
 - **Estimated watch hours per stream**, both platforms — see
   [Estimated watch time](#estimated-watch-time).
 - **Estimated watch hours by location**, both platforms — every broadcast on
@@ -776,8 +816,7 @@ Kingdom has to have been earned there.
 A broadcast whose follower count was never sampled draws a **dash**; one that
 genuinely gained nobody draws a **labelled zero**; one that *lost* followers
 draws **below the line**, which is why these axes have a floor the others don't
-need. Three different facts, three different marks — the same rule the peaks
-chart follows for a day off.
+need. Three different facts, three different marks.
 
 The bars are coloured by **metric** rather than by platform. Four Twitch panels
 in the same purple would be distinguishable only by their headings, and
@@ -817,10 +856,10 @@ before they return.
 ### Location Trends
 
 Everything above draws **one bar per venue**, and a bar is a mean. That is the
-same trade the peaks chart refuses for days — five bars rather than a five-day
-average, because "an average hides its own spread; one freak evening drags
-normal up and nothing on the chart says so" — and until now there was no way to
-look underneath it. Clicking Magic Kingdom did nothing, because there was
+same trade the half-hour chart refuses for days — five bars rather than a
+five-day average, because "an average hides its own spread; one freak evening
+drags normal up and nothing on the chart says so" — and until now there was no
+way to look underneath it. Clicking Magic Kingdom did nothing, because there was
 nothing to click.
 
 Every venue now gets a page of its own:
@@ -833,7 +872,7 @@ locations.json                           slug -> name and broadcast count
 ```
 
 **The by-location bars on the Trends page are links into it**, exactly as the
-peaks bars link to day pages, with the same rule: a bar is a link only when the
+per-broadcast bars link to day pages, with the same rule: a bar is a link only when the
 bucket actually holds that page, so a venue that never published stays plain
 rather than becoming a 404.
 
@@ -956,11 +995,10 @@ A trapezoid rather than "viewers × the poll interval", because the interval is
 not a guarantee — a restart, a slow API call and a spooled backfill all make
 gaps of their own, and the trapezoid is right for any of them.
 
-It appears in five places:
+It appears in four places:
 
 - a **headline tile** on every per-day graph, and a line in `graph`'s summary;
 - **estimated watch hours per stream**, one bar per broadcast, both platforms;
-- **estimated watch hours, trailing 365 days**, a rolling total per day;
 - **estimated watch hours by location**, all-time, averaged per broadcast at each
   venue — the answer to "which of these places is worth going back to";
 - `tm.report_stream_trend.watch_minutes`, `tm.report_daily_peak.watch_minutes`
@@ -997,11 +1035,12 @@ against its own history, never a figure to reconcile.
 **It cannot judge the 4,000-hour threshold.** The YouTube Partner Programme bar
 counts *valid public watch hours* across live **and** VOD in the trailing twelve
 months. This misses VOD entirely and applies none of the validity rules, so it
-undercounts by a margin nothing here can measure. The rolling chart draws 4,000
-as a dashed **reference** line on YouTube — because the shape of the trailing
-total is worth watching — and labels it "estimate, not the YPP figure" on the
-chart itself. The real number is in Studio's YPP eligibility card, and only the
-owner can see it. Twitch has no such threshold, so its chart gets no line.
+undercounts by a margin nothing here can measure. There was once a
+trailing-365-day chart here drawing 4,000 as a dashed reference line, labelled
+"estimate, not the YPP figure" on the chart itself; it is gone, because a
+reference nobody can reconcile invites exactly the reading the label spent its
+words denying. The real number is in Studio's YPP eligibility card, and only the
+owner can see it.
 
 #### Coverage is what makes it readable
 
@@ -1018,17 +1057,14 @@ covered one adds no asterisk, because a qualifier printed on every chart teaches
 the eye to skip the one where it matters.
 
 A broadcast that could not be integrated at all — one sample, or every gap too
-wide — draws a **dash**, never a zero. The same rule the peaks chart follows for
-a day off: "we don't know" is not "nobody watched".
+wide — draws a **dash**, never a zero. The same rule the half-hour chart follows
+for a day off: "we don't know" is not "nobody watched".
 
 The estimator exists twice, in `chart.watch_time()` for the CSV path and the
 per-day graphs and in `tm.stream_watch_slices()` for the report tables, and
 `tests/smoke.py` holds the two to the penny — trapezoid, upper-median gap and
 tolerance alike — so the same broadcast cannot report one figure in `graph` and
 another on the site.
-
-`--watch-days` sets how many days the rolling chart shows (30), and
-`--rolling-days` how long a window its trailing total sums (365).
 
 ### Both platforms on one chart
 
@@ -1334,11 +1370,14 @@ TWITCH_TEST_DATABASE_URL=postgresql://127.0.0.1:5432/twitchmetrics_test \
 ```
 
 Those are the **parity harness**, and they are the reason the migration can be
-trusted. Every aggregate exists twice — once in `trends.py` and once in SQL —
-and each pair is asserted to produce the same answer on the same fixtures,
+trusted. Every aggregate a chart draws exists twice — once in `trends.py` and
+once in SQL — and each pair is asserted to produce the same answer on the same
+fixtures,
 including the cases the committed data does not have: two platforms on different
 polling intervals, a poller that dies mid-day, and a day with no stream at all,
-which must come back as "no peak" and never as a peak of zero.
+which must come back as "no peak" and never as a peak of zero. `tm.daily_peaks()`
+draws no chart any more — it is what picks the dates a broadcast axis is built
+from — so its expectation lives in the harness itself rather than in `trends.py`.
 
 Python is no longer the path the site takes, but it stays as the definition of
 the right answer — and the strongest assertion in the harness is not that the

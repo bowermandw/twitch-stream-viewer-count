@@ -5,9 +5,9 @@ list comes from the enabled pollers — twitch-metrics@ and youtube-metrics@ —
 enabling one is the only step needed to add a channel to the report.
 
 A channel polled on both platforms gets a graph each; one polled on only one
-gets one graph, which is not a failure. Each platform also gets the two
-multi-day charts behind the Trends page, built from its whole CSV rather than
-today's slice of it. The SVG is published as-is, because a
+gets one graph, which is not a failure. Each platform also gets the multi-day
+charts behind the Trends page, built from the report tables rather than from
+today's slice of the samples. The SVG is published as-is, because a
 browser renders it natively — sharper and smaller than the PNG the Drive report
 used to convert, and with no binary to install.
 """
@@ -83,9 +83,6 @@ def add_arguments(parser):
     parser.add_argument("--no-buckets", action="store_true", help="hide the average lines")
     parser.add_argument("--no-trends", action="store_true",
                         help="skip the multi-day charts and the Trends page")
-    parser.add_argument("--peak-days", type=int, default=trends.PEAK_DAYS, metavar="N",
-                        help="days with a stream on the peaks chart "
-                             "(default {})".format(trends.PEAK_DAYS))
     parser.add_argument("--compare-days", type=int, default=trends.COMPARE_DAYS,
                         metavar="N",
                         help="days with a stream shown behind today on the "
@@ -95,15 +92,6 @@ def add_arguments(parser):
                         help="broadcasts on the per-stream charts (default {}); "
                              "these count broadcasts, not days".format(
                                  trends.STREAM_COUNT))
-    parser.add_argument("--watch-days", type=int, default=trends.WATCH_DAYS,
-                        metavar="N",
-                        help="days on the rolling watch-time chart "
-                             "(default {})".format(trends.WATCH_DAYS))
-    parser.add_argument("--rolling-days", type=int, default=trends.ROLLING_DAYS,
-                        metavar="N",
-                        help="days the trailing watch-time total sums over "
-                             "(default {}, a twelve-month window)".format(
-                                 trends.ROLLING_DAYS))
     parser.add_argument("--no-locations", action="store_true",
                         help="skip the per-location pages and their charts "
                              "(already implied by --no-trends)")
@@ -366,10 +354,11 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
     A platform with nothing in the window still contributes nothing, so a
     channel that has only ever streamed on Twitch gets two charts and not four.
     There is deliberately no "has this platform any samples" guard any more and
-    none is needed: render_peaks() returns None when no day has a peak and
-    render_typical() returns None when no slot has a bar, so an unpolled
-    platform falls out by itself. Re-introducing the guard would mean loading
-    every sample again, which is the one thing this stopped doing.
+    none is needed: every renderer returns None when its rows carry nothing to
+    draw -- render_typical() when no slot has a bar, render_stream_bars() when
+    no broadcast carries the metric -- so an unpolled platform falls out by
+    itself. Re-introducing the guard would mean loading every sample again,
+    which is the one thing this stopped doing.
 
     Written straight to charts/ under a name with no date in it, because they
     describe where the channel is now: each run replaces them.
@@ -387,7 +376,7 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
     # have to hold that whole range or the older streams it wants are simply
     # absent. ensure_reports() clamps the request to the channel's own first
     # sample, which is what stops a young channel re-refreshing 90 days forever.
-    span = (max(1, args.peak_days, args.compare_days + 1) if args.calendar_days
+    span = (max(1, args.compare_days + 1) if args.calendar_days
             else max(1, args.lookback))
     try:
         store.ensure_reports(channel, day, span, minutes=args.bucket)
@@ -398,9 +387,6 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
     made = []
     for platform in PLATFORMS:
         try:
-            peaks = store.daily_peaks(channel, platform, day, args.peak_days,
-                                      calendar=args.calendar_days,
-                                      lookback=args.lookback)
             slots, per_day, dropped = store.compare_slots(
                 channel, platform, day, args.compare_days, args.bucket,
                 calendar=args.calendar_days, lookback=args.lookback)
@@ -408,13 +394,13 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
             log("WARN     {} {} — no trend charts: {}".format(
                 channel, platform, str(exc).splitlines()[0]))
             continue
-        charts = trends.render_from(peaks, slots, per_day, channel, platform, day,
+        charts = trends.render_from(slots, per_day, channel, platform, day,
                                     minutes=args.bucket, dropped=dropped,
                                     known=known)
         # The per-broadcast charts, from the same run's tables. Their own try:
-        # a channel whose stream trends are missing should still get the two
-        # charts above, which is the same courtesy _publish_trends() extends to
-        # a platform that failed while its sibling published.
+        # a channel whose stream trends are missing should still get the chart
+        # above, which is the same courtesy _publish_trends() extends to a
+        # platform that failed while its sibling published.
         try:
             rows = store.stream_trends(channel, platform, day, args.stream_count,
                                        lookback=args.lookback)
@@ -429,22 +415,16 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
             groups["peaklocation"] = store.stream_groups(
                 channel, platform, "peak", "location", day,
                 args.stream_count, lookback=args.lookback)
-            # A window of DAYS, not of broadcasts, and a different query for
-            # that reason: the trailing total moves on days nobody streamed as
-            # older days drop out of the back of it, so a broadcast axis has no
-            # room for the question it answers.
-            watch = store.watch_totals(channel, platform, day, args.watch_days,
-                                       rolling=args.rolling_days)
-            # Neither window applies: this is every broadcast on record, so it
-            # takes no --stream-count and no --watch-days. 009_location_watch.sql
-            # says why a venue's average is not a windowed question.
+            # No window applies: this is every broadcast on record, so it takes
+            # no --stream-count. 009_location_watch.sql says why a venue's
+            # average is not a windowed question.
             location_watch = store.location_watch(channel, platform)
         except (db.Unreachable, db.NotConfigured, SystemExit) as exc:
             log("WARN     {} {} — no per-stream charts: {}".format(
                 channel, platform, str(exc).splitlines()[0]))
         else:
             charts.update(trends.render_streams(
-                rows, groups, channel, platform, day, known=known, watch=watch,
+                rows, groups, channel, platform, day, known=known,
                 location_watch=location_watch, known_locations=known_locations))
         for kind, svg in charts.items():
             out = config.chart_path(channel, "_{}_{}".format(kind, platform))

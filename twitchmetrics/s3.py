@@ -11,7 +11,7 @@ those and the SVGs:
     location/magic-kingdom.html
     twitch/2026-08-24.svg
     youtube/2026-08-24.svg
-    trends/peaks-twitch.svg
+    trends/peakstream-twitch.svg
     location/magic-kingdom-peakstream-twitch.svg
 
 Every page is rebuilt from a listing of the bucket rather than from anything
@@ -79,18 +79,20 @@ TITLE_PREFERENCE = ("twitch", "youtube")
 # The multi-day charts, in the order the Trends page shows them. They are one
 # per platform and not per day — each run overwrites them, because they describe
 # where the channel is now rather than what happened on a particular date.
-# The last four count BROADCASTS rather than dates, and sit below the two that
-# count dates -- the page reads from "how many watched" down to "how many
-# stayed, and where". A kind is one lowercase word because trend_key() puts it
-# in front of a hyphen and TREND_KEY_RE will not take a second one.
-TREND_KINDS = ("peaks", "typical", "peakstream", "watchtime", "watchrolling",
+# Peak viewers leads, as it always has -- it is the figure a reader opens the
+# page for, and it used to be led by a by-DAY version of itself that no longer
+# exists. "typical" is the only kind here still counting DATES; every kind after
+# it counts BROADCASTS, and the order is the reading order -- from "how many
+# watched" down to "how many stayed, and where". A kind is one lowercase word
+# because trend_key() puts it in front of a hyphen and TREND_KEY_RE will not
+# take a second one.
+TREND_KINDS = ("peakstream", "typical", "watchtime",
                "watchlocation", "peaklocation", "followers", "likes", "weekday",
                "location")
 TREND_LABELS = {
-    ("peaks", "twitch"): "Peak viewers by day · Twitch",
-    ("peaks", "youtube"): "Peak viewers by day · YouTube",
-    # "per stream" against the two above's "by day", because that is the whole
-    # difference: a Saturday at two parks is one bar up there and two down here.
+    # "per stream" and not "peak viewers" bare: a Saturday at two parks is two
+    # bars here, which is the reading the by-day chart this replaced could not
+    # give and the by-location one beside it needs.
     ("peakstream", "twitch"): "Peak viewers per stream · Twitch",
     ("peakstream", "youtube"): "Peak viewers per stream · YouTube",
     ("peaklocation", "twitch"): "Peak viewers by location · Twitch",
@@ -110,8 +112,6 @@ TREND_LABELS = {
     # heading is the last place a reader sees that before the figure itself.
     ("watchtime", "twitch"): "Estimated watch hours per stream · Twitch",
     ("watchtime", "youtube"): "Estimated watch hours per stream · YouTube",
-    ("watchrolling", "twitch"): "Estimated watch hours, trailing 12 months · Twitch",
-    ("watchrolling", "youtube"): "Estimated watch hours, trailing 12 months · YouTube",
     # The three watch charts read together, so this sits with them rather than
     # beside the other by-location chart: "how many hours" then "where they were".
     ("watchlocation", "twitch"): "Estimated watch hours by location · Twitch",
@@ -244,7 +244,11 @@ def _classify(exc):
 
 
 def _with_backoff(what, call):
-    """Retry one idempotent S3 call. PUT is keyed by path, so replay is harmless."""
+    """Retry one idempotent S3 call.
+
+    PUT is keyed by path, so a replay is harmless; so is DELETE, which S3
+    reports as a success for a key that has already gone.
+    """
     try:
         return retry.with_backoff(what, call, _classify)
     except retry.GaveUp as exc:
@@ -303,7 +307,7 @@ def parse_day_key(key):
 
 
 def trend_key(kind, platform):
-    """Where a multi-day chart lives: 'trends/peaks-twitch.svg'.
+    """Where a multi-day chart lives: 'trends/peakstream-twitch.svg'.
 
     The filename is deliberately not a date. KEY_RE only matches
     '<word>/<YYYY-MM-DD>.svg', so a trend chart can never be mistaken for a
@@ -710,6 +714,73 @@ def list_trends(channel):
             for platform in PLATFORMS if (kind, platform) in found]
 
 
+def orphan_trend_keys(keys):
+    """The trends/ keys whose kind nothing renders any more, sorted.
+
+    Pure, and separate from the deleting for that reason: WHICH keys are stale
+    is the decision worth a test, and that test must not need a bucket.
+
+    A key qualifies by parsing as a trend chart whose KIND is not in
+    TREND_KINDS. Retiring a chart is the only way one gets here -- every kind the
+    renderers still draw is in that tuple -- and a key the matcher does not
+    recognise at all is left alone rather than swept up as collateral: a
+    directory marker, a hand-uploaded note, or a kind added by a NEWER version
+    of this code than the one doing the pruning.
+
+    Never by platform, and never outside trends/. A venue whose location rule
+    was dropped also stops being linked, and its charts are deliberately NOT
+    stale by this rule: list_locations() already hides them, the venue may come
+    back with the next rule, and nothing about the chart itself became wrong.
+    """
+    out = []
+    for key in keys:
+        parsed = parse_trend_key(key)
+        if parsed and parsed[0] not in TREND_KINDS:
+            out.append(key)
+    return sorted(out)
+
+
+def stale_trends(channel):
+    """orphan_trend_keys() over what the bucket actually holds, under trends/."""
+    return orphan_trend_keys(_keys(channel, TRENDS_PREFIX))
+
+
+def delete_trend_keys(channel, keys):
+    """Delete `keys` from the channel's bucket. Returns [(key, error_or_None)].
+
+    The one thing in this module that deletes, and narrow on purpose: it refuses
+    any key orphan_trend_keys() would not have returned, so a caller that
+    computed its list some other way -- or against a different version of
+    TREND_KINDS -- cannot talk it into removing a live chart or anything outside
+    trends/. Re-deriving the guard here rather than trusting the argument is the
+    whole safety of it.
+
+    S3 takes a thousand keys per delete_objects call and this will only ever see
+    a handful, but the batching is real rather than assumed: a bucket that has
+    outlived several chart retirements should not need the command run twice.
+
+    A key that is already gone is not an error -- S3 reports a delete of a
+    missing key as a success, which is what makes running this twice harmless.
+    """
+    wanted = set(orphan_trend_keys(keys))
+    refused = [(key, "not a stale trend chart") for key in keys if key not in wanted]
+    known = require_bucket(channel)
+    s3 = _client("s3", known["region"])
+    done = []
+    ordered = sorted(wanted)
+    for start in range(0, len(ordered), 1000):
+        batch = ordered[start:start + 1000]
+        reply = _with_backoff(
+            "delete {} object(s) for {}".format(len(batch), channel),
+            lambda b=batch: s3.delete_objects(
+                Bucket=known["bucket"],
+                Delete={"Objects": [{"Key": key} for key in b], "Quiet": True}))
+        failed = {item.get("Key"): item.get("Message") or item.get("Code") or "failed"
+                  for item in (reply.get("Errors") or [])}
+        done.extend((key, failed.get(key)) for key in batch)
+    return done + refused
+
+
 def list_day_pages(channel):
     """{'YYYY-MM-DD', ...} for the day pages the bucket already holds.
 
@@ -841,7 +912,9 @@ def list_locations(channel):
     so a page never links something that isn't there, and the manifest decides
     what is named and in what order. A venue whose rule was dropped leaves the
     manifest on the next run and stops being linked immediately, without
-    anything being deleted -- nothing in this module deletes from a bucket.
+    anything being deleted. delete_trend_keys() is the single exception in this
+    module, and it will not touch a location chart at all: see
+    orphan_trend_keys() for why a dropped venue is not stale.
     """
     found = list_location_pages(channel)
     return [(slug, name, broadcasts, platforms)
@@ -1372,7 +1445,7 @@ def render_location(channel, today, slug, name, charts, locations=()):
             kind, "{} · {{}}".format(kind)).format(
                 PLATFORM_LABELS.get(platform, platform))),
         key=html.escape(location_chart_key(slug, kind, platform)[len(LOCATION_PREFIX):]),
-        ratio="{} / {}".format(*TREND_SIZES.get(kind, TREND_SIZES["peaks"])))
+        ratio="{} / {}".format(*TREND_SIZES.get(kind, TREND_SIZES["typical"])))
         for kind, platform in charts]
     if not panels:
         panels.append('  <p class="empty">No charts for this location yet — they '
@@ -1408,7 +1481,7 @@ def render_trends(channel, today, charts, locations=()):
         label=html.escape(TREND_LABELS.get(
             (kind, platform), "{} · {}".format(kind, platform))),
         key=html.escape(trend_key(kind, platform)),
-        ratio="{} / {}".format(*TREND_SIZES.get(kind, TREND_SIZES["peaks"])))
+        ratio="{} / {}".format(*TREND_SIZES.get(kind, TREND_SIZES["typical"])))
         for kind, platform in charts]
     if not panels:
         panels.append('  <p class="empty">No trend charts yet — they appear once '
