@@ -11,7 +11,9 @@ in parsing, session detection, chart building and CLI wiring.
 import glob
 import inspect
 import json
+import decimal
 import os
+import random
 import re
 import stat
 import subprocess
@@ -45,9 +47,9 @@ _TEST_DB_URL = os.environ.get("TWITCH_TEST_DATABASE_URL", "").strip()
 if _REAL_DB_URL and _TEST_DB_URL == _REAL_DB_URL:
     _TEST_DB_URL = ""
 
-from twitchmetrics import (chart, config, db, drive, driveoauth, png, retry, s3,  # noqa: E402
-                          storage, trends, youtube)
-from twitchmetrics.commands import daily  # noqa: E402
+from twitchmetrics import (api, chart, config, db, directory, drive, driveoauth,  # noqa: E402
+                          png, retry, s3, storage, trends, youtube)
+from twitchmetrics.commands import daily, rank  # noqa: E402
 
 FIXTURES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixtures")
 PLAIN = os.path.join(FIXTURES, "metrics_testchannel.csv")
@@ -2397,6 +2399,175 @@ check("a fresh token payload is enough to build a client",
       drive.client_for({"access_token": "t", "email": "a@b"})["token"] == "t")
 
 # --- deploy units ---------------------------------------------------------
+# --- directory rank -------------------------------------------------------
+section("directory rank")
+# A listing shaped like the real thing: a few streams with real audiences, then
+# the enormous tie block that makes list position meaningless. Measured on IRL:
+# 207 of 532 streams on exactly 1 viewer, 29 on 0.
+def _stream(login, viewers, user_id=None, game_id="509672"):
+    return {"user_login": login, "user_id": user_id or login,
+            "id": "b-" + login, "viewer_count": viewers,
+            "game_id": game_id, "game_name": "IRL"}
+
+_listing = ([_stream("top", 900), _stream("second", 120), _stream("third", 120)]
+            + [_stream("mid", 7)]
+            + [_stream("tied%d" % i, 1) for i in range(10)]
+            + [_stream("dark%d" % i, 0) for i in range(3)])
+
+_top = directory.rank_in(_listing, "top")
+check("the top stream has nobody ahead of it", _top["streams_ahead"] == 0)
+check("and it is rank 1, not rank unknown", _top["streams_ahead"] + 1 == 1)
+check("a stream alone at its count has a tie group of itself",
+      _top["tie_count"] == 1)
+check("the total counts the whole listing", _top["total_streams"] == len(_listing))
+
+# Two streams on 120: both are second, and neither is third.
+_second = directory.rank_in(_listing, "second")
+_third = directory.rank_in(_listing, "third")
+check("tied streams get the same position, not consecutive ones",
+      _second["streams_ahead"] == _third["streams_ahead"] == 1)
+check("and they know how many they are tied with",
+      _second["tie_count"] == 2)
+
+# The measurement this module exists for. Inside a tie block the position is a
+# band, and streams_ahead must not depend on where in the block Helix put us.
+_mine = directory.rank_in(_listing, "tied3")
+check("a tie block does not inflate the rank", _mine["streams_ahead"] == 4)
+check("the tie band is as wide as the block", _mine["tie_count"] == 10)
+_shuffled = list(_listing)
+random.Random(7).shuffle(_shuffled)
+check("and counting survives any order Helix emits the block in",
+      directory.rank_in(_shuffled, "tied3")["streams_ahead"]
+      == _mine["streams_ahead"])
+check("which the list index does not",
+      [s["user_login"] for s in _shuffled].index("tied3")
+      != [s["user_login"] for s in _listing].index("tied3"))
+
+check("zero viewers still ranks rather than vanishing",
+      directory.rank_in(_listing, "dark1")["streams_ahead"] == 14)
+check("a channel absent from the listing gets no rank at all",
+      directory.rank_in(_listing, "nobody") is None)
+check("and never a fabricated first place",
+      directory.rank_in([], "top") is None)
+check("the ranked viewer count comes from the listing's own row",
+      directory.rank_in(_listing, "mid")["viewer_count"] == 7)
+check("the rank carries the broadcast id it must be attached to",
+      _mine["stream_id"] == "b-tied3")
+
+# Deduplication. Not fussiness: measured, three consecutive IRL passes returned
+# 521 rows for 508 channels, 515 for 492, 513 for 501 -- a stream that moves
+# across a page boundary while the cursor walks arrives twice.
+_dupes = _listing + [_stream("top", 900), _stream("tied1", 1)]
+check("a stream seen twice is counted once",
+      len(directory.dedupe(_dupes)) == len(_listing))
+check("a duplicate ahead of us does not inflate streams_ahead",
+      directory.rank_in(_dupes, "mid")["streams_ahead"]
+      == directory.rank_in(_listing, "mid")["streams_ahead"])
+check("nor does a duplicate beside us inflate the tie count",
+      directory.rank_in(_dupes, "tied3")["tie_count"] == _mine["tie_count"])
+check("nor the total", directory.rank_in(_dupes, "mid")["total_streams"]
+      == len(_listing))
+check("dedupe keys on user_id, so a renamed login is still one stream",
+      len(directory.dedupe([_stream("old", 5, user_id="42"),
+                            _stream("new", 5, user_id="42")])) == 1)
+
+# The log line. A rank inside a tie block is an interval, and printing only its
+# top edge reads as more precise than the measurement is.
+check("the description names the band, not just the best case",
+      "tied with 9" in directory.describe(_mine, "tied3", "IRL"))
+check("a stream with no ties says nothing about ties",
+      "tied" not in directory.describe(_top, "top", "IRL"))
+check("one viewer is not '1 viewers'",
+      directory.describe(_mine, "tied3", "IRL").endswith("1 viewer"))
+check("and an absent channel says so rather than printing a number",
+      "not in its own category" in directory.describe(None, "nobody"))
+
+# --- category paging ------------------------------------------------------
+section("category paging")
+# api.get stubbed, so the pagination contract is checked without a network:
+# both terminators, the page size, and the truncation flag that decides whether
+# a total is a count or a floor.
+_pages = [
+    {"data": [_stream("a", 9), _stream("b", 8)], "pagination": {"cursor": "c1"}},
+    {"data": [_stream("c", 7)], "pagination": {"cursor": "c2"}},
+    {"data": [_stream("d", 6)], "pagination": {}},
+]
+_asked = []
+
+def _fake_get(url, params, token, client_id):
+    _asked.append(dict(params))
+    after = params.get("after")
+    return _pages[0] if after is None else _pages[["c1", "c2"].index(after) + 1]
+
+_saved_get = api.get
+api.get = _fake_get
+try:
+    _streams, _read, _complete = api.category_streams("509672", "t", "c")
+    check("it walks to the end of the category", len(_streams) == 4)
+    check("and reports how many pages that took", _read == 3)
+    check("a category that ended is complete", _complete is True)
+    check("it asks for a hundred at a time",
+          all(p["first"] == 100 for p in _asked))
+    check("it passes the cursor and never a page number",
+          _asked[1]["after"] == "c1" and all("page" not in p for p in _asked))
+    check("and does not send a cursor on the first request",
+          "after" not in _asked[0])
+
+    _asked.clear()
+    _capped, _read, _complete = api.category_streams("509672", "t", "c",
+                                                     max_pages=2)
+    check("the page cap stops the walk", _read == 2 and len(_asked) == 2)
+    check("and a capped walk is not complete", _complete is False)
+    check("so its total is a floor, not a count", len(_capped) == 3)
+
+    # An empty page is the other terminator, and Twitch sends a cursor with it
+    # as often as not -- so the data array has to be checked too.
+    _pages[2] = {"data": [], "pagination": {"cursor": "c3"}}
+    _streams, _read, _complete = api.category_streams("509672", "t", "c")
+    check("an empty page ends the walk even with a cursor attached",
+          _complete is True and _read == 3)
+    _pages[2] = {"data": [_stream("d", 6)], "pagination": {}}
+
+    # A rate limit is the caller's to handle, not this layer's: api.get raises
+    # and nothing here retries, matching get_stream's contract.
+    api.get = lambda *a, **k: (_ for _ in ()).throw(api.RateLimited(30))
+    check("a rate limit surfaces rather than being swallowed",
+          raises(api.RateLimited, api.category_streams, "509672", "t", "c"))
+    check("and the collector turns it into a skipped pass, not a crash",
+          rank._walk("509672", "t", "c", 200) == (None, None))
+finally:
+    api.get = _saved_get
+
+check("the cap is a runaway guard, not a budget", api.MAX_CATEGORY_PAGES >= 66)
+
+# --- rank units -----------------------------------------------------------
+section("rank units")
+_ksvc = open(os.path.join(root, "deploy/twitch-metrics-rank.service")).read()
+_ktmr = open(os.path.join(root, "deploy/twitch-metrics-rank.timer")).read()
+check("the rank service is a oneshot", "Type=oneshot" in _ksvc)
+check("it is not a template", "%i" not in _ksvc)
+check("the timer owns activation, not the service", "WantedBy=" not in _ksvc)
+check("it asks for one pass and lets the timer set the cadence",
+      "rank --all --once" in _ksvc and "--interval" not in
+      _ksvc.split("ExecStart=")[1].splitlines()[0])
+check("it fires every ten minutes", "OnCalendar=*:0/10" in _ktmr)
+check("catch-up runs are off on purpose -- a rank cannot be backfilled",
+      "Persistent=false" in _ktmr)
+check("the timer starts the rank service",
+      "Unit=twitch-metrics-rank.service" in _ktmr)
+check("the timer is installed into timers.target", "WantedBy=timers.target" in _ktmr)
+check("the placeholders still fail loudly", "User=twitch" in _ksvc)
+check("a database that is down delays it, never stops it",
+      "Wants=postgresql.service" in _ksvc
+      and "Requires=postgresql.service" not in _ksvc)
+check("only data is writable, because it renders nothing",
+      "ReadWritePaths=/opt/twitch-metrics/data" in _ksvc
+      and "/charts" not in _ksvc.split("ReadWritePaths=")[1].splitlines()[0])
+check("so the command makes only data/, not charts/",
+      "ensure_data_dir" in inspect.getsource(rank.run))
+check("and the filesystem stays protected", "ProtectSystem=strict" in _ksvc)
+check("it says what a pass costs against the rate limit", "800" in _ksvc)
+
 section("daily units")
 _svc = open(os.path.join(root, "deploy/twitch-metrics-daily.service")).read()
 _tmr = open(os.path.join(root, "deploy/twitch-metrics-daily.timer")).read()
@@ -2429,7 +2600,7 @@ check("only db.py imports it at all",
       [m for m in ("db.py", "storage.py", "config.py", "cli.py", "chart.py",
                    "trends.py", "commands/db_cmd.py", "commands/poll.py",
                    "commands/youtube_cmd.py", "commands/daily.py",
-                   "commands/graph_cmd.py")
+                   "commands/graph_cmd.py", "commands/rank.py", "directory.py")
        if _imports_pg.search(open(os.path.join(root, "twitchmetrics", m)).read())]
       == ["db.py"])
 
@@ -2482,6 +2653,8 @@ for _version, _name, _path in _files:
     check("{} is not empty".format(_name), _sql.strip())
     check("{} creates things idempotently".format(_name),
           "IF NOT EXISTS" in _sql or "OR REPLACE" in _sql)
+check("the directory rank has a migration",
+      any(name.startswith("012_") for _, name, _ in _files))
 check("no sample table stores a local date",
       not re.search(r"local_date[^)\n]*GENERATED", open(_files[0][2]).read()))
 
@@ -2614,6 +2787,141 @@ else:
         except db.Unreachable:
             _refused = True
         check("a day with no stream cannot be given a peak of zero", _refused)
+
+        # --- the directory rank -----------------------------------------
+        # The CHECKs are the point here: this table's job is to make a
+        # half-measured rank unrepresentable, so each constraint is asserted to
+        # actually bite rather than merely to exist.
+        from twitchmetrics import store as _rstore  # noqa: PLC0415 - needs a DB
+        _kacct = _rstore.account_id("smokerank", "twitch",
+                                    timezone_name=_zone_name)
+        _kwhen = datetime(2026, 9, 10, 14, 20, tzinfo=timezone.utc)
+        # Repeatable against a test database that persists between runs, the way
+        # the location-rule checks below re-file rather than assuming an empty
+        # table.
+        db.execute("DELETE FROM tm.directory_rank WHERE account_id IN "
+                   "(SELECT account_id FROM tm.platform_account a JOIN "
+                   " tm.channel c USING (channel_id) WHERE c.slug = 'smokerank')")
+        _kstream = db.execute(
+            "SELECT tm.open_or_touch_stream(%s, 'bcast-1', 'A title', 'IRL', "
+            "now(), now())", (_kacct,), fetch=True)[0][0]
+
+        def _rank(**over):
+            """One record_directory_rank() call, defaults overridable."""
+            args = {"sampled_at": _kwhen, "platform_stream_id": "bcast-1",
+                    "game_id": "509672", "total_streams": 532, "pages_read": 7,
+                    "page_cap": 200, "pass_seconds": 1,
+                    "listing_complete": True, "game_name": "IRL",
+                    "streams_ahead": 294, "tie_count": 207, "viewer_count": 1}
+            args.update(over)
+            return db.execute(
+                "SELECT tm.record_directory_rank(%(a)s, %(sampled_at)s, "
+                "%(platform_stream_id)s, %(game_id)s, %(total_streams)s, "
+                "%(pages_read)s, %(page_cap)s, %(pass_seconds)s, "
+                "%(listing_complete)s, %(game_name)s, %(streams_ahead)s, "
+                "%(tie_count)s, %(viewer_count)s)",
+                dict(args, a=_kacct), fetch=True)[0][0]
+
+        def _refuses_rank(**over):
+            """True when the database rejects the row. A violated CHECK arrives
+            as db.Unreachable, as the dark-day check above relies on."""
+            try:
+                _rank(**over)
+            except db.Unreachable:
+                return True
+            return False
+
+        _kid = _rank()
+        check("a rank row stores", _kid is not None)
+        # A real measurement from the tail of IRL: 294 ahead, in a
+        # tie block of 207.
+        check("rank_best and rank_worst are the database's arithmetic",
+              db.execute("SELECT rank_best, rank_worst FROM tm.directory_rank "
+                         "WHERE rank_id = %s", (_kid,), fetch=True)[0]
+              == (295, 501))
+        check("the rank is attached to the broadcast it measured",
+              db.execute("SELECT stream_id FROM tm.directory_rank WHERE "
+                         "rank_id = %s", (_kid,), fetch=True)[0][0] == _kstream)
+        check("replaying the same pass does not duplicate it",
+              db.execute("SELECT count(*) FROM tm.directory_rank WHERE "
+                         "account_id = %s", (_kacct,), fetch=True)[0][0] == 1)
+
+        # Truncation: a complete pass must never be overwritten by a partial
+        # one, because its totals are exact and the partial one's are floors.
+        # A plausible partial pass: it stopped after one page, so it saw fewer
+        # streams and a smaller tie group. Its numbers are internally consistent
+        # -- the constraint below refuses ones that are not -- but every total is
+        # a floor, so it must not displace the complete pass already stored.
+        _rank(total_streams=99, streams_ahead=50, tie_count=10, pages_read=1,
+              listing_complete=False)
+        check("a truncated re-offer cannot overwrite a complete pass",
+              db.execute("SELECT total_streams, listing_complete FROM "
+                         "tm.directory_rank WHERE rank_id = %s", (_kid,),
+                         fetch=True)[0] == (532, True))
+
+        check("the top stream is rank 1, and not rank unknown",
+              db.execute(
+                  "SELECT rank_best FROM tm.directory_rank WHERE rank_id = %s",
+                  (_rank(sampled_at=_kwhen + timedelta(seconds=600),
+                         streams_ahead=0, tie_count=1, total_streams=1),),
+                  fetch=True)[0][0] == 1)
+
+        # The other half of that: absent from its own listing is NULL, not 1.
+        _kmiss = _rank(sampled_at=_kwhen + timedelta(seconds=1200),
+                       streams_ahead=None, tie_count=None, viewer_count=None)
+        check("a channel absent from its own directory has no position at all",
+              db.execute("SELECT rank_best, rank_worst FROM tm.directory_rank "
+                         "WHERE rank_id = %s", (_kmiss,), fetch=True)[0]
+              == (None, None))
+
+        _later = {"sampled_at": _kwhen + timedelta(seconds=1800)}
+        check("half a rank is refused: a position with no tie group",
+              _refuses_rank(tie_count=None, **_later))
+        check("and a position with no viewer count that produced it",
+              _refuses_rank(viewer_count=None, **_later))
+        check("a tie group of nobody is refused -- it always contains itself",
+              _refuses_rank(tie_count=0, **_later))
+        check("a rank cannot claim more streams ahead than the listing held",
+              _refuses_rank(streams_ahead=600, tie_count=1, total_streams=532,
+                            **_later))
+        check("an empty directory cannot hold a rank at all",
+              _refuses_rank(total_streams=0, streams_ahead=None,
+                            tie_count=None, viewer_count=None, **_later))
+        check("a pass that read no pages is refused",
+              _refuses_rank(pages_read=0, **_later))
+        check("and one that read more pages than its own cap",
+              _refuses_rank(pages_read=201, page_cap=200, **_later))
+
+        # A rank belongs to a broadcast, and the ranker never invents one.
+        check("a rank for a broadcast the poller has not recorded is skipped",
+              _rank(platform_stream_id="never-seen", **_later) is None)
+
+        # The most recent pass at this point is deliberately the unranked one,
+        # and the reader reports it as such rather than reaching back for the
+        # last pass that happened to have a position.
+        check("the latest pass is reported honestly even with no position in it",
+              db.execute(
+                  "SELECT rank_best, midrank, total_streams FROM tm.channel c, "
+                  "LATERAL tm.latest_directory_rank(c.channel_id) r "
+                  "WHERE c.slug = 'smokerank'", fetch=True)[0]
+              == (None, None, 532))
+
+        # A later ranked pass, so the midrank has something to be the middle of.
+        # It is the one number for a chart with room for one line: the centre of
+        # the tie block rather than either flattering edge. 294 ahead in a block
+        # of 207 spans #295 to #501, so the middle is #398.
+        _rank(sampled_at=_kwhen + timedelta(seconds=3600))
+        check("a rank inside a tie block reports a midrank between its bounds",
+              db.execute(
+                  "SELECT rank_best, midrank, rank_worst FROM tm.channel c, "
+                  "LATERAL tm.latest_directory_rank(c.channel_id) r "
+                  "WHERE c.slug = 'smokerank'", fetch=True)[0]
+              == (295, decimal.Decimal("398"), 501))
+        check("and every category it has been ranked in is listable",
+              db.execute("SELECT game_id, game_name FROM tm.channel c, LATERAL "
+                         "tm.categories_ranked(c.channel_id) g WHERE "
+                         "c.slug = 'smokerank'", fetch=True)[0]
+              == ("509672", "IRL"))
         check("the server knows the reporting timezone",
               db.execute("SELECT now() AT TIME ZONE %s", (_zone_name,), fetch=True))
 
@@ -3471,7 +3779,13 @@ _forbidden = re.compile(
     r"^\s*(import|from)\s+"
     r"(google|googleapiclient|google_auth\w*|requests|httplib2|oauth2client|matplotlib)\b",
     re.M)
-for _mod in ("driveoauth.py", "drive.py", "png.py", "trends.py",
+_dir_src = open(os.path.join(root, "twitchmetrics/directory.py")).read()
+check("directory.py is arithmetic, not a database client or an HTTP client",
+      not re.search(r"^from \.? ?import .*\b(db|store|api)\b|"
+                    r"^from \.(db|store|api) import|^import urllib",
+                    _dir_src, re.M))
+
+for _mod in ("driveoauth.py", "drive.py", "png.py", "trends.py", "directory.py",
              "commands/drive_cmd.py", "commands/daily.py"):
     _src = open(os.path.join(root, "twitchmetrics", _mod)).read()
     check("{} imports nothing third-party".format(_mod), not _forbidden.search(_src))

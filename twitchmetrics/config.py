@@ -39,6 +39,18 @@ DEFAULT_CHANNEL = "testchannel"
 # recovery as a straight line because nothing was recorded on the way down.
 DEFAULT_INTERVAL_SECONDS = 60
 MIN_INTERVAL_SECONDS = 10
+
+# A directory pass is a different kind of measurement from a viewer sample, so it
+# gets its own cadence rather than inheriting the one above. A sample is one
+# request; a pass walks a whole category -- 7 requests for IRL, 66 for Just
+# Chatting -- and what it measures is a position among hundreds of other streams,
+# which does not move minute to minute the way a viewer count does. Ten minutes
+# costs about a tenth of one percent of the 800-per-minute allowance.
+#
+# The floor is 60s and not 10s: at ten seconds the largest categories would still
+# be walking when the next tick fired.
+DEFAULT_RANK_INTERVAL_SECONDS = 600
+MIN_RANK_INTERVAL_SECONDS = 60
 HTTP_TIMEOUT = 20       # stops a hung socket stalling a poll loop
 UPLOAD_TIMEOUT = 120    # a chart is small, but 20s is tight on a slow uplink
 
@@ -110,6 +122,17 @@ def invocation():
 def ensure_dirs():
     for path in (DATA_DIR, CHARTS_DIR):
         os.makedirs(path, exist_ok=True)
+
+
+def ensure_data_dir():
+    """Just data/, for a job that renders nothing.
+
+    The rank collector's unit grants ReadWritePaths on data/ alone, because it
+    writes no charts. ensure_dirs() above would makedirs() CHARTS_DIR as well --
+    a no-op while that directory exists, and a hard failure under
+    ProtectSystem=strict on a box where it does not.
+    """
+    os.makedirs(DATA_DIR, exist_ok=True)
 
 
 # --------------------------------------------------------------------------
@@ -338,6 +361,21 @@ def resolve_interval(cli_value=None):
                      DEFAULT_INTERVAL_SECONDS, MIN_INTERVAL_SECONDS)
 
 
+def resolve_rank_interval(cli_value=None):
+    """Seconds between directory passes.
+
+    Precedence: --interval > TWITCH_RANK_INTERVAL env/.env >
+    DEFAULT_RANK_INTERVAL_SECONDS. Deliberately not falling back to
+    TWITCH_INTERVAL, for the same reason the YouTube resolver does not: a value
+    set there was chosen for a one-request sample, and quietly reusing it would
+    turn it into a decision about walking whole categories.
+    """
+    return _interval(cli_value, "TWITCH_RANK_INTERVAL",
+                     DEFAULT_RANK_INTERVAL_SECONDS, MIN_RANK_INTERVAL_SECONDS,
+                     note="\nA pass walks a whole category: about 7 requests for "
+                          "IRL, 66 for Just Chatting, out of 800 a minute.")
+
+
 def resolve_youtube_interval(cli_value=None):
     """Seconds between YouTube samples.
 
@@ -472,6 +510,16 @@ def metrics_csv(channel):
 
 def youtube_csv(channel):
     return os.path.join(DATA_DIR, "youtube_{}.csv".format(channel_slug(channel)))
+
+
+def rank_log_path():
+    """One log for the whole pass, not one per channel.
+
+    The pollers get a log each because they are a process each. A directory
+    pass is a single run covering every tracked channel -- splitting its output
+    per channel would tear one category walk across several files.
+    """
+    return os.path.join(DATA_DIR, "rank.log")
 
 
 def log_path(channel, kind="poll"):

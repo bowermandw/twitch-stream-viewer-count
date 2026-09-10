@@ -1,0 +1,46 @@
+# Fires the directory-rank pass every ten minutes.
+#
+#   sudo cp deploy/twitch-metrics-rank.timer /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now twitch-metrics-rank.timer
+#
+#   systemctl list-timers 'twitch-metrics*'     # next run, last run, whether it fired
+#   systemd-analyze calendar '*:0/10'           # what that expands to
+#   systemctl status twitch-metrics-rank.timer
+#
+# Ten minutes rather than one. The pollers sample a viewer count, which moves
+# second to second; this measures a position among several hundred other streams,
+# which does not. A minute's cadence would cost sixty times as many requests to
+# record the same shape -- and the shape is what a rank is for.
+#
+# Independent of the twitch-metrics@ pollers by design. Neither should be able to
+# delay or wedge the other, and this one is a oneshot that exits.
+
+[Unit]
+Description=Twitch category directory rank, every ten minutes
+Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
+
+[Timer]
+Unit=twitch-metrics-rank.service
+OnCalendar=*:0/10
+AccuracySec=15s
+
+# Fifteen seconds of jitter, so the pass does not begin on the same second as
+# the pollers' :00 boundary sample and every other job on the box. Small enough
+# that a row stamped 14:20:11 still plainly belongs to the 14:20 tick. Note that
+# `systemctl list-timers` then shows the randomized time, so 14:20:11 for a
+# *:0/10 unit is correct rather than a bug.
+RandomizedDelaySec=15
+
+# Deliberately NOT Persistent=true, and for a sharper reason than the daily
+# report's.
+#
+# A rank is the shape of a category at one instant. There is no such thing as
+# catching up on one: a missed tick replayed at boot would walk the directory
+# NOW and stamp it with a time that has passed, which is a wrong row rather than
+# a late one. The next tick measures the present correctly and costs the same.
+# Nothing here can be backfilled by hand either -- the list is gone.
+Persistent=false
+
+[Install]
+WantedBy=timers.target

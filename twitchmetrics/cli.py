@@ -10,12 +10,14 @@ import sys
 
 from . import __version__, config
 from .commands import (auth_cmd, chatters, daily, db_cmd, followers, graph_cmd,
-                       poll, s3_cmd, setup_cmd, testdata_cmd, users, youtube_cmd)
+                       poll, rank, s3_cmd, setup_cmd, testdata_cmd, users,
+                       youtube_cmd)
 
 COMMANDS = [
     ("setup", setup_cmd, "register credentials and verify them"),
     ("auth", auth_cmd, "browser login for endpoints needing a user token"),
     ("poll", poll, "record viewers, followers and chat size on an interval"),
+    ("rank", rank, "record how far down its category directory a channel sits"),
     ("youtube", youtube_cmd, "record YouTube live viewers and subscriber count"),
     ("graph", graph_cmd, "render collected samples as an SVG chart"),
     ("daily", daily, "chart every polled channel and publish to its website"),
@@ -32,6 +34,7 @@ examples:
   {prog} setup
   {prog} poll testchannel
   {prog} youtube testchannel --once
+  {prog} rank --all --once --dry-run
   {prog} graph testchannel --date today
   {prog} daily --dry-run
   {prog} s3 --setup testchannel

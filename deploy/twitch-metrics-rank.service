@@ -1,0 +1,103 @@
+# systemd unit for the directory-rank pass.
+#
+# NOT a template, unlike twitch-metrics@.service. One run covers every tracked
+# channel, and channels streaming the same category share a single walk of that
+# category -- so there is nothing to put after an @, and splitting this per
+# channel would multiply the API calls for no benefit. The channel list comes
+# from the enabled pollers, the same way the daily report's does.
+#
+#   sudo cp deploy/twitch-metrics-rank.service /etc/systemd/system/
+#   sudo cp deploy/twitch-metrics-rank.timer   /etc/systemd/system/
+#   sudoedit /etc/systemd/system/twitch-metrics-rank.service   # User, Group, dir
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now twitch-metrics-rank.timer
+#
+#   systemctl list-timers 'twitch-metrics*'
+#   journalctl -u twitch-metrics-rank -f
+#
+# Enable the TIMER, not the service. There is no [Install] section here on
+# purpose: enabling the service would take a pass at every boot as well as on
+# the schedule, and a boot-time rank is no more useful than the next tick's.
+#
+# BEFORE ENABLING, edit User, Group and WorkingDirectory to match your install.
+# The values here are placeholders and WILL fail if left as-is: User=twitch does
+# not exist by default, and systemd exits 217/USER before running anything, with
+# no Python output to explain it.
+#
+#   Create the account:   useradd -r -s /usr/sbin/nologin twitch
+#   Or run as yourself:   set User= and Group= to an existing account.
+#
+# RUN IT AS THE SAME USER AS THE POLLERS. It shares data/.app_token.json with
+# them, and a single run under another account leaves a root-owned data/rank.log
+# that the timer can then never append to -- which fails quietly, ten minutes at
+# a time.
+#
+# NOTHING TO INSTALL for the pass itself: urllib and the standard library, like
+# the pollers. psycopg is needed to store anything, exactly as it is for
+# twitch-metrics@.service, so either use a venv (see ExecStart) or:
+#     apt install python3-psycopg3
+#
+# UNLIKE THE POLLERS, there is no CSV spool here. A viewer sample is one request
+# and irreplaceable, so losing an evening of them to a database outage is worth a
+# second on-disk format. A directory pass is a measurement of a list of several
+# hundred other streams, taken every ten minutes by a process that has already
+# exited -- so an outage costs at most one row of a coarse series, and the pass
+# logs it and skips rather than spooling. A `data/rank.log` full of "no database"
+# is the symptom.
+#
+# WHAT IT COSTS. One Helix request per hundred streams in the category. Measured:
+# IRL (game_id 509672) is about 530 streams, so 7 requests and a little over a
+# second; Just Chatting (509658) is the largest there is at ~6,100, so 66
+# requests and about eighteen seconds. The allowance is 800 requests a minute and
+# a request is one point, so a ten-minute cadence on IRL is roughly a tenth of
+# one percent of it. There is nothing here for Twitch to throttle.
+
+[Unit]
+Description=Twitch category directory rank for the tracked channels
+Documentation=https://github.com/bowermandw/twitch-stream-viewer-count
+After=network-online.target postgresql.service
+Wants=network-online.target
+# Wants, never Requires -- the pollers' rule rather than the daily report's. The
+# daily report can wait for the next night; a rank cannot be caught up, so a
+# database that is starting slowly must delay this pass rather than cancel it.
+Wants=postgresql.service
+
+[Service]
+Type=oneshot
+User=twitch
+Group=twitch
+WorkingDirectory=/opt/twitch-metrics
+# --all reads the enabled twitch-metrics@* instances, so enabling a poller for a
+# new channel starts ranking it too. There is no channel list to maintain here
+# and none in the repo.
+#
+# --once, with the cadence living in the timer and nowhere else. Passing
+# --interval here as well would be two places to change it and one to forget.
+#
+# Use the venv's Python if you installed psycopg there:
+#   ExecStart=/opt/twitch-metrics/.venv/bin/python -m twitchmetrics rank --all --once
+ExecStart=/usr/bin/python3 -m twitchmetrics rank --all --once
+
+# Generous against the worst measured pass (66 requests, 17.7s) and still far
+# inside the ten-minute bucket, so a wedged socket fails before the next tick
+# rather than overlapping it. There is no Restart= for a oneshot, and none is
+# wanted: the timer is the retry policy, and the next pass is a better
+# measurement than a retry of a stale one.
+TimeoutStartSec=300
+
+StandardOutput=journal
+StandardError=journal
+
+# The pollers' hardening, with one deliberate difference: charts/ is NOT
+# writable, because this job renders nothing. Only data/ is, for rank.log and the
+# shared token cache -- which is also why the command calls
+# config.ensure_data_dir() rather than ensure_dirs().
+#
+# ProtectSystem=strict leaves /etc read-only rather than hidden, which is what
+# --all needs: channel discovery reads the twitch-metrics@ symlinks under
+# /etc/systemd/system/multi-user.target.wants/. It needs no D-Bus.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/twitch-metrics/data

@@ -590,16 +590,157 @@ find /opt/twitch-metrics/charts -name '*.png' -mtime +90 -delete
 
 Never rotate `data/*.csv`. That is the actual data.
 
+## Directory rank
+
+How far down its category's directory page each tracked channel sits —
+`twitch.tv/directory/category/irl` and the like — recorded every ten minutes.
+
+No scraping. Helix returns a category already sorted by viewer count
+descending, which is the ordering the page itself shows under **Sort by:
+Viewers (High to Low)**, so walking the cursor and counting is both supported
+and cheap. Note that the page's *default* sort is "Recommended For You", which
+is personalised per viewer — so counting down the page by eye will not match
+unless you switch the sort first.
+
+### Why the number is not a list position
+
+Because viewer counts in the tail of a category are tied in enormous blocks.
+Measured on IRL: 532 live streams, of which **207 had exactly 1 viewer** and 29
+had none. The index of a one-viewer stream in that list is not a fact about the
+stream — two passes taken seconds apart moved **486 of 488** streams, and one
+channel went from 316th to 301st with nothing having changed.
+
+So what is stored is the part that holds still:
+
+| Column | Meaning |
+|---|---|
+| `streams_ahead` | streams with strictly more viewers — the stable number |
+| `tie_count` | streams sharing this viewer count, this one included |
+| `rank_best` | `streams_ahead + 1`, generated — the top of the tie block |
+| `rank_worst` | `streams_ahead + tie_count`, generated — the bottom of it |
+| `total_streams` | the category's size, so a rank reads as a share |
+
+Which turns "#303" into "**#295 of 532, tied with 206 others**" — the same
+answer next tick, where the list index is not.
+
+`tm.latest_directory_rank(channel_id)` adds a `midrank`, the centre of the tie
+block, for a chart with room for one line rather than a band.
+
+### What it costs
+
+One request per hundred streams in the category. Measured: IRL is about 530
+streams, so 7 requests and a little over a second; Just Chatting is the largest
+there is at ~6,100, so 66 requests and about eighteen seconds. The allowance is
+**800 requests a minute** and a request is one point, so a ten-minute cadence on
+IRL is roughly **a tenth of one percent** of it. There is nothing here for
+Twitch to throttle.
+
+Channels streaming the same category share one walk of it, and are ranked
+against the same snapshot with the same timestamp — so two channels in IRL cost
+7 requests, not 14, and "who was higher at 14:20" has an answer.
+
+### Schema
+
+Apply the migration first. From a machine whose `.env` points at the database —
+which for this install means your workstation, not the server:
+
+```
+python3 -m twitchmetrics db --status     # 012_directory_rank.sql pending
+python3 -m twitchmetrics db --init
+python3 -m twitchmetrics db --status     # and now applied
+```
+
+`--init --dry-run` prints *every* file rather than only the pending one, so use
+`--status` to see what is outstanding and read the `.sql` by hand to review it.
+
+012 is purely additive — one new table and three new functions, nothing existing
+altered — so it is safe to apply before the code that writes to it ships, and
+safe to leave in place if that code is rolled back. It adds no report table, so
+`db --rebuild` needs no rerun and there is nothing to backfill.
+
+### Install the timer
+
+```
+sudo cp deploy/twitch-metrics-rank.service /etc/systemd/system/
+sudo cp deploy/twitch-metrics-rank.timer   /etc/systemd/system/
+sudoedit /etc/systemd/system/twitch-metrics-rank.service   # User, Group, dir
+sudo systemctl daemon-reload
+```
+
+Prove it works before trusting the schedule, as the user the timer will use:
+
+```
+sudo -u twitch python3 -m twitchmetrics rank --all --once --dry-run
+sudo -u twitch python3 -m twitchmetrics rank --all --once
+sudo systemctl start twitch-metrics-rank.service    # once, under the hardening
+journalctl -u twitch-metrics-rank -n 30 --no-pager
+```
+
+Starting the service by hand catches the two failures a plain CLI run cannot: a
+path `ProtectSystem=strict` denies, and a `User=` that does not exist — which
+exits 217/USER with no Python output to explain it. Then:
+
+```
+sudo systemctl enable --now twitch-metrics-rank.timer
+systemctl list-timers 'twitch-metrics*'
+```
+
+Run it as the **same user as the pollers**. It shares `data/.app_token.json`
+with them, and one run as root leaves a root-owned `data/rank.log` the timer can
+never append to afterwards — which fails silently, ten minutes at a time.
+
+### Which channels it covers
+
+`--all` reads the enabled `twitch-metrics@*` instances, the same discovery the
+daily report uses. So `systemctl enable --now twitch-metrics@somechannel` starts
+recording that channel's rank too — there is no second list to maintain, and
+none in the repo. `TWITCH_DAILY_CHANNELS` and explicit positionals override it.
+
+**A rank is only recorded for a channel something polls.** Every row hangs off a
+broadcast in `tm.stream`, which the poller opens; the ranker looks that row up
+and never creates one, because two writers racing to open a broadcast would
+fight the one-open-stream-per-account index. So ranking a channel with no poller
+logs `nothing polls <channel>` and stores nothing. `--dry-run` still prints the
+position for any channel, which is the way to check one you do not track.
+
+### Reading the rows
+
+```
+psql "$TWITCH_DATABASE_URL" -c "SELECT sampled_at, game_name, viewer_count,
+    rank_best, rank_worst, tie_count, total_streams, listing_complete
+  FROM tm.directory_rank ORDER BY sampled_at DESC LIMIT 10"
+```
+
+`listing_complete = false` means the walk hit `page_cap` — so `total_streams`
+and `tie_count` are **floors rather than counts**. `rank_best` is still exact
+even then: the listing is sorted descending, so everything ahead of the channel
+was on the pages already read. Filter those rows out of any average.
+
+A row with `rank_best` NULL is a channel that was live but not in its own
+category listing — the directory is eventually consistent and it happens. The
+row is written anyway, so "how often is the directory inconsistent" stays
+countable rather than looking like a missed tick.
+
+### No CSV spool here, unlike the pollers
+
+A viewer sample is one request and irreplaceable, so losing an evening of them
+to a database outage is worth a second on-disk format. A directory pass is
+measured every ten minutes by a oneshot that has already exited, so an outage
+costs at most one row of a coarse series — not worth a second format, a
+`_widen()` rewrite of every archive, and a replay path. The pass logs
+`no database` and skips. A `data/rank.log` full of that line is the symptom.
+
 ## Where things live
 
 | Path | Contents |
 |---|---|
 | PostgreSQL | the samples, the broadcasts and the report tables — the irreplaceable part |
-| `data/` | the CSV spool (written only during an outage), poll logs, `daily.log`, cached tokens, `.s3_buckets.json` |
+| `data/` | the CSV spool (written only during an outage), poll logs, `daily.log`, `rank.log`, cached tokens, `.s3_buckets.json` |
 | `charts/` | generated SVGs, which is what `daily` publishes |
 | `.env` | credentials, mode 0600 |
 
-`data/daily.log` is already covered by the `data/*.log` logrotate glob above.
+`data/daily.log` and `data/rank.log` are already covered by the `data/*.log`
+logrotate glob above.
 
 Point them elsewhere with `TWITCH_DATA_DIR` and `TWITCH_CHARTS_DIR` if you'd
 rather keep data on a mounted volume:

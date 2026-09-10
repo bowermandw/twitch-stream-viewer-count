@@ -129,6 +129,71 @@ SELECT tm.record_youtube_sample(
     %(subscriber_count)s, %(like_count)s, %(title)s, %(started_at)s, %(source)s)
 """
 
+RANK_CALL = """
+SELECT tm.record_directory_rank(
+    %(account_id)s, %(sampled_at)s, %(stream_id)s, %(game_id)s,
+    %(total_streams)s, %(pages_read)s, %(page_cap)s, %(pass_seconds)s,
+    %(listing_complete)s, %(game_name)s, %(streams_ahead)s, %(tie_count)s,
+    %(viewer_count)s, %(source)s)
+"""
+
+
+def record_rank(account, sampled_at, stream_id, game_id, pass_info, rank=None,
+                game_name=None, source="ranker"):
+    """Store one directory pass. Returns the rank_id, or None.
+
+    None means the function found no broadcast to attach the rank to, which
+    happens when the ranker has seen a stream the poller has not recorded yet.
+    The caller logs it and lets the next pass pick it up.
+
+    Deliberately NOT routed through Destination: there is no CSV spool for a
+    rank, and that is a decision rather than an omission. The spool exists
+    because a viewer sample is irrecoverable, and it is drained by a poller that
+    is still running ten minutes later. A directory pass is measured by a
+    oneshot that has already exited, and what it measures is a position among
+    hundreds of other streams that have all moved since -- so an outage costs at
+    most one row of a ten-minute series, which is not worth a second on-disk
+    format, a _widen() rewrite of every archive, and a replay path. On
+    db.Unreachable the caller logs once and skips the tick.
+    """
+    params = {
+        "account_id": account,
+        "sampled_at": sampled_at,
+        "stream_id": stream_id,
+        "game_id": game_id,
+        "game_name": game_name,
+        "total_streams": pass_info["total_streams"],
+        "pages_read": pass_info["pages_read"],
+        "page_cap": pass_info["page_cap"],
+        "pass_seconds": pass_info["pass_seconds"],
+        "listing_complete": pass_info["listing_complete"],
+        # All three together or none of them -- the schema's pairing rule. A
+        # channel absent from its own listing still gets a row, saying so.
+        "streams_ahead": rank["streams_ahead"] if rank else None,
+        "tie_count": rank["tie_count"] if rank else None,
+        "viewer_count": rank["viewer_count"] if rank else None,
+        "source": source,
+    }
+    found = db.execute(RANK_CALL, params, fetch=True)
+    return found[0][0] if found else None
+
+
+def latest_rank(slug):
+    """The most recent directory pass for a channel, or None.
+
+    Returns the row tm.latest_directory_rank() builds, as a dict.
+    """
+    rows = db.execute(
+        "SELECT r.* FROM tm.channel c,"
+        " LATERAL tm.latest_directory_rank(c.channel_id) r"
+        " WHERE c.slug = %s", (slug,), fetch=True)
+    if not rows:
+        return None
+    names = ("sampled_at", "game_id", "game_name", "viewer_count", "rank_best",
+             "rank_worst", "midrank", "tie_count", "total_streams",
+             "listing_complete")
+    return dict(zip(names, rows[0]))
+
 
 def row_params(platform, account, fields, source="poller"):
     """Call parameters from a row spelled the way the CSV spells it.

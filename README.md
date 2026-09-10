@@ -450,6 +450,90 @@ a 10,000-subscriber step is invisible on a 0–1,240,000 scale.
 
 ---
 
+## Directory rank
+
+How far down its category's page a channel sits — the "how many streams down
+`twitch.tv/directory/category/irl` am I?" question.
+
+```
+twitch-metrics rank testchannel --once --dry-run   # print it, store nothing
+twitch-metrics rank --all --once                   # every polled channel
+twitch-metrics rank --all --interval 600           # or as a long-running loop
+```
+
+```
+testchannel  IRL  #295 of 532, tied with 206  1 viewer  (7 pages, 1s)
+```
+
+There is nothing to scrape. Helix's `/streams?game_id=…` returns a category
+already sorted by viewer count descending, which is what the directory page
+shows under **Sort by: Viewers (High to Low)** — so the answer is a cursor walk
+and a count. (The page's *default* sort is "Recommended For You", personalised
+per viewer, so counting by eye only matches once you change the sort.)
+
+### The rank is a band, not a number
+
+Viewer counts in the tail of a category are tied in enormous blocks. Measured on
+IRL: 532 live streams, **207 of them on exactly 1 viewer**, 29 on none. So a
+one-viewer stream's position in that list is not a property of the stream — two
+passes seconds apart moved **486 of 488** streams, and one channel slid from
+316th to 301st with nothing having happened.
+
+What is recorded is therefore the part that holds still — `streams_ahead`, the
+count of streams with strictly more viewers — plus the size of the tie block it
+lands in. `rank_best` and `rank_worst` are generated from those two by the
+database, so no writer can produce a row whose rank disagrees with its own
+arithmetic:
+
+| | measured, one channel in IRL |
+|---|---|
+| `streams_ahead` | 294 |
+| `tie_count` | 207 |
+| `rank_best` | 295 |
+| `rank_worst` | 501 |
+| `total_streams` | 532 |
+
+Both bounds are true. Publishing only the first would not be wrong so much as
+rhetorical, which is why `tie_count` sits next to them: it says what the interval
+is worth at a glance. `tm.latest_directory_rank()` also offers a `midrank` — the
+centre of the block — for a chart with room for one line.
+
+### Cost, and why ten minutes
+
+One request per hundred streams. IRL is 7 requests and about a second; Just
+Chatting, the biggest category there is, is 66 and about eighteen. The allowance
+is 800 requests a minute, so a ten-minute cadence on IRL spends about a tenth of
+one percent of it. A minute's cadence would cost sixty times as much to record
+the same shape — a rank moves on the scale of a broadcast, not a second.
+
+Channels in the same category share one walk of it and one timestamp, so two
+channels in IRL cost 7 requests rather than 14, and are directly comparable.
+
+### What ends up in the database
+
+One row per channel per pass, in `tm.directory_rank`, while the channel is live.
+Every row hangs off a broadcast in `tm.stream` — which is what will later let a
+rank be averaged per venue, since `tm.stream_location()` reads the title — so
+**a rank is only stored for a channel something polls**. The ranker looks the
+broadcast up and never opens one, leaving that to the poller. `--dry-run` prints
+the position for any channel regardless.
+
+Two kinds of honest gap, both recorded rather than papered over:
+
+- `rank_best` NULL — the channel was live but absent from its own category
+  listing. The directory is eventually consistent and this happens; the row is
+  written anyway so the gap stays countable instead of looking like a dead job.
+- `listing_complete = false` — the walk hit its page cap, so `total_streams` and
+  `tie_count` are floors. `rank_best` is still exact, because the listing is
+  sorted descending and everything ahead was already read.
+
+Unlike the pollers there is no CSV spool: a pass is a measurement of a list of
+several hundred other streams taken every ten minutes, so an outage costs one
+coarse row rather than an evening, and the pass logs it and skips.
+
+Run it on a schedule with `deploy/twitch-metrics-rank.timer`; see
+`deploy/README.md`.
+
 ## Graphing
 
 ```
@@ -1402,6 +1486,7 @@ twitchmetrics/          the package
   api.py                Helix endpoint wrappers
   youtube.py            YouTube Data API wrappers
   runloop.py            the sampling loop both pollers share
+  directory.py          where a stream sits in a category listing (arithmetic)
   s3.py                 the website: buckets, uploads, the index page
   retry.py              backoff shared by every destination
   drive.py              Google Drive (retired, kept for reference)
