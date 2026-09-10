@@ -408,13 +408,20 @@ def render_trend_charts(channel, day, args, known=None, known_locations=None):
                           channel, platform, "followers", grouping, day,
                           args.stream_count, lookback=args.lookback)
                       for grouping in trends.GROUPINGS}
-            # Peak viewers by venue, over the same window as the followers
-            # rollup beside it. Its own key rather than a fourth GROUPINGS
+            # Peak viewers by venue. Its own key rather than a fourth GROUPINGS
             # entry, because "location" is a grouping and this is a second
             # metric along it.
+            #
+            # ALL-TIME, unlike the followers rollup beside it and unlike what
+            # this chart used to be: "how many people watch me at this place"
+            # is the same kind of question as the watch-hours-by-venue chart's,
+            # and the answer is not a property of the last ten broadcasts. A
+            # window also makes the best-peak tile mean something nobody asks
+            # for -- the biggest crowd RECENTLY, which quietly forgets the
+            # record. NULL count and lookback are how 010 spells unbounded.
             groups["peaklocation"] = store.stream_groups(
                 channel, platform, "peak", "location", day,
-                args.stream_count, lookback=args.lookback)
+                count=None, lookback=None)
             # No window applies: this is every broadcast on record, so it takes
             # no --stream-count. 009_location_watch.sql says why a venue's
             # average is not a windowed question.

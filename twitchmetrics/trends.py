@@ -1189,11 +1189,18 @@ def render_streams(rows, groups, channel, platform, day, known=None,
     # Peak viewers by venue, which is the chart the location pages are most
     # often reached from: "where do most people watch me" is the question a
     # reader has before "and what happened on each visit".
+    #
+    # All-time, like the watch-hours chart below and unlike the followers
+    # rollup above, so it says so: the caller hands this one every broadcast on
+    # record and a subtitle claiming "last N" would be wrong. The best-peak
+    # tile and tooltips are the record too, not the recent record.
     peaks_by_place = groups.get("peaklocation") or []
     if peaks_by_place:
         drawn = render_stream_groups(
             peaks_by_place, channel, platform, day, "peak", "location",
             width=SIZES["peaklocation"][0], height=SIZES["peaklocation"][1],
+            span_label="all {} on record".format(
+                sum(row["streams"] for row in peaks_by_place)),
             links=location_links(peaks_by_place, known_locations))
         if drawn:
             charts["peaklocation"] = drawn

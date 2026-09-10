@@ -1490,6 +1490,37 @@ check("both by-location charts survive the same run",
 check("and they are not the same drawing",
       _bothplaces["location"] != _bothplaces["watchlocation"])
 
+# Peak viewers by venue is all-time, like the watch chart above it and unlike
+# the followers rollup beside it. What is being checked is the SUBTITLE, because
+# that is the only place a reader can tell the two windows apart -- the bars of
+# a windowed and an unwindowed rollup look identical, so a caller that quietly
+# went back to passing --stream-count would produce a chart that is simply
+# wrong with nothing on it to say so.
+_peakplace = [{"key": "EPCOT", "streams": 9, "total": 990, "average": 110.0,
+               "best": 260, "best_stream_id": 1},
+              {"key": "Magic Kingdom", "streams": 3, "total": 240,
+               "average": 80.0, "best": 95, "best_stream_id": 2}]
+_peakplacesvg = trends.render_streams(
+    _wstreams, {"peaklocation": _peakplace}, "t", "twitch",
+    date(2026, 8, 27))["peaklocation"]
+check("the peak-by-venue chart's subtitle names the all-time window",
+      "all 12 on record" in _peakplacesvg
+      and "of them" not in _peakplacesvg)
+check("it is titled in peak viewers, not followers",
+      "Peak viewers by location" in _peakplacesvg)
+# The record crowd, not the record within a window: 260 is one venue's best ever
+# and is what its tooltip has to carry. The tile beside it stays the best
+# venue's AVERAGE, as it is on every other by-group chart -- "Best location"
+# answers where to go, and a tile that switched to a single night's high would
+# be answering a different question from the bars it sits next to.
+check("and the best peak on record reaches the tooltip",
+      "best 260" in _peakplacesvg)
+check("while the tile stays the best venue's average",
+      "Best location" in _peakplacesvg
+      and trends._fmt_mean("peak", 110.0) in _peakplacesvg)
+check("a venue's whole record is counted, not the last N of it",
+      "9 stream(s)" in _peakplacesvg)
+
 check("the venue chart is known to the publisher",
       "watchlocation" in s3.TREND_KINDS)
 check("it has a label on every platform",
@@ -3277,6 +3308,22 @@ else:
               abs(_by_peak["Magic Kingdom"]["average"] - 40.0) < _TOL
               and abs(_by_peak["Magic Kingdom"]["best"] - 40.0) < _TOL,
               str(_by_peak["Magic Kingdom"]))
+        # The window the peak-by-venue chart is published with: NULL count and
+        # NULL lookback, forwarded through tm.stream_groups() to the
+        # tm.stream_trends() branches above. Checked HERE and not only on
+        # location_history() because it is a second function's pass-through --
+        # greatest(0, NULL) is 0, so a stream_groups() that forgot to spell the
+        # NULL branch returns an empty rollup, and an empty rollup draws no
+        # chart at all rather than a wrong one.
+        _peak_all = store.stream_groups(
+            _lslug, "twitch", "peak", "location", date(2026, 8, 31),
+            count=None, lookback=None, timezone_name=_zone_name)
+        check("an unbounded rollup counts every broadcast on record",
+              sum(g["streams"] for g in _peak_all) == 3,
+              str([(g["key"], g["streams"]) for g in _peak_all]))
+        check("and still names both venues rather than collapsing to one",
+              {g["key"] for g in _peak_all} == {"EPCOT", "Magic Kingdom"},
+              str(sorted(g["key"] for g in _peak_all)))
         _refused_metric = refusal(lambda: db.execute(
             "SELECT * FROM tm.stream_groups(%s,'twitch','banana','location',"
             "%s,10,90,%s,NULL)", (_lcid, date(2026, 8, 31), _zone_name),
